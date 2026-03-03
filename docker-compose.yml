@@ -1,0 +1,87 @@
+services:
+
+  # ─────────────────────────────────────────────────────────
+  #  Base de datos: PostgreSQL 18 + PostGIS 3.4
+  # ─────────────────────────────────────────────────────────
+  db:
+    image: postgis/postgis:17-3.4-alpine
+    container_name: georiesgo_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       georiesgo
+      POSTGRES_USER:     georiesgo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-georiesgo_secret}
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "5432:5432"       # comentar en producción
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U georiesgo -d georiesgo"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 30s
+    networks:
+      - georiesgo_net
+
+  # ─────────────────────────────────────────────────────────
+  #  Backend: FastAPI + PostGIS
+  # ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context:    ./backend
+      dockerfile: Dockerfile
+    container_name: georiesgo_api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:      postgresql+asyncpg://georiesgo:${DB_PASSWORD:-georiesgo_secret}@db:5432/georiesgo
+      DATABASE_URL_SYNC: postgresql://georiesgo:${DB_PASSWORD:-georiesgo_secret}@db:5432/georiesgo
+      DB_HOST:           db
+      DB_PORT:           5432
+      POSTGRES_DB:       georiesgo
+      POSTGRES_USER:     georiesgo
+      APP_ENV:           ${APP_ENV:-production}
+      LOG_LEVEL:         ${LOG_LEVEL:-INFO}
+      FORCE_SYNC:        ${FORCE_SYNC:-0}
+    ports:
+      - "8000:8000"       # comentar si solo se accede vía nginx
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout:  10s
+      start_period: 120s  # tiempo para ETL en primer arranque
+      retries:  3
+    networks:
+      - georiesgo_net
+
+  # ─────────────────────────────────────────────────────────
+  #  Frontend: React + nginx (proxy /api → backend)
+  # ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context:    ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api     # el navegador llama /api, nginx hace proxy
+    container_name: georiesgo_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - georiesgo_net
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  georiesgo_net:
+    driver: bridge
