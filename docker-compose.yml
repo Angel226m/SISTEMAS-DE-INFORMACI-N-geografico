@@ -1,10 +1,14 @@
+ 
+# ══════════════════════════════════════════════════════════
+#  GeoRiesgo Perú — Stack v4.0
+#  PostGIS + FastAPI + Nginx
+# ══════════════════════════════════════════════════════════
+
 services:
 
-  # ─────────────────────────────────────────────────────────
-  #  Base de datos: PostgreSQL 18 + PostGIS 3.4
-  # ─────────────────────────────────────────────────────────
+  # ── Base de datos: PostgreSQL 16 + PostGIS 3.4 (Alpine) ─
   db:
-    image: postgis/postgis:17-3.4-alpine
+    image: postgis/postgis:16-3.4-alpine
     container_name: georiesgo_db
     restart: unless-stopped
     environment:
@@ -12,31 +16,47 @@ services:
       POSTGRES_USER:     georiesgo
       POSTGRES_PASSWORD: ${DB_PASSWORD:-georiesgo_secret}
       PGDATA:            /var/lib/postgresql/data/pgdata
+      # Tuning básico para PostGIS
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=es_PE.UTF-8"
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c effective_cache_size=768MB
+        -c work_mem=16MB
+        -c max_connections=50
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c random_page_cost=1.1
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./backend/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
     ports:
-      - "5432:5432"       # comentar en producción
+      - "${DB_PORT_EXPOSE:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U georiesgo -d georiesgo"]
+      test: ["CMD-SHELL", "pg_isready -U georiesgo -d georiesgo -q"]
       interval: 10s
       timeout:  5s
-      retries:  5
+      retries:  10
       start_period: 30s
     networks:
       - georiesgo_net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
 
-  # ─────────────────────────────────────────────────────────
-  #  Backend: FastAPI + PostGIS
-  # ─────────────────────────────────────────────────────────
+  # ── Backend: FastAPI ligero (sin GDAL) ──────────────────
   backend:
     build:
       context:    ./backend
       dockerfile: Dockerfile
+      cache_from:
+        - python:3.12-slim
+    image: georiesgo_api:4.0
     container_name: georiesgo_api
     restart: unless-stopped
     environment:
-      DATABASE_URL:      postgresql+asyncpg://georiesgo:${DB_PASSWORD:-georiesgo_secret}@db:5432/georiesgo
+      DATABASE_URL:      postgresql://georiesgo:${DB_PASSWORD:-georiesgo_secret}@db:5432/georiesgo
       DATABASE_URL_SYNC: postgresql://georiesgo:${DB_PASSWORD:-georiesgo_secret}@db:5432/georiesgo
       DB_HOST:           db
       DB_PORT:           5432
@@ -45,38 +65,45 @@ services:
       APP_ENV:           ${APP_ENV:-production}
       LOG_LEVEL:         ${LOG_LEVEL:-INFO}
       FORCE_SYNC:        ${FORCE_SYNC:-0}
+      WORKERS:           ${WORKERS:-2}
     ports:
-      - "8000:8000"       # comentar si solo se accede vía nginx
+      - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout:  10s
-      start_period: 120s  # tiempo para ETL en primer arranque
-      retries:  3
+      start_period: 180s
+      retries:  5
     networks:
       - georiesgo_net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
-  # ─────────────────────────────────────────────────────────
-  #  Frontend: React + nginx (proxy /api → backend)
-  # ─────────────────────────────────────────────────────────
+  # ── Frontend: nginx proxy ────────────────────────────────
   frontend:
     build:
       context:    ./frontend
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: /api     # el navegador llama /api, nginx hace proxy
+        VITE_API_URL: ""   # vacío = rutas relativas /api/*
     container_name: georiesgo_frontend
     restart: unless-stopped
     ports:
-      - "5173:80"
+      - "80:80"
+      - "443:443"
     depends_on:
-      backend:
-        condition: service_healthy
+      - backend
     networks:
       - georiesgo_net
+    deploy:
+      resources:
+        limits:
+          memory: 64m
 
 volumes:
   pgdata:
@@ -85,3 +112,6 @@ volumes:
 networks:
   georiesgo_net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

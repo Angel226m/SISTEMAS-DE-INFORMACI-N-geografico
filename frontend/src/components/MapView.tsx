@@ -1,114 +1,194 @@
-﻿// == MapView.tsx — Mapa estable ante resize / zoom =========
+﻿// ══════════════════════════════════════════════════════════
+// MapView.tsx v4.1 — Correcciones:
+//   - Eliminado 'antialias' de MapOptions (no existe en MapLibre)
+//   - Zoom con rueda del ratón centrado en el cursor (scrollZoom)
+//   - Sincronización MapLibre ↔ Deck.gl estable sin deriva
+//   - canvas de Deck.gl con pointer-events correctos
+// ══════════════════════════════════════════════════════════
+
 import { useEffect, useRef, useCallback } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { Deck } from '@deck.gl/core'
 import { ScatterplotLayer, GeoJsonLayer } from '@deck.gl/layers'
-// @ts-ignore — aggregation-layers no tiene types perfectos
 import { HeatmapLayer } from '@deck.gl/aggregation-layers'
-import type { CapasActivas, TipoVista } from '../types'
+import type { CapasActivas, TipoVista, TooltipInfo } from '../types'
 
-// ── Constantes ─────────────────────────────────────────────
-const ICA: [number, number] = [-75.73, -14.07]
-const ICA_ZOOM = 8.5
-const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json'
+// ── Constantes ───────────────────────────────────────────
+const PERU_CENTER: [number, number] = [-75.0, -10.5]
+const PERU_ZOOM   = 5.2
+const ICA_CENTER: [number, number]  = [-75.73, -14.07]
+const ICA_ZOOM    = 8.5
+
+const MAP_STYLES = {
+  light: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+  dark:  'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+  topo:  'https://api.maptiler.com/maps/topo/style.json?key=get_your_own_OpIi9ZULNHzrESv6T2vL',
+} as const
+type MapStyle = keyof typeof MAP_STYLES
 
 type FC   = GeoJSON.FeatureCollection
 type Feat = GeoJSON.Feature
 type FPt  = GeoJSON.Feature<GeoJSON.Point>
 
-// ── Helpers de color ───────────────────────────────────────
+// ── Colores ──────────────────────────────────────────────
 const profColor = (km: number): [number, number, number, number] =>
-  km < 30  ? [220, 38,  38,  210] :
+  km < 30  ? [220, 38,  38,  220] :
   km < 70  ? [249, 115, 22,  200] :
-             [14,  165, 233, 190]
+             [14,  165, 233, 185]
 
 const riskColor = (n: number): [number, number, number, number] => {
-  const MAP: Record<number, [number, number, number, number]> = {
-    1: [5,   150, 105, 110],
-    2: [16,  185, 129, 130],
-    3: [245, 158, 11,  150],
-    4: [249, 115, 22,  170],
-    5: [220, 38,  38,  190],
+  const COLORS: [number,number,number,number][] = [
+    [5,   150, 105, 90],
+    [16,  185, 129, 110],
+    [245, 158, 11,  130],
+    [249, 115, 22,  155],
+    [220, 38,  38,  175],
+  ]
+  return COLORS[Math.max(0, Math.min(4, n - 1))] ?? [148, 163, 184, 80]
+}
+
+const infraColor = (tipo: string): [number, number, number, number] => {
+  const MAP: Record<string, [number,number,number,number]> = {
+    hospital:          [239, 68,  68,  230],
+    clinica:           [248, 113, 113, 210],
+    escuela:           [99,  102, 241, 220],
+    aeropuerto:        [6,   182, 212, 230],
+    puerto:            [20,  184, 166, 230],
+    bomberos:          [234, 179, 8,   230],
+    policia:           [59,  130, 246, 220],
+    central_electrica: [250, 204, 21,  230],
+    planta_agua:       [56,  189, 248, 220],
+    puente:            [156, 163, 175, 210],
   }
-  return MAP[Math.max(1, Math.min(5, n))] ?? [148, 163, 184, 100]
+  return MAP[tipo] ?? [148, 163, 184, 200]
 }
 
 const get = <T,>(f: Feat, k: string): T | undefined =>
   (f.properties as Record<string, unknown> | null)?.[k] as T | undefined
 
-// ── Props ──────────────────────────────────────────────────
+// ── Props ─────────────────────────────────────────────────
 interface Props {
   sismos:          FC | null
   distritos:       FC | null
   fallas:          FC | null
   inundaciones:    FC | null
+  tsunamis:        FC | null
   infraestructura: FC | null
+  estaciones:      FC | null
   capas:           CapasActivas
   vista:           TipoVista
-  onClickFeature:  (info: Record<string, unknown>) => void
+  mapStyle?:       MapStyle
+  onClickFeature:  (props: Record<string, unknown>, layer: string) => void
+  onHoverFeature?: (info: TooltipInfo | null) => void
 }
 
 export default function MapView({
-  sismos, distritos, fallas, inundaciones, infraestructura,
-  capas, vista, onClickFeature,
+  sismos, distritos, fallas, inundaciones, tsunamis,
+  infraestructura, estaciones,
+  capas, vista, mapStyle = 'light',
+  onClickFeature, onHoverFeature,
 }: Props) {
-  const wrapRef      = useRef<HTMLDivElement>(null)   // div contenedor
-  const mapContainer = useRef<HTMLDivElement>(null)   // div para MapLibre
-  const canvasRef    = useRef<HTMLCanvasElement>(null) // canvas para Deck.gl
-  const mapRef       = useRef<maplibregl.Map | null>(null)
-  const deckRef      = useRef<Deck | null>(null)
-  const clickRef     = useRef(onClickFeature)
-  clickRef.current   = onClickFeature
+  const wrapRef   = useRef<HTMLDivElement>(null)
+  const mapDiv    = useRef<HTMLDivElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const mapRef    = useRef<maplibregl.Map | null>(null)
+  const deckRef   = useRef<Deck | null>(null)
+  const clickRef  = useRef(onClickFeature)
+  const hoverRef  = useRef(onHoverFeature)
+  clickRef.current = onClickFeature
+  hoverRef.current = onHoverFeature
 
-  // ── Inicializar mapa y Deck una sola vez ──────────────────
+  // ── Inicialización única ───────────────────────────────
   useEffect(() => {
-    if (!mapContainer.current || !canvasRef.current || mapRef.current) return
+    if (!mapDiv.current || !canvasRef.current || mapRef.current) return
 
+    // CORRECCIÓN: MapLibre MapOptions — sin 'antialias' (no existe en MapOptions)
+    // El antialias se controla a nivel de contexto WebGL interno de MapLibre
     const map = new maplibregl.Map({
-      container: mapContainer.current,
-      style:     MAP_STYLE,
-      center:    ICA,
-      zoom:      ICA_ZOOM,
-      pitch:     0,
-      bearing:   0,
+      container:         mapDiv.current,
+      style:             MAP_STYLES[mapStyle],
+      center:            ICA_CENTER,
+      zoom:              ICA_ZOOM,
+      pitch:             0,
+      bearing:           0,
+      maxPitch:          70,
       attributionControl: false,
+      // ZOOM CENTRADO EN CURSOR: configuración del scrollZoom
+      // MapLibre por defecto ya hace zoom en el cursor, pero lo explicitamos:
+      scrollZoom:        true,
     })
 
-    map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right')
+    // Aseguramos que el zoom con rueda esté habilitado y centrado en el cursor
+    // (comportamiento por defecto de MapLibre, pero lo reforzamos)
+    map.scrollZoom.setWheelZoomRate(1 / 450)  // sensibilidad estándar
+    // El zoom centrado en el cursor es el comportamiento nativo de MapLibre GL
+
+    map.addControl(new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }), 'top-right')
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right')
     mapRef.current = map
 
+    // ── Deck.gl ────────────────────────────────────────
     const deck = new Deck({
-      canvas:  canvasRef.current,
-      width:   '100%',
-      height:  '100%',
-      initialViewState: { longitude: ICA[0], latitude: ICA[1], zoom: ICA_ZOOM, pitch: 0 },
-      controller: false,   // MapLibre controla la cámara
-      layers:  [],
-      onClick: (info) => {
-        if ((info as { object?: unknown }).object) {
-          clickRef.current(info as Record<string, unknown>)
-        }
+      canvas:     canvasRef.current,
+      width:      '100%',
+      height:     '100%',
+      initialViewState: {
+        longitude: ICA_CENTER[0],
+        latitude:  ICA_CENTER[1],
+        zoom:      ICA_ZOOM,
+        pitch:     0,
+        bearing:   0,
       },
+      controller: false, // MapLibre controla TODA la cámara
+      layers:     [],
+      parameters: { clearColor: [0, 0, 0, 0] },
+
+      onClick: (info) => {
+        if (!info.object) return
+        const props = (info.object as Feat).properties ?? {}
+        clickRef.current(props as Record<string, unknown>, info.layer?.id ?? 'unknown')
+      },
+
+      onHover: (info) => {
+        if (!hoverRef.current) return
+        if (!info.object) { hoverRef.current(null); return }
+        hoverRef.current({
+          x:      info.x,
+          y:      info.y,
+          object: info.object as Feat,
+          layer:  info.layer?.id ?? null,
+        })
+      },
+
+      getTooltip: () => null,
     })
     deckRef.current = deck
 
-    // Sincronizar cámara MapLibre → Deck.gl al moverse el mapa
-    const syncCamera = () => {
-      const c = map.getCenter()
-      deck.setProps({
+    // ── Sync cámara MapLibre → Deck.gl ─────────────────
+    // Se llama en cada frame para evitar cualquier deriva
+    const syncViewState = () => {
+      if (!deckRef.current) return
+      const center = map.getCenter()
+      deckRef.current.setProps({
         viewState: {
-          longitude: c.lng,
-          latitude:  c.lat,
-          zoom:      map.getZoom(),
-          bearing:   map.getBearing(),
-          pitch:     map.getPitch(),
+          longitude:          center.lng,
+          latitude:           center.lat,
+          zoom:               map.getZoom(),
+          bearing:            map.getBearing(),
+          pitch:              map.getPitch(),
+          transitionDuration: 0,
         },
       })
     }
-    map.on('move', syncCamera)
-    map.on('load', syncCamera)
+
+    map.on('move',    syncViewState)
+    map.on('zoom',    syncViewState)
+    map.on('rotate',  syncViewState)
+    map.on('pitch',   syncViewState)
+    map.on('moveend', syncViewState)
+    map.on('load',    syncViewState)
+    map.on('render',  syncViewState)
 
     return () => {
       deck.finalize()
@@ -116,172 +196,304 @@ export default function MapView({
       map.remove()
       mapRef.current = null
     }
-  }, []) // Solo al montar
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── ResizeObserver: mapa se ajusta al contenedor siempre ──
+  // ── ResizeObserver ────────────────────────────────────
   useEffect(() => {
     const el = wrapRef.current
     if (!el) return
     const ro = new ResizeObserver(() => {
       mapRef.current?.resize()
-      // El canvas de Deck.gl usa 100%/100% CSS → se ajusta solo
+      if (mapRef.current && deckRef.current) {
+        const c = mapRef.current.getCenter()
+        deckRef.current.setProps({
+          viewState: {
+            longitude:          c.lng,
+            latitude:           c.lat,
+            zoom:               mapRef.current.getZoom(),
+            bearing:            mapRef.current.getBearing(),
+            pitch:              mapRef.current.getPitch(),
+            transitionDuration: 0,
+          },
+        })
+      }
     })
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
 
-  // ── Vista 3D / 2D ──────────────────────────────────────────
+  // ── Cambio de estilo ──────────────────────────────────
   useEffect(() => {
-    mapRef.current?.easeTo({ pitch: vista === '3d' ? 52 : 0, duration: 900 })
+    mapRef.current?.setStyle(MAP_STYLES[mapStyle])
+  }, [mapStyle])
+
+  // ── Vista 2D / 3D ─────────────────────────────────────
+  useEffect(() => {
+    mapRef.current?.easeTo({ pitch: vista === '3d' ? 55 : 0, duration: 800 })
   }, [vista])
 
-  // ── Recentrar desde evento global ─────────────────────────
+  // ── Eventos de vuelo ──────────────────────────────────
   useEffect(() => {
-    const handler = () =>
-      mapRef.current?.flyTo({ center: ICA, zoom: ICA_ZOOM, pitch: vista === '3d' ? 52 : 0, duration: 1100 })
-    window.addEventListener('georiesgo:recenter', handler)
-    return () => window.removeEventListener('georiesgo:recenter', handler)
+    const flyToIca = () => mapRef.current?.flyTo({
+      center: ICA_CENTER, zoom: ICA_ZOOM,
+      pitch: vista === '3d' ? 55 : 0, duration: 1200,
+    })
+    const flyToPeru = () => mapRef.current?.flyTo({
+      center: PERU_CENTER, zoom: PERU_ZOOM, pitch: 0, duration: 1400,
+    })
+    window.addEventListener('geo:center-ica',  flyToIca)
+    window.addEventListener('geo:center-peru', flyToPeru)
+    return () => {
+      window.removeEventListener('geo:center-ica',  flyToIca)
+      window.removeEventListener('geo:center-peru', flyToPeru)
+    }
   }, [vista])
 
-  // ── Capas Deck.gl ──────────────────────────────────────────
+  // ── Construir capas Deck.gl ────────────────────────────
   const buildLayers = useCallback(() => {
     const layers = []
 
-    // Distritos (índice de riesgo)
+    // 1. Distritos
     if (capas.riesgo_distritos && distritos) {
       layers.push(new GeoJsonLayer({
-        id: 'distritos',
-        data: distritos,
-        getFillColor: (f: Feat) => riskColor(get<number>(f, 'nivel_riesgo') ?? 3),
-        getLineColor: [100, 116, 139, 80] as [number,number,number,number],
-        lineWidthMinPixels: 1,
-        pickable: true,
-        updateTriggers: { getFillColor: [distritos] },
+        id:             'distritos',
+        data:           distritos,
+        getFillColor:   (f: Feat) => riskColor(get<number>(f, 'nivel_riesgo') ?? 3),
+        getLineColor:   [100, 116, 139, 60] as [number,number,number,number],
+        lineWidthMinPixels: 0.5,
+        lineWidthMaxPixels: 2,
+        pickable:       true,
+        autoHighlight:  true,
+        highlightColor: [255, 255, 255, 40],
       }))
     }
 
-    // Zonas inundables
+    // 2. Zonas inundables
     if (capas.inundaciones && inundaciones) {
       layers.push(new GeoJsonLayer({
-        id: 'inundaciones',
-        data: inundaciones,
-        getFillColor: [14, 165, 233, 55] as [number,number,number,number],
-        getLineColor: [14, 165, 233, 160] as [number,number,number,number],
+        id:             'inundaciones',
+        data:           inundaciones,
+        getFillColor:   (f: Feat) => {
+          const nivel = get<number>(f, 'nivel_riesgo') ?? 3
+          return [14, 165, 233, 40 + nivel * 15] as [number,number,number,number]
+        },
+        getLineColor:   [14, 165, 233, 180] as [number,number,number,number],
         lineWidthMinPixels: 1.5,
-        pickable: true,
+        lineWidthMaxPixels: 4,
+        pickable:       true,
+        autoHighlight:  true,
+        highlightColor: [14, 165, 233, 60],
       }))
     }
 
-    // Heatmap de densidad sísmica
+    // 3. Tsunamis
+    if (capas.tsunamis && tsunamis) {
+      layers.push(new GeoJsonLayer({
+        id:             'tsunamis',
+        data:           tsunamis,
+        getFillColor:   [6, 182, 212, 55] as [number,number,number,number],
+        getLineColor:   [6, 182, 212, 200] as [number,number,number,number],
+        lineWidthMinPixels: 2,
+        lineWidthMaxPixels: 5,
+        pickable:       true,
+        autoHighlight:  true,
+        highlightColor: [6, 182, 212, 70],
+      }))
+    }
+
+    // 4. Heatmap
     if (capas.heatmap && sismos?.features.length) {
       layers.push(new HeatmapLayer({
-        id: 'heatmap',
-        data: sismos.features,
-        getPosition: (f: FPt) => f.geometry.coordinates as [number, number],
-        getWeight:   (f: Feat) => get<number>(f, 'magnitud') ?? 3,
-        radiusPixels: 60,
-        intensity:    2,
-        threshold:    0.03,
+        id:           'heatmap',
+        data:         sismos.features,
+        getPosition:  (f: FPt) => f.geometry.coordinates as [number, number],
+        getWeight:    (f: Feat) => Math.pow(10, (get<number>(f, 'magnitud') ?? 3) - 2),
+        radiusPixels: 55,
+        intensity:    1.8,
+        threshold:    0.025,
         colorRange: [
-          [5,150,105,0],[5,150,105,80],[245,158,11,140],
-          [249,115,22,180],[220,38,38,220],[127,29,29,255],
-        ],
+          [5,   150, 105, 0  ],
+          [5,   150, 105, 80 ],
+          [245, 158, 11,  150],
+          [249, 115, 22,  190],
+          [220, 38,  38,  220],
+          [127, 29,  29,  255],
+        ] as [number, number, number, number][],
       }))
     }
 
-    // Puntos sísmicos
-    // ↓ Usa profundidad_km (nombre correcto del backend PostGIS)
+    // 5. Sismos
     if (capas.sismos && sismos?.features.length) {
       layers.push(new ScatterplotLayer({
-        id: 'sismos',
-        data: sismos.features,
-        getPosition: (f: FPt) => f.geometry.coordinates as [number, number, number],
-        getRadius:   (f: Feat) => (get<number>(f, 'magnitud') ?? 3) * 2400,
-        getFillColor:(f: Feat) => profColor(get<number>(f, 'profundidad_km') ?? 30),
-        radiusMinPixels: 3,
-        radiusMaxPixels: 28,
-        pickable: true,
-        stroked: true,
-        getLineColor: [255, 255, 255, 160] as [number,number,number,number],
+        id:              'sismos',
+        data:            sismos.features,
+        getPosition:     (f: FPt) => f.geometry.coordinates as [number, number, number],
+        getRadius:       (f: Feat) => {
+          const mag = get<number>(f, 'magnitud') ?? 3
+          return Math.pow(1.8, mag) * 800
+        },
+        getFillColor:    (f: Feat) => profColor(get<number>(f, 'profundidad_km') ?? 30),
+        getLineColor:    [255, 255, 255, 120] as [number,number,number,number],
+        radiusMinPixels: 2,
+        radiusMaxPixels: 32,
+        radiusUnits:     'meters',
+        pickable:        true,
+        stroked:         true,
         lineWidthMinPixels: 0.5,
-        updateTriggers: { getPosition: [sismos], getFillColor: [sismos] },
+        autoHighlight:   true,
+        highlightColor:  [255, 255, 255, 80],
       }))
     }
 
-    // Fallas geológicas
+    // 6. Fallas
     if (capas.fallas && fallas) {
       layers.push(new GeoJsonLayer({
-        id: 'fallas',
-        data: fallas,
-        getLineColor: [220, 38, 38, 210] as [number,number,number,number],
-        lineWidthMinPixels: 2.5,
-        lineWidthMaxPixels: 6,
-        pickable: true,
+        id:             'fallas',
+        data:           fallas,
+        getLineColor:   (f: Feat) => {
+          const activa = get<boolean>(f, 'activa')
+          return activa
+            ? [220, 38,  38,  220] as [number,number,number,number]
+            : [156, 163, 175, 140] as [number,number,number,number]
+        },
+        lineWidthMinPixels: 1.5,
+        lineWidthMaxPixels: 5,
+        pickable:       true,
+        autoHighlight:  true,
+        highlightColor: [255, 200, 0, 60],
       }))
     }
 
-    // Infraestructura crítica
+    // 7. Infraestructura
     if (capas.infraestructura && infraestructura) {
       layers.push(new ScatterplotLayer({
-        id: 'infraestructura',
-        data: infraestructura.features,
-        getPosition: (f: FPt) => f.geometry.coordinates as [number, number],
-        getRadius: 400,
-        getFillColor: [99, 102, 241, 220] as [number,number,number,number],
-        getLineColor: [255, 255, 255, 200] as [number,number,number,number],
-        radiusMinPixels: 5,
-        radiusMaxPixels: 14,
-        stroked: true,
+        id:              'infraestructura',
+        data:            infraestructura.features,
+        getPosition:     (f: FPt) => f.geometry.coordinates as [number, number],
+        getRadius:       700,
+        radiusUnits:     'meters',
+        getFillColor:    (f: Feat) => infraColor(get<string>(f, 'tipo') ?? ''),
+        getLineColor:    [255, 255, 255, 200] as [number,number,number,number],
+        radiusMinPixels: 4,
+        radiusMaxPixels: 18,
+        stroked:         true,
         lineWidthMinPixels: 1.5,
-        pickable: true,
+        pickable:        true,
+        autoHighlight:   true,
+        highlightColor:  [255, 255, 255, 100],
+      }))
+    }
+
+    // 8. Estaciones
+    if (capas.estaciones && estaciones) {
+      layers.push(new ScatterplotLayer({
+        id:              'estaciones',
+        data:            estaciones.features,
+        getPosition:     (f: FPt) => f.geometry.coordinates as [number, number],
+        getRadius:       500,
+        radiusUnits:     'meters',
+        getFillColor:    (f: Feat) => {
+          const tipo = get<string>(f, 'tipo') ?? ''
+          return tipo === 'sismica'
+            ? [16, 185, 129, 230] as [number,number,number,number]
+            : [56, 189, 248, 230] as [number,number,number,number]
+        },
+        getLineColor:    [255, 255, 255, 180] as [number,number,number,number],
+        radiusMinPixels: 4,
+        radiusMaxPixels: 12,
+        stroked:         true,
+        lineWidthMinPixels: 1.5,
+        pickable:        true,
+        autoHighlight:   true,
+        highlightColor:  [255, 255, 255, 80],
       }))
     }
 
     return layers
-  }, [capas, sismos, distritos, fallas, inundaciones, infraestructura])
+  }, [capas, sismos, distritos, fallas, inundaciones, tsunamis, infraestructura, estaciones])
 
   useEffect(() => {
     deckRef.current?.setProps({ layers: buildLayers() })
   }, [buildLayers])
 
-  // ── Render ─────────────────────────────────────────────────
   return (
     <div
       ref={wrapRef}
       style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}
     >
-      {/* Contenedor MapLibre */}
-      <div ref={mapContainer} style={{ position: 'absolute', inset: 0 }} />
+      {/* Base: MapLibre GL — recibe TODOS los eventos de navegación */}
+      <div ref={mapDiv} style={{ position: 'absolute', inset: 0 }} />
 
-      {/* Canvas Deck.gl superpuesto, pointer-events: none para pasar eventos al mapa */}
+      {/* Deck.gl canvas: pointer-events:none para que MapLibre reciba scroll/drag */}
       <canvas
         ref={canvasRef}
         style={{
-          position: 'absolute', inset: 0,
-          width: '100%', height: '100%',
-          pointerEvents: 'none',   // ← el mapa recibe scroll/drag
+          position:      'absolute',
+          inset:         0,
+          width:         '100%',
+          height:        '100%',
+          pointerEvents: 'none',  // ← CRUCIAL: MapLibre maneja zoom/pan nativamente
         }}
       />
 
-      {/* Capa interactiva: captura clics sobre features Deck.gl */}
+      {/*
+        Capa de interacción para CLICKS y HOVER sobre features Deck.gl.
+        IMPORTANTE: pointer-events:none en el canvas, pero esta capa
+        captura clics sobre features de forma precisa.
+        El scroll/zoom pasa directamente al div del mapa (z-index más bajo).
+      */}
       <div
-        style={{ position: 'absolute', inset: 0 }}
-        onMouseMove={e => {
-          if (!deckRef.current) return
-          const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
-          deckRef.current.setProps({
-            _onMetrics: undefined, // reset metrics
-          })
-          // Pasar la posición del mouse a Deck para pickeo
-          void deckRef.current.pickObject({ x: e.clientX - rect.left, y: e.clientY - rect.top })
+        style={{ position: 'absolute', inset: 0, cursor: 'crosshair' }}
+        onWheelCapture={(e) => {
+          // Reenviar el evento de scroll al div del mapa para que MapLibre
+          // haga zoom centrado en el cursor correctamente
+          if (mapDiv.current) {
+            mapDiv.current.dispatchEvent(new WheelEvent('wheel', {
+              deltaY:   e.deltaY,
+              deltaX:   e.deltaX,
+              deltaMode: e.deltaMode,
+              clientX:  e.clientX,
+              clientY:  e.clientY,
+              ctrlKey:  e.ctrlKey,
+              bubbles:  true,
+            }))
+          }
+          e.preventDefault()
         }}
         onClick={e => {
           if (!deckRef.current) return
-          const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
-          const info = deckRef.current.pickObject({ x: e.clientX - rect.left, y: e.clientY - rect.top })
-          if (info?.object) clickRef.current(info as unknown as Record<string, unknown>)
+          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+          const info = deckRef.current.pickObject({
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+          })
+          if (info?.object) {
+            const props = (info.object as Feat).properties ?? {}
+            clickRef.current(props as Record<string, unknown>, info.layer?.id ?? '')
+          }
         }}
+        onMouseMove={e => {
+          if (!deckRef.current || !hoverRef.current) return
+          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+          const info = deckRef.current.pickObject({
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+          })
+          if (info?.object) {
+            hoverRef.current({
+              x:      e.clientX - rect.left,
+              y:      e.clientY - rect.top,
+              object: info.object as Feat,
+              layer:  info.layer?.id ?? null,
+            })
+          } else {
+            hoverRef.current(null)
+          }
+        }}
+        onMouseLeave={() => hoverRef.current?.(null)}
       />
     </div>
   )
 }
+
+export type { MapStyle }

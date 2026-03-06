@@ -14,17 +14,17 @@
   body {
     background: #ffffff;
     color: #0f172a;
-    font-family: 'Inter', 'DM Sans', system-ui, sans-serif;
+    font-family: 'DM Sans', system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
 
-  /* Scrollbar claro y discreta */
+  /* Scrollbar sutil */
   ::-webkit-scrollbar          { width: 4px; height: 4px; }
   ::-webkit-scrollbar-track    { background: transparent; }
-  ::-webkit-scrollbar-thumb    { background: rgba(0,0,0,0.12); border-radius: 2px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.22); }
+  ::-webkit-scrollbar-thumb    { background: rgba(0,0,0,0.10); border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.20); }
 
-  /* Range input — tema claro con acento esmeralda */
+  /* Range inputs — acento esmeralda */
   input[type="range"] {
     -webkit-appearance: none;
     height: 5px;
@@ -47,21 +47,21 @@
     box-shadow: 0 1px 6px rgba(0,0,0,0.2), 0 0 0 3px #059669;
   }
   input[type="range"]:focus-visible::-webkit-slider-thumb {
-    box-shadow: 0 0 0 3px #05966960;
+    box-shadow: 0 0 0 3px rgba(5,150,105,0.35);
   }
 }
 
-/* ── MapLibre GL overrides — tema claro ──────────────────── */
+/* ── MapLibre GL overrides ────────────────────────────── */
 .maplibregl-ctrl-attrib,
 .maplibregl-ctrl-logo         { display: none !important; }
 
 .maplibregl-ctrl-group {
-  background:    rgba(255, 255, 255, 0.94) !important;
-  backdrop-filter: blur(10px) !important;
-  border:        1px solid rgba(0,0,0,0.09) !important;
-  border-radius: 10px !important;
-  box-shadow:    0 2px 8px rgba(0,0,0,0.07) !important;
-  overflow:      hidden;
+  background:      rgba(255, 255, 255, 0.96) !important;
+  backdrop-filter: blur(12px) !important;
+  border:          1px solid rgba(0,0,0,0.08) !important;
+  border-radius:   10px !important;
+  box-shadow:      0 2px 8px rgba(0,0,0,0.06) !important;
+  overflow:        hidden;
 }
 .maplibregl-ctrl-group button {
   background: transparent !important;
@@ -74,18 +74,17 @@
 }
 
 .maplibregl-ctrl-scale {
-  background:   rgba(255,255,255,0.88) !important;
-  border:       1px solid rgba(0,0,0,0.1) !important;
-  color:        #64748b !important;
-  font-family:  'JetBrains Mono', monospace !important;
-  font-size:    9px !important;
+  background:    rgba(255,255,255,0.90) !important;
+  border:        1px solid rgba(0,0,0,0.09) !important;
+  color:         #64748b !important;
+  font-family:   'DM Mono', monospace !important;
+  font-size:     9px !important;
   border-radius: 6px !important;
-  padding:      2px 6px !important;
+  padding:       2px 6px !important;
 }
 
-/* Popup MapLibre (no se usa pero por si acaso) */
 .maplibregl-popup-content {
   border-radius: 12px !important;
-  padding: 0 !important;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.1) !important;
+  padding:       0 !important;
+  box-shadow:    0 8px 32px rgba(0,0,0,0.10) !important;
 }
