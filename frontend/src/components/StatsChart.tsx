@@ -1,8 +1,9 @@
 ﻿// ══════════════════════════════════════════════════════════
-// StatsChart.tsx v4.0 — Gráfica de estadísticas mejorada
+// StatsChart.tsx v5.0 — React.memo + mejoras de rendimiento
+// React.memo evita re-renders cuando estadísticas no cambian
 // ══════════════════════════════════════════════════════════
 
-import { useState } from 'react'
+import { useState, memo } from 'react'
 import {
   BarChart, Bar, AreaChart, Area, XAxis, YAxis,
   Tooltip, ResponsiveContainer, Cell, ReferenceLine,
@@ -71,7 +72,9 @@ function Skeleton() {
   )
 }
 
-export default function StatsChart({ estadisticas, loading }: Props) {
+// ── StatsChart — React.memo previene re-renders innecesarios
+// cuando el mapa se actualiza pero las estadísticas no cambian
+const StatsChart = memo(function StatsChart({ estadisticas, loading }: Props) {
   const [modo, setModo] = useState<Modo>('cantidad')
 
   if (loading) return <Skeleton />
@@ -91,9 +94,9 @@ export default function StatsChart({ estadisticas, loading }: Props) {
     n >= max * 0.5 ? C.warning : C.primary
 
   const MODOS: { key: Modo; label: string; color: string }[] = [
-    { key: 'cantidad',   label: 'Cantidad',   color: C.primary },
-    { key: 'magnitud',   label: 'Magnitud',   color: C.warning },
-    { key: 'profundidad',label: 'Profundidad',color: '#6366f1' },
+    { key: 'cantidad',    label: 'Cantidad',    color: C.primary },
+    { key: 'magnitud',    label: 'Magnitud',    color: C.warning },
+    { key: 'profundidad', label: 'Profundidad', color: '#6366f1' },
   ]
 
   return (
@@ -113,6 +116,11 @@ export default function StatsChart({ estadisticas, loading }: Props) {
         </div>
         <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>
           <span style={{ color: C.text, fontWeight: 700 }}>{total.toLocaleString('es-PE')}</span> total
+          {estadisticas.length > 0 && (
+            <span style={{ color: C.textMuted }}>
+              {' · '}{estadisticas[0].anio}–{estadisticas[estadisticas.length - 1].anio}
+            </span>
+          )}
         </span>
       </div>
 
@@ -175,4 +183,6 @@ export default function StatsChart({ estadisticas, loading }: Props) {
       </div>
     </div>
   )
-}
+})
+
+export default StatsChart

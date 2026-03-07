@@ -1,5 +1,11 @@
 ﻿// ══════════════════════════════════════════════════════════
-// GeoRiesgo Perú — App.tsx v4.0
+// GeoRiesgo Perú — App.tsx v6.0
+// Mejoras:
+// - Pasa `filtros` a MapView (para DataFilterExtension GPU)
+// - recargarSismos sólo se llama cuando cambia región o profundidad
+// - filtrosRef para comparar sin stale closure
+// - Panel de riesgo de punto (f_riesgo_punto)
+// - v6.0 en header/statusbar
 // ══════════════════════════════════════════════════════════
 
 import { useState, useCallback, useEffect, useRef } from 'react'
@@ -9,7 +15,7 @@ import FilterPanel    from './components/FilterPanel'
 import StatsChart     from './components/StatsChart'
 import LandingPage    from './components/Landingpage'
 import { useMapData } from './hooks/useMapData'
-import type { CapasActivas, FiltrosSismos, TipoVista, TooltipInfo } from './types'
+import type { CapasActivas, FiltrosSismos, TipoVista, TooltipInfo, RiesgoInfo } from './types'
 import type { MapStyle } from './components/MapView'
 
 const C = {
@@ -22,7 +28,6 @@ const C = {
   text:      '#0f172a',  textSec: '#475569', textMuted: '#94a3b8',
 }
 
-// ── Íconos SVG ─────────────────────────────────────────────
 const Icons = {
   Menu:    () => <svg width="16" height="12" viewBox="0 0 16 12" fill="currentColor"><rect y="0" width="16" height="2" rx="1"/><rect y="5" width="11" height="2" rx="1"/><rect y="10" width="16" height="2" rx="1"/></svg>,
   Chart:   () => <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><rect x="1" y="7" width="2.5" height="6"/><rect x="5.75" y="4" width="2.5" height="9"/><rect x="10.5" y="1" width="2.5" height="12"/></svg>,
@@ -31,19 +36,24 @@ const Icons = {
   Refresh: () => <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12.5 2.5A6 6 0 1 1 8.5 1.5"/><polyline points="8.5,1.5 12.5,1.5 12.5,5.5"/></svg>,
   X:       () => <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>,
   Locate:  () => <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><circle cx="7" cy="7" r="3"/><line x1="7" y1="1" x2="7" y2="4"/><line x1="7" y1="10" x2="7" y2="13"/><line x1="1" y1="7" x2="4" y2="7"/><line x1="10" y1="7" x2="13" y2="7"/></svg>,
-  Map:     () => <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5,1 9,1 13,4 13,13 9,13 5,10 1,13 1,4"/><line x1="5" y1="1" x2="5" y2="10"/><line x1="9" y1="1" x2="9" y2="13"/></svg>,
   Globe:   () => <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><circle cx="7" cy="7" r="6"/><path d="M1 7h12M7 1c-2 2-3 4-3 6s1 4 3 6M7 1c2 2 3 4 3 6s-1 4-3 6"/></svg>,
 }
 
-// ── Estado inicial ─────────────────────────────────────────
 const CAPAS_INIT: CapasActivas = {
-  sismos: true, heatmap: false, fallas: true,
-  inundaciones: false, tsunamis: false, riesgo_distritos: true,
-  infraestructura: false, estaciones: false, extrusion_3d: false,
+  sismos:           true,
+  heatmap:          false,
+  departamentos:    false,
+  fallas:           true,
+  inundaciones:     false,
+  tsunamis:         false,
+  deslizamientos:   false,
+  riesgo_distritos: true,
+  infraestructura:  false,
+  estaciones:       false,
+  extrusion_3d:     false,
 }
 const FILTROS_INIT: FiltrosSismos = { mag_min: 3.0, mag_max: 9.5, year_start: 1960, year_end: 2030 }
 
-// ── Toast ──────────────────────────────────────────────────
 interface Toast { id: number; type: 'error' | 'success' | 'warn'; msg: string }
 const TOAST_C = {
   error:   { fg: C.danger,  bg: C.dangerBg  },
@@ -56,14 +66,7 @@ function ToastList({ toasts, remove }: { toasts: Toast[]; remove: (id: number) =
   return (
     <div style={{ position: 'fixed', bottom: 52, right: 14, zIndex: 300, display: 'flex', flexDirection: 'column', gap: 7 }}>
       {toasts.map(t => (
-        <div key={t.id} style={{
-          display: 'flex', alignItems: 'flex-start', gap: 10, padding: '9px 12px',
-          background: TOAST_C[t.type].bg,
-          border: `1px solid ${TOAST_C[t.type].fg}30`,
-          borderLeft: `3px solid ${TOAST_C[t.type].fg}`,
-          borderRadius: 10, boxShadow: '0 4px 14px rgba(0,0,0,0.07)',
-          animation: 'slideInR 0.2s ease', maxWidth: 300,
-        }}>
+        <div key={t.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '9px 12px', background: TOAST_C[t.type].bg, border: `1px solid ${TOAST_C[t.type].fg}30`, borderLeft: `3px solid ${TOAST_C[t.type].fg}`, borderRadius: 10, boxShadow: '0 4px 14px rgba(0,0,0,0.07)', animation: 'slideInR 0.2s ease', maxWidth: 300 }}>
           <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: C.text, flex: 1, lineHeight: 1.4 }}>{t.msg}</span>
           <button onClick={() => remove(t.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.textMuted, padding: 0 }}>
             <Icons.X />
@@ -74,7 +77,6 @@ function ToastList({ toasts, remove }: { toasts: Toast[]; remove: (id: number) =
   )
 }
 
-// ── Loader ─────────────────────────────────────────────────
 function Loader({ pct }: { pct: number }) {
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 999, background: C.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 24 }}>
@@ -99,7 +101,6 @@ function Loader({ pct }: { pct: number }) {
   )
 }
 
-// ── Tooltip hover sobre features ───────────────────────────
 function HoverTooltip({ info }: { info: TooltipInfo }) {
   if (!info.object?.properties) return null
   const p   = info.object.properties as Record<string, unknown>
@@ -142,7 +143,6 @@ function HoverTooltip({ info }: { info: TooltipInfo }) {
   )
 }
 
-// ── Popup de detalle al hacer clic ─────────────────────────
 const RISK_LABELS = ['Muy bajo', 'Bajo', 'Moderado', 'Alto', 'Muy alto']
 const RISK_COLORS = [C.primary, '#10b981', C.warning, '#f97316', C.danger]
 
@@ -159,37 +159,39 @@ function InfoPopup({ props, layer, onClose }: {
   props: Record<string, unknown>; layer: string; onClose: () => void
 }) {
   const p = props
-  const isSismo  = 'magnitud' in p
-  const isFalla  = 'activa' in p
-  const isDistrito = 'nivel_riesgo' in p && 'nombre' in p && !isFalla && !isSismo
-  const isInfra  = 'criticidad' in p
-  const isTsunami = 'altura_ola_m' in p
-  const isEstacion = 'codigo' in p
+  const isSismo       = 'magnitud'     in p
+  const isFalla       = 'activa'       in p && 'longitud_km' in p
+  const isDepartamento= 'capital'      in p && 'area_km2' in p && !isSismo
+  const isDistrito    = 'nivel_riesgo' in p && 'provincia' in p && !isFalla && !isSismo
+  const isInfra       = 'criticidad'   in p
+  const isTsunami     = 'altura_ola_m' in p
+  const isDesliz      = 'activo'       in p && 'tipo' in p && !isFalla
+  const isEstacion    = 'codigo'       in p
 
   const accentColor =
-    isSismo   ? C.danger  :
-    isFalla   ? C.warning :
-    isDistrito? C.primary :
-    isInfra   ? C.accent  :
-    isTsunami ? '#06b6d4' :
+    isSismo       ? C.danger    :
+    isFalla       ? C.warning   :
+    isDepartamento? '#7c3aed'   :
+    isDistrito    ? C.primary   :
+    isInfra       ? C.accent    :
+    isTsunami     ? '#06b6d4'   :
+    isDesliz      ? '#92400e'   :
     C.textMuted
 
   const kindLabel =
-    isSismo   ? 'Sismo'           :
-    isFalla   ? 'Falla Geológica' :
-    isDistrito? 'Distrito'        :
-    isInfra   ? 'Infraestructura' :
-    isTsunami ? 'Zona Tsunami'    :
-    isEstacion? 'Estación'        :
+    isSismo       ? 'Sismo'           :
+    isFalla       ? 'Falla Geológica' :
+    isDepartamento? 'Departamento'    :
+    isDistrito    ? 'Distrito'        :
+    isInfra       ? 'Infraestructura' :
+    isTsunami     ? 'Zona Tsunami'    :
+    isDesliz      ? 'Deslizamiento'   :
+    isEstacion    ? 'Estación'        :
     'Elemento'
 
   return (
-    <div style={{
-      position: 'absolute', bottom: 48, left: 14, zIndex: 50, width: 280,
-      animation: 'slideUp 0.2s ease-out forwards',
-    }}>
+    <div style={{ position: 'absolute', bottom: 48, left: 14, zIndex: 50, width: 280, animation: 'slideUp 0.2s ease-out forwards' }}>
       <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderTop: `3px solid ${accentColor}`, borderRadius: 14, overflow: 'hidden', boxShadow: '0 8px 32px rgba(0,0,0,0.1)' }}>
-        {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '9px 12px', background: C.bgSoft, borderBottom: `1px solid ${C.border}` }}>
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, fontWeight: 700, color: accentColor, letterSpacing: '0.08em' }}>{kindLabel}</span>
           <button onClick={onClose} style={{ width: 22, height: 22, borderRadius: 6, background: C.bgMuted, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -197,8 +199,8 @@ function InfoPopup({ props, layer, onClose }: {
           </button>
         </div>
 
-        {/* Cuerpo */}
         <div style={{ padding: '12px 14px' }}>
+          {/* SISMO */}
           {isSismo && (() => {
             const mag  = Number(p.magnitud ?? 0)
             const prof = Number(p.profundidad_km ?? 0)
@@ -209,10 +211,10 @@ function InfoPopup({ props, layer, onClose }: {
                   <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 40, fontWeight: 800, color: mc, lineHeight: 1 }}>{mag.toFixed(1)}</span>
                   <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: C.textMuted }}>Mw</span>
                 </div>
-                <Row label="Fecha"         value={String(p.fecha ?? '')} />
-                <Row label="Profundidad"   value={`${prof} km`} color={prof < 30 ? C.danger : prof < 70 ? '#f97316' : '#0ea5e9'} />
-                <Row label="Tipo"          value={String(p.tipo_profundidad ?? '')} />
-                <Row label="ID USGS"       value={String(p.usgs_id ?? '-')} />
+                <Row label="Fecha"       value={String(p.fecha ?? '')} />
+                <Row label="Profundidad" value={`${prof} km`} color={prof < 30 ? C.danger : prof < 70 ? '#f97316' : '#0ea5e9'} />
+                <Row label="Tipo"        value={String(p.tipo_profundidad ?? '')} />
+                <Row label="ID USGS"     value={String(p.usgs_id ?? '-')} />
                 {p.region && <Row label="Región" value={String(p.region)} />}
                 <div style={{ marginTop: 7, padding: '7px 10px', background: C.bgSoft, borderRadius: 8, fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textSec, lineHeight: 1.4 }}>
                   {String(p.lugar ?? '')}
@@ -221,40 +223,56 @@ function InfoPopup({ props, layer, onClose }: {
             )
           })()}
 
-          {isDistrito && (() => {
+          {/* DEPARTAMENTO */}
+          {isDepartamento && (() => {
             const nivel = Math.max(1, Math.min(5, Number(p.nivel_riesgo ?? 1)))
             return (
               <>
-                <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 10 }}>
-                  {String(p.nombre ?? '')}
-                </p>
+                <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 10 }}>{String(p.nombre ?? '')}</p>
+                {p.capital  && <Row label="Capital" value={String(p.capital)} />}
+                {p.area_km2 && <Row label="Área"    value={`${Number(p.area_km2).toLocaleString('es-PE')} km²`} />}
+                {p.ubigeo   && <Row label="Ubigeo"  value={String(p.ubigeo)} />}
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>Nivel de riesgo</span>
+                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 700, color: RISK_COLORS[nivel - 1] }}>{RISK_LABELS[nivel - 1]}</span>
+                </div>
+                <div style={{ display: 'flex', gap: 3 }}>
+                  {RISK_LABELS.map((_, i) => (
+                    <div key={i} style={{ flex: 1, height: 5, borderRadius: 3, background: i < nivel ? RISK_COLORS[i] : C.bgMuted }} />
+                  ))}
+                </div>
+              </>
+            )
+          })()}
+
+          {/* DISTRITO */}
+          {isDistrito && !isDepartamento && (() => {
+            const nivel = Math.max(1, Math.min(5, Number(p.nivel_riesgo ?? 1)))
+            return (
+              <>
+                <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 10 }}>{String(p.nombre ?? '')}</p>
                 {p.provincia    && <Row label="Provincia"    value={String(p.provincia)} />}
                 {p.departamento && <Row label="Departamento" value={String(p.departamento)} />}
-                <div style={{ marginBottom: 6 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
-                    <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>Nivel de riesgo</span>
-                    <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 700, color: RISK_COLORS[nivel - 1] }}>
-                      {RISK_LABELS[nivel - 1]}
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', gap: 3 }}>
-                    {RISK_LABELS.map((_, i) => (
-                      <div key={i} style={{ flex: 1, height: 5, borderRadius: 3, background: i < nivel ? RISK_COLORS[i] : C.bgMuted }} />
-                    ))}
-                  </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>Nivel de riesgo</span>
+                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 700, color: RISK_COLORS[nivel - 1] }}>{RISK_LABELS[nivel - 1]}</span>
+                </div>
+                <div style={{ display: 'flex', gap: 3 }}>
+                  {RISK_LABELS.map((_, i) => (
+                    <div key={i} style={{ flex: 1, height: 5, borderRadius: 3, background: i < nivel ? RISK_COLORS[i] : C.bgMuted }} />
+                  ))}
                 </div>
                 {p.fuente && <Row label="Fuente" value={String(p.fuente)} />}
               </>
             )
           })()}
 
+          {/* FALLA */}
           {isFalla && (() => {
             const activa = Boolean(p.activa)
             return (
               <>
-                <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 8 }}>
-                  {String(p.nombre ?? '')}
-                </p>
+                <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 8 }}>{String(p.nombre ?? '')}</p>
                 {p.nombre_alt && <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: C.textMuted, marginBottom: 8 }}>{String(p.nombre_alt)}</p>}
                 <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', background: activa ? C.dangerBg : C.bgMuted, borderRadius: 99, marginBottom: 8 }}>
                   <div style={{ width: 6, height: 6, borderRadius: '50%', background: activa ? C.danger : C.textMuted }} />
@@ -262,13 +280,12 @@ function InfoPopup({ props, layer, onClose }: {
                     {activa ? 'Falla Activa' : 'Falla Inactiva'}
                   </span>
                 </div>
-                {p.tipo        && <Row label="Tipo"        value={String(p.tipo)} />}
-                {p.mecanismo   && <Row label="Mecanismo"   value={String(p.mecanismo)} />}
-                {p.longitud_km && <Row label="Longitud"    value={`${Number(p.longitud_km).toFixed(1)} km`} />}
-                {p.magnitud_max && <Row label="Mag. máx."  value={`${p.magnitud_max} Mw`} color={C.danger} />}
-                {p.region      && <Row label="Región"      value={String(p.region)} />}
-                {p.fuente      && <Row label="Fuente"      value={String(p.fuente)} />}
-                {p.referencia  && (
+                {p.tipo         && <Row label="Tipo"        value={String(p.tipo)} />}
+                {p.mecanismo    && <Row label="Mecanismo"   value={String(p.mecanismo)} />}
+                {p.longitud_km  && <Row label="Longitud"    value={`${Number(p.longitud_km).toFixed(1)} km`} />}
+                {p.magnitud_max && <Row label="Mag. máx."   value={`${p.magnitud_max} Mw`} color={C.danger} />}
+                {p.region       && <Row label="Región"      value={String(p.region)} />}
+                {p.referencia   && (
                   <div style={{ marginTop: 6, padding: '6px 9px', background: C.bgSoft, borderRadius: 7, fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: C.textMuted, lineHeight: 1.4 }}>
                     {String(p.referencia)}
                   </div>
@@ -277,25 +294,47 @@ function InfoPopup({ props, layer, onClose }: {
             )
           })()}
 
+          {/* DESLIZAMIENTO */}
+          {isDesliz && (() => {
+            const nivel  = Math.max(1, Math.min(5, Number(p.nivel_riesgo ?? 1)))
+            const activo = Boolean(p.activo)
+            return (
+              <>
+                <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 8 }}>{String(p.nombre ?? 'Zona de deslizamiento')}</p>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', background: activo ? '#fef3c7' : C.bgMuted, borderRadius: 99, marginBottom: 8 }}>
+                  <div style={{ width: 6, height: 6, borderRadius: '50%', background: activo ? '#92400e' : C.textMuted }} />
+                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: activo ? '#92400e' : C.textMuted }}>
+                    {activo ? 'Activo' : 'Inactivo'}
+                  </span>
+                </div>
+                {p.tipo     && <Row label="Tipo"  value={String(p.tipo)} />}
+                {p.area_km2 && <Row label="Área"  value={`${Number(p.area_km2).toFixed(2)} km²`} />}
+                <div style={{ display: 'flex', gap: 3, marginTop: 6 }}>
+                  {RISK_LABELS.map((_, i) => (
+                    <div key={i} style={{ flex: 1, height: 5, borderRadius: 3, background: i < nivel ? RISK_COLORS[i] : C.bgMuted }} />
+                  ))}
+                </div>
+                {p.region && <Row label="Región" value={String(p.region)} />}
+              </>
+            )
+          })()}
+
+          {/* TSUNAMI */}
           {isTsunami && (() => (
             <>
-              <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 10 }}>
-                {String(p.nombre ?? '')}
-              </p>
-              {p.altura_ola_m     && <Row label="Altura ola"     value={`${p.altura_ola_m} m`} color="#06b6d4" />}
-              {p.tiempo_arribo_min && <Row label="Tiempo arribo"  value={`${p.tiempo_arribo_min} min`} />}
-              {p.periodo_retorno  && <Row label="Período retorno" value={`${p.periodo_retorno} años`} />}
-              {p.nivel_riesgo     && <Row label="Nivel riesgo"    value={String(p.nivel_riesgo)} color={C.danger} />}
-              {p.region           && <Row label="Región"          value={String(p.region)} />}
-              {p.fuente           && <Row label="Fuente"          value={String(p.fuente)} />}
+              <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 10 }}>{String(p.nombre ?? '')}</p>
+              {p.altura_ola_m      && <Row label="Altura ola"     value={`${p.altura_ola_m} m`}        color="#06b6d4" />}
+              {p.tiempo_arribo_min && <Row label="Tiempo arribo"  value={`${p.tiempo_arribo_min} min`}               />}
+              {p.periodo_retorno   && <Row label="Período retorno" value={`${p.periodo_retorno} años`}               />}
+              {p.nivel_riesgo      && <Row label="Nivel riesgo"    value={String(p.nivel_riesgo)}       color={C.danger} />}
+              {p.region            && <Row label="Región"          value={String(p.region)} />}
             </>
           ))()}
 
+          {/* ESTACIÓN */}
           {isEstacion && (() => (
             <>
-              <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 10 }}>
-                {String(p.nombre ?? '')}
-              </p>
+              <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 10 }}>{String(p.nombre ?? '')}</p>
               {p.codigo      && <Row label="Código"      value={String(p.codigo)} />}
               {p.tipo        && <Row label="Tipo"        value={String(p.tipo)} />}
               {p.institucion && <Row label="Institución" value={String(p.institucion)} />}
@@ -304,13 +343,14 @@ function InfoPopup({ props, layer, onClose }: {
             </>
           ))()}
 
-          {isInfra && !isTsunami && !isEstacion && (
+          {/* INFRAESTRUCTURA */}
+          {isInfra && !isTsunami && !isEstacion && !isDesliz && (
             <>
-              {p.nombre && <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 8 }}>{String(p.nombre)}</p>}
-              {p.tipo        && <Row label="Tipo"       value={String(p.tipo).replace('_', ' ')} />}
-              {p.criticidad  && <Row label="Criticidad" value={`${p.criticidad}/5`} color={Number(p.criticidad) >= 4 ? C.danger : C.warning} />}
-              {p.estado      && <Row label="Estado"     value={String(p.estado)} />}
-              {p.region      && <Row label="Región"     value={String(p.region)} />}
+              {p.nombre     && <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 8 }}>{String(p.nombre)}</p>}
+              {p.tipo       && <Row label="Tipo"       value={String(p.tipo).replace('_', ' ')} />}
+              {p.criticidad && <Row label="Criticidad" value={`${p.criticidad}/5`} color={Number(p.criticidad) >= 4 ? C.danger : C.warning} />}
+              {p.estado     && <Row label="Estado"     value={String(p.estado)} />}
+              {p.region     && <Row label="Región"     value={String(p.region)} />}
             </>
           )}
         </div>
@@ -319,7 +359,58 @@ function InfoPopup({ props, layer, onClose }: {
   )
 }
 
-// ── Btn ────────────────────────────────────────────────────
+// ── Panel de riesgo de punto (f_riesgo_punto v6.0) ────────
+function RiesgoPanel({ riesgo, loading, onClose }: {
+  riesgo: RiesgoInfo | null; loading: boolean; onClose: () => void
+}) {
+  if (!loading && !riesgo) return null
+  const nivel = riesgo ? Math.max(1, Math.min(5, riesgo.nivel_riesgo)) : 0
+
+  return (
+    <div style={{ position: 'absolute', bottom: 48, right: 14, zIndex: 50, width: 240, animation: 'slideUp 0.2s ease-out forwards' }}>
+      <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderTop: `3px solid ${C.primary}`, borderRadius: 14, overflow: 'hidden', boxShadow: '0 8px 32px rgba(0,0,0,0.1)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '9px 12px', background: C.bgSoft, borderBottom: `1px solid ${C.border}` }}>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, fontWeight: 700, color: C.primary }}>Riesgo del punto</span>
+          <button onClick={onClose} style={{ width: 22, height: 22, borderRadius: 6, background: C.bgMuted, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Icons.X />
+          </button>
+        </div>
+        <div style={{ padding: '12px 14px' }}>
+          {loading ? (
+            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, textAlign: 'center', padding: '8px 0' }}>
+              Calculando...
+            </div>
+          ) : riesgo ? (
+            <>
+              <div style={{ textAlign: 'center', marginBottom: 10 }}>
+                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 32, fontWeight: 800, color: RISK_COLORS[nivel - 1], lineHeight: 1 }}>
+                  {riesgo.nivel_riesgo.toFixed(1)}
+                </div>
+                <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: RISK_COLORS[nivel - 1], marginTop: 2 }}>
+                  {RISK_LABELS[nivel - 1]}
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 3, marginBottom: 10 }}>
+                {RISK_LABELS.map((_, i) => (
+                  <div key={i} style={{ flex: 1, height: 5, borderRadius: 3, background: i < nivel ? RISK_COLORS[i] : C.bgMuted }} />
+                ))}
+              </div>
+              {riesgo.region   && <Row label="Región"   value={riesgo.region} />}
+              {riesgo.distrito && <Row label="Distrito" value={riesgo.distrito} />}
+              <Row label="Sismos 5km"  value={riesgo.sismos_cercanos_5km}  />
+              <Row label="Sismos 20km" value={riesgo.sismos_cercanos_20km} />
+              {riesgo.falla_mas_cercana && (
+                <Row label="Falla cercana" value={`${riesgo.falla_mas_cercana} (${riesgo.dist_falla_km?.toFixed(1)} km)`} color={C.warning} />
+              )}
+              <Row label="Infra cercana" value={riesgo.infraestructura_cercana} />
+            </>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function Btn({ active, onClick, title, children }: {
   active: boolean; onClick: () => void; title?: string; children: React.ReactNode
 }) {
@@ -352,16 +443,24 @@ export default function App() {
   const [sidebar,   setSidebar]   = useState(true)
   const [chart,     setChart]     = useState(true)
   const [toasts,    setToasts]    = useState<Toast[]>([])
+  const [showRiesgo, setShowRiesgo] = useState(false)
 
-  const { data, loading, errors, recargarSismos, recargarTodo } = useMapData()
+  const {
+    data, loading, errors,
+    riesgo, riesgoLoading,
+    recargarSismos, buscarRiesgo, recargarTodo,
+  } = useMapData()
 
-  // % de carga total para el loader
-  const totalKeys = 8
+  // Ref para comparar filtros previos sin stale closure
+  const filtrosRef = useRef(filtros)
+  filtrosRef.current = filtros
+
+  const totalKeys = Object.keys(loading).length
   const doneKeys  = Object.values(loading).filter(v => !v).length
   const loadPct   = (doneKeys / totalKeys) * 100
-  const isInitial = doneKeys < 3  // Mostrar loader hasta que 3 capas carguen
+  const isInitial = doneKeys < 3
+  const totalErr  = Object.values(errors).filter(Boolean).length
 
-  // Mostrar errores como toasts (una vez por error único)
   const shownErr = useRef(new Set<string>())
   useEffect(() => {
     Object.entries(errors).forEach(([k, v]) => {
@@ -379,35 +478,44 @@ export default function App() {
     setTimeout(() => setToasts(p => p.filter(t => t.id !== id)), 5000)
   }
 
-  // Atajos de teclado
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (e.key === 'l' || e.key === 'L') setSidebar(p => !p)
       if (e.key === 'f' || e.key === 'F') { setSidebar(true); setTab('filtros') }
       if (e.key === 'g' || e.key === 'G') setChart(p => !p)
-      if (e.key === 'Escape') { setPopup(null); setTooltip(null) }
+      if (e.key === 'Escape') { setPopup(null); setTooltip(null); setShowRiesgo(false) }
       if (e.key === 'r' || e.key === 'R') window.dispatchEvent(new CustomEvent('geo:center-ica'))
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
   }, [])
 
+  /**
+   * handleFiltros v6.0:
+   * - Actualiza el estado de filtros siempre (para DataFilterExtension GPU)
+   * - Sólo llama recargarSismos si cambió región o profundidad (filtros server-side)
+   * - mag/year son filtrados en GPU sin llamada a la API
+   */
   const handleFiltros = useCallback((f: FiltrosSismos) => {
     setFiltros(f)
-    recargarSismos(f)
+    const prev = filtrosRef.current
+    const serverFilterChanged = f.region !== prev.region || f.profundidad !== prev.profundidad
+    if (serverFilterChanged) {
+      recargarSismos(f)
+    }
   }, [recargarSismos])
 
   const handleClick = useCallback((props: Record<string, unknown>, layer: string) => {
     setTooltip(null)
     setPopup({ props, layer })
+    setShowRiesgo(false)
   }, [])
 
   const sidebarW = sidebar ? 268 : 0
-  const totalErr = Object.values(errors).filter(Boolean).length
 
-  const MAP_STYLES: { key: MapStyle; label: string }[] = [
-    { key: 'light', label: 'Claro' },
+  const MAP_STYLES_LIST: { key: MapStyle; label: string }[] = [
+    { key: 'light', label: 'Claro'  },
     { key: 'dark',  label: 'Oscuro' },
   ]
 
@@ -429,13 +537,12 @@ export default function App() {
                 GeoRiesgo <span style={{ color: C.primary }}>Perú</span>
               </div>
               <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
-                Riesgo Sísmico · v4.0
+                Riesgo Sísmico · v6.0
               </div>
             </div>
           </div>
         </div>
 
-        {/* Badge sismos */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 13px', background: C.bgSoft, border: `1px solid ${C.border}`, borderRadius: 99 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: C.primary, animation: 'pring 1.8s ease-out infinite' }} />
           {loading.sismos
@@ -447,9 +554,8 @@ export default function App() {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-          {/* Estilo de mapa */}
           <div style={{ display: 'flex', background: C.bgMuted, border: `1px solid ${C.border}`, borderRadius: 8, padding: 2, marginRight: 4 }}>
-            {MAP_STYLES.map(({ key, label }) => (
+            {MAP_STYLES_LIST.map(({ key, label }) => (
               <button key={key} onClick={() => setMapStyle(key)} style={{
                 padding: '3px 9px', borderRadius: 6, border: 'none', cursor: 'pointer',
                 fontFamily: "'DM Mono',monospace", fontSize: 9, fontWeight: 700,
@@ -461,7 +567,6 @@ export default function App() {
             ))}
           </div>
 
-          {/* Vista 2D/3D */}
           <div style={{ display: 'flex', background: C.bgMuted, border: `1px solid ${C.border}`, borderRadius: 8, padding: 2, marginRight: 4 }}>
             {(['2d', '3d'] as TipoVista[]).map(v => (
               <button key={v} onClick={() => setVista(v)} style={{
@@ -474,10 +579,10 @@ export default function App() {
             ))}
           </div>
 
-          <Btn active={chart}                onClick={() => setChart(p => !p)}                              title="Gráfica [G]"><Icons.Chart /></Btn>
-          <Btn active={tab==='capas'&&sidebar}   onClick={() => { setSidebar(true); setTab('capas') }}        title="Capas [L]"><Icons.Layers /></Btn>
-          <Btn active={tab==='filtros'&&sidebar} onClick={() => { setSidebar(true); setTab('filtros') }}      title="Filtros [F]"><Icons.Filter /></Btn>
-          <Btn active={false}                onClick={() => { recargarTodo(); addToast('success', 'Recargando datos...') }} title="Recargar [R]"><Icons.Refresh /></Btn>
+          <Btn active={chart}                     onClick={() => setChart(p => !p)}                               title="Gráfica [G]"><Icons.Chart /></Btn>
+          <Btn active={tab==='capas'&&sidebar}    onClick={() => { setSidebar(true); setTab('capas') }}           title="Capas [L]"><Icons.Layers /></Btn>
+          <Btn active={tab==='filtros'&&sidebar}  onClick={() => { setSidebar(true); setTab('filtros') }}         title="Filtros [F]"><Icons.Filter /></Btn>
+          <Btn active={false}                     onClick={() => { recargarTodo(); addToast('success', 'Recargando datos...') }} title="Recargar"><Icons.Refresh /></Btn>
         </div>
       </header>
 
@@ -487,7 +592,6 @@ export default function App() {
         {/* Sidebar */}
         <aside style={{ flexShrink: 0, width: sidebarW, overflow: 'hidden', transition: 'width 0.26s cubic-bezier(0.4,0,0.2,1)', background: C.bg, borderRight: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', zIndex: 10 }}>
           <div style={{ width: 268, height: '100%', display: 'flex', flexDirection: 'column', padding: '12px 12px 0' }}>
-            {/* Tabs */}
             <div style={{ display: 'flex', gap: 3, background: C.bgMuted, borderRadius: 10, padding: 3, marginBottom: 16, flexShrink: 0 }}>
               {(['capas', 'filtros'] as const).map(t => (
                 <button key={t} onClick={() => setTab(t)} style={{
@@ -510,14 +614,13 @@ export default function App() {
               }
             </div>
 
-            {/* Footer sidebar */}
             <div style={{ paddingTop: 10, paddingBottom: 12, borderTop: `1px solid ${C.border}`, flexShrink: 0 }}>
               <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, lineHeight: 2.0 }}>
                 USGS · INEI/GADM · IGP · INGEMMET · ANA<br />
                 CENEPRED · PREDES · SENAMHI · OSM
               </p>
               <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: C.textMuted, marginTop: 2 }}>
-                [L] panel  [F] filtros  [G] gráfica  [R] recargar
+                [L] panel  [F] filtros  [G] gráfica  [R] recentrar
               </p>
             </div>
           </div>
@@ -528,24 +631,31 @@ export default function App() {
           <div style={{ flex: 1, position: 'relative' }}>
             <MapView
               sismos={data.sismos}
+              departamentos={data.departamentos}
               distritos={data.distritos}
               fallas={data.fallas}
               inundaciones={data.inundaciones}
               tsunamis={data.tsunamis}
+              deslizamientos={data.deslizamientos}
               infraestructura={data.infraestructura}
               estaciones={data.estaciones}
               capas={capas}
               vista={vista}
               mapStyle={mapStyle}
+              filtros={filtros}
               onClickFeature={handleClick}
               onHoverFeature={setTooltip}
             />
 
-            {/* Tooltip hover */}
             {tooltip && !popup && <HoverTooltip info={tooltip} />}
-
-            {/* Popup detalle */}
             {popup && <InfoPopup props={popup.props} layer={popup.layer} onClose={() => setPopup(null)} />}
+            {showRiesgo && (
+              <RiesgoPanel
+                riesgo={riesgo}
+                loading={riesgoLoading}
+                onClose={() => setShowRiesgo(false)}
+              />
+            )}
 
             {/* Badge ubicación */}
             <div style={{ position: 'absolute', top: 14, left: 14, zIndex: 10, background: 'rgba(255,255,255,0.93)', backdropFilter: 'blur(12px)', border: `1px solid ${C.border}`, borderRadius: 12, padding: '7px 12px', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
@@ -556,7 +666,7 @@ export default function App() {
               <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>14.07°S  75.73°O</div>
             </div>
 
-            {/* Controles recentrar */}
+            {/* Controles recentrar + riesgo de punto */}
             <div style={{ position: 'absolute', top: 14, right: 56, zIndex: 10, display: 'flex', flexDirection: 'column', gap: 5 }}>
               <button title="Centrar en Ica [R]"
                 onClick={() => window.dispatchEvent(new CustomEvent('geo:center-ica'))}
@@ -568,9 +678,19 @@ export default function App() {
                 style={{ width: 34, height: 34, borderRadius: 9, background: 'rgba(255,255,255,0.93)', backdropFilter: 'blur(12px)', border: `1px solid ${C.border}`, color: C.textSec, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 6px rgba(0,0,0,0.06)' }}>
                 <Icons.Globe />
               </button>
+              <button
+                title="Riesgo del punto (Ica)"
+                onClick={() => {
+                  setShowRiesgo(true)
+                  setPopup(null)
+                  buscarRiesgo(-75.73, -14.07) // Centro de Ica
+                }}
+                style={{ width: 34, height: 34, borderRadius: 9, background: showRiesgo ? `${C.primary}15` : 'rgba(255,255,255,0.93)', backdropFilter: 'blur(12px)', border: `1px solid ${showRiesgo ? C.primary : C.border}`, color: showRiesgo ? C.primary : C.textSec, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 6px rgba(0,0,0,0.06)', fontFamily: 'DM Mono', fontSize: 11, fontWeight: 700 }}>
+                R
+              </button>
             </div>
 
-            {/* Indicadores de carga por capa */}
+            {/* Spinner de actualización */}
             {Object.entries(loading).some(([, v]) => v) && !isInitial && (
               <div style={{ position: 'absolute', top: 14, left: '50%', transform: 'translateX(-50%)', zIndex: 10, background: 'rgba(255,255,255,0.93)', backdropFilter: 'blur(12px)', border: `1px solid ${C.border}`, borderRadius: 20, padding: '5px 14px', display: 'flex', alignItems: 'center', gap: 8 }}>
                 <div style={{ width: 10, height: 10, borderRadius: '50%', border: `2px solid ${C.primary}30`, borderTopColor: C.primary, animation: 'spin 0.6s linear infinite' }} />
@@ -586,20 +706,20 @@ export default function App() {
             </div>
           </div>
 
-          {/* Barra de estado */}
+          {/* Status bar */}
           <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 22, background: C.bgSoft, borderTop: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', padding: '0 12px', gap: 10, zIndex: 40, fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>
-            <span>{Object.values(capas).filter(Boolean).length} capas</span>
+            <span>{Object.values(capas).filter(Boolean).length} capas activas</span>
             <span style={{ width: 1, height: 10, background: C.border }} />
             <span style={{ color: vista === '3d' ? C.accent : C.textMuted }}>{vista.toUpperCase()}</span>
             <span style={{ width: 1, height: 10, background: C.border }} />
-            <span style={{ color: mapStyle === 'dark' ? C.secondary : C.textMuted }}>{mapStyle === 'dark' ? 'Mapa oscuro' : 'Mapa claro'}</span>
+            <span>{mapStyle === 'dark' ? 'Mapa oscuro' : 'Mapa claro'}</span>
+            <span style={{ width: 1, height: 10, background: C.border }} />
+            <span style={{ color: C.primary }}>GPU filter · {filtros.mag_min.toFixed(1)}–{filtros.mag_max.toFixed(1)} Mw · {filtros.year_start}–{filtros.year_end}</span>
             {totalErr > 0 && <>
               <span style={{ width: 1, height: 10, background: C.border }} />
               <span style={{ color: C.danger }}>{totalErr} error{totalErr > 1 ? 'es' : ''}</span>
             </>}
-            <span style={{ marginLeft: 'auto' }}>
-              USGS · IGP · ANA · CENEPRED · OSM
-            </span>
+            <span style={{ marginLeft: 'auto' }}>USGS · IGP · ANA · CENEPRED · OSM · v6.0</span>
           </div>
         </div>
       </div>

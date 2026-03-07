@@ -1,5 +1,9 @@
 // ══════════════════════════════════════════════════════════
-// FilterPanel.tsx v4.0
+// FilterPanel.tsx v5.0
+// Con DataFilterExtension (GPU), sliders responden en tiempo real:
+//   - mag_min/max y year_start/year_end → actualización inmediata vía GPU
+//   - profundidad y región → siguen disparando refetch de API
+//   - Eliminado el botón "Aplicar rango" redundante
 // ══════════════════════════════════════════════════════════
 
 import { useState, useEffect } from 'react'
@@ -11,14 +15,15 @@ const C = {
   primary: '#059669', danger: '#dc2626', warning: '#f59e0b',
 }
 
-// ── Componentes base ────────────────────────────────────────
+// ── Componentes base ───────────────────────────────────────
 
 function Slider({
-  label, value, min, max, step, color, unit, format, onChange,
+  label, value, min, max, step, color, unit, format, onChange, onCommit,
 }: {
   label: string; value: number; min: number; max: number; step: number
   color: string; unit?: string; format?: (v: number) => string
   onChange: (v: number) => void
+  onCommit?: (v: number) => void
 }) {
   const pct     = ((value - min) / (max - min)) * 100
   const display = format ? format(value) : `${value}${unit ?? ''}`
@@ -31,6 +36,8 @@ function Slider({
       <input
         type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(Number(e.target.value))}
+        onMouseUp={e => onCommit?.(Number((e.target as HTMLInputElement).value))}
+        onTouchEnd={e => onCommit?.(Number((e.target as HTMLInputElement).value))}
         style={{
           width: '100%', height: 5, borderRadius: 3,
           appearance: 'none', outline: 'none', cursor: 'pointer',
@@ -88,11 +95,14 @@ const REGIONES = [
 interface Props { filtros: FiltrosSismos; onChange: (f: FiltrosSismos) => void }
 
 export default function FilterPanel({ filtros, onChange }: Props) {
-  // Debounce para los sliders (no llamar a la API en cada tick)
   const [local, setLocal] = useState(filtros)
   useEffect(() => { setLocal(filtros) }, [filtros])
 
-  // Aplicar filtros sólo al soltar el slider (onMouseUp / onTouchEnd)
+  /**
+   * apply: llama al padre con los filtros actuales.
+   * Para mag/year: el padre YA NO dispara refetch (lo hace DataFilterExtension en GPU).
+   * Para profundidad/region: el padre sí hace refetch vía API.
+   */
   const apply = (f: FiltrosSismos) => {
     setLocal(f)
     onChange(f)
@@ -105,61 +115,55 @@ export default function FilterPanel({ filtros, onChange }: Props) {
 
   return (
     <div>
-      <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.18em', marginBottom: 18 }}>
+      <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.18em', marginBottom: 4 }}>
         Filtros de búsqueda
       </div>
+      {/* Etiqueta de filtrado GPU */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 16 }}>
+        <div style={{ width: 5, height: 5, borderRadius: '50%', background: C.primary, flexShrink: 0 }} />
+        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: C.primary }}>
+          Mag + año filtran en GPU · sin latencia
+        </span>
+      </div>
 
-      {/* Magnitud */}
+      {/* Magnitud — tiempo real vía DataFilterExtension */}
       <Slider
         label="Magnitud mínima" value={local.mag_min} min={2.5} max={8.5} step={0.1}
         color={C.danger} unit=" Mw"
-        onChange={v => setLocal(p => ({ ...p, mag_min: v }))}
+        onChange={v => apply({ ...local, mag_min: v })}
       />
-      {/* Slider con listener onMouseUp para aplicar */}
-      <div
-        onMouseUp={() => apply(local)}
-        onTouchEnd={() => apply(local)}
-        style={{ marginBottom: 6 }}
-      >
-        <Slider
-          label="Magnitud máxima" value={local.mag_max} min={2.5} max={9.9} step={0.1}
-          color="#f97316" unit=" Mw"
-          onChange={v => setLocal(p => ({ ...p, mag_max: Math.max(v, local.mag_min + 0.5) }))}
-        />
-      </div>
+      <Slider
+        label="Magnitud máxima" value={local.mag_max} min={2.5} max={9.9} step={0.1}
+        color="#f97316" unit=" Mw"
+        onChange={v => apply({ ...local, mag_max: Math.max(v, local.mag_min + 0.5) })}
+      />
 
       {divider}
 
-      {/* Años */}
+      {/* Años — tiempo real vía DataFilterExtension */}
       <Slider
         label="Año inicio" value={local.year_start} min={1900} max={2024} step={1}
         color="#f97316"
-        onChange={v => setLocal(p => ({ ...p, year_start: Math.min(v, p.year_end - 1) }))}
+        onChange={v => apply({ ...local, year_start: Math.min(v, local.year_end - 1) })}
       />
       <Slider
         label="Año fin" value={local.year_end} min={1901} max={2030} step={1}
         color={C.warning}
-        onChange={v => setLocal(p => ({ ...p, year_end: Math.max(v, p.year_start + 1) }))}
+        onChange={v => apply({ ...local, year_end: Math.max(v, local.year_start + 1) })}
       />
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 10 }}>
-        <button
-          onClick={() => apply(local)}
-          style={{
-            padding: '5px 14px', borderRadius: 7, border: 'none',
-            background: C.primary, color: 'white', cursor: 'pointer',
-            fontFamily: "'DM Sans',sans-serif", fontSize: 11, fontWeight: 600,
-          }}
-        >
-          Aplicar rango
-        </button>
-      </div>
 
       {divider}
 
-      {/* Profundidad */}
+      {/* Profundidad — dispara API refetch */}
       <div style={{ marginBottom: 16 }}>
-        <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textMuted, marginBottom: 8 }}>
+        <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textMuted, marginBottom: 6 }}>
           Tipo de profundidad
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 6 }}>
+          <div style={{ width: 5, height: 5, borderRadius: '50%', background: C.warning, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: C.warning }}>
+            Requiere consulta al servidor
+          </span>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
           {PROF_OPTS.map(({ value, label, color }) => (
@@ -173,10 +177,16 @@ export default function FilterPanel({ filtros, onChange }: Props) {
 
       {divider}
 
-      {/* Región */}
+      {/* Región — dispara API refetch */}
       <div style={{ marginBottom: 16 }}>
-        <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textMuted, marginBottom: 8 }}>
+        <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textMuted, marginBottom: 6 }}>
           Región / Departamento
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 6 }}>
+          <div style={{ width: 5, height: 5, borderRadius: '50%', background: C.warning, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: C.warning }}>
+            Requiere consulta al servidor
+          </span>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
           <Chip key="todas" label="Todas" active={!local.region}
