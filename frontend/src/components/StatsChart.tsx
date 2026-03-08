@@ -1,26 +1,33 @@
 ﻿// ══════════════════════════════════════════════════════════
-// StatsChart.tsx v5.0 — React.memo + mejoras de rendimiento
-// React.memo evita re-renders cuando estadísticas no cambian
+// StatsChart.tsx v6.0
+// Nuevos modos: IRC ranking distritos + población por zona
+// React.memo evita re-renders innecesarios
 // ══════════════════════════════════════════════════════════
 
 import { useState, memo } from 'react'
 import {
   BarChart, Bar, AreaChart, Area, XAxis, YAxis,
   Tooltip, ResponsiveContainer, Cell, ReferenceLine,
-  CartesianGrid,
+  CartesianGrid, RadialBarChart, RadialBar, PieChart, Pie,
 } from 'recharts'
-import type { EstadisticaAnual } from '../types'
+import type { EstadisticaAnual, RiesgoConstruccionRanking } from '../types'
 
 const C = {
   primary: '#059669', danger: '#dc2626', warning: '#f59e0b',
   text: '#0f172a', textMuted: '#94a3b8', border: '#e2e8f0', bgMuted: '#f1f5f9',
+  orange: '#f97316', indigo: '#6366f1', amber: '#f59e0b',
 }
 
-type Modo = 'cantidad' | 'magnitud' | 'profundidad'
+const RISK_COLORS = [C.primary, '#10b981', C.warning, C.orange, C.danger]
 
-interface Props { estadisticas: EstadisticaAnual[]; loading: boolean }
+type Modo = 'cantidad' | 'magnitud' | 'profundidad' | 'irc'
 
-// ── Tooltip ────────────────────────────────────────────────
+interface Props {
+  estadisticas: EstadisticaAnual[]
+  loading: boolean
+  ircRanking?: RiesgoConstruccionRanking[]
+}
+
 function CustomTooltip({ active, payload, label }: {
   active?: boolean; payload?: Array<{ value: number; payload: EstadisticaAnual }>; label?: string
 }) {
@@ -30,8 +37,7 @@ function CustomTooltip({ active, payload, label }: {
   return (
     <div style={{
       background: '#fff', border: `1px solid ${C.border}`, borderRadius: 10,
-      padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)',
-      minWidth: 170,
+      padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)', minWidth: 170,
     }}>
       <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>
         {label}
@@ -58,7 +64,38 @@ function CustomTooltip({ active, payload, label }: {
   )
 }
 
-// ── Skeleton ───────────────────────────────────────────────
+function IRCTooltip({ active, payload }: { active?: boolean; payload?: Array<{ payload: RiesgoConstruccionRanking }> }) {
+  if (!active || !payload?.length) return null
+  const d = payload[0]?.payload
+  if (!d) return null
+  const nivel = Math.max(1, Math.min(5, Math.round(d.indice_riesgo_construccion)))
+  return (
+    <div style={{
+      background: '#fff', border: `1px solid ${C.border}`, borderRadius: 10,
+      padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)', minWidth: 200,
+    }}>
+      <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 4 }}>
+        {d.distrito}
+      </p>
+      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
+        {d.departamento}
+      </p>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted }}>IRC</span>
+        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 800, color: RISK_COLORS[nivel - 1] }}>
+          {d.indice_riesgo_construccion.toFixed(2)}
+        </span>
+      </div>
+      {d.zona_sismica && (
+        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted }}>Zona sísmica</span>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, fontWeight: 700, color: C.danger }}>Z{d.zona_sismica} ({d.factor_z}g)</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Skeleton() {
   return (
     <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: 2, paddingBottom: 4 }}>
@@ -72,13 +109,11 @@ function Skeleton() {
   )
 }
 
-// ── StatsChart — React.memo previene re-renders innecesarios
-// cuando el mapa se actualiza pero las estadísticas no cambian
-const StatsChart = memo(function StatsChart({ estadisticas, loading }: Props) {
+const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking = [] }: Props) {
   const [modo, setModo] = useState<Modo>('cantidad')
 
   if (loading) return <Skeleton />
-  if (!estadisticas.length) {
+  if (!estadisticas.length && modo !== 'irc') {
     return (
       <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'DM Mono',monospace", fontSize: 11, color: C.textMuted }}>
         Sin datos — API en línea?
@@ -86,18 +121,22 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading }: Props) {
     )
   }
 
-  const max   = Math.max(...estadisticas.map(e => e.cantidad))
-  const avg   = estadisticas.reduce((s, e) => s + e.cantidad, 0) / estadisticas.length
-  const total = estadisticas.reduce((s, e) => s + e.cantidad, 0)
-  const barC  = (n: number) =>
-    n >= max * 0.8 ? C.danger :
-    n >= max * 0.5 ? C.warning : C.primary
+  const max   = estadisticas.length ? Math.max(...estadisticas.map(e => e.cantidad)) : 0
+  const avg   = estadisticas.length ? estadisticas.reduce((s, e) => s + e.cantidad, 0) / estadisticas.length : 0
+  const total = estadisticas.length ? estadisticas.reduce((s, e) => s + e.cantidad, 0) : 0
+  const barC  = (n: number) => n >= max * 0.8 ? C.danger : n >= max * 0.5 ? C.warning : C.primary
 
   const MODOS: { key: Modo; label: string; color: string }[] = [
-    { key: 'cantidad',    label: 'Cantidad',    color: C.primary },
-    { key: 'magnitud',    label: 'Magnitud',    color: C.warning },
-    { key: 'profundidad', label: 'Profundidad', color: '#6366f1' },
+    { key: 'cantidad',    label: 'Cantidad',  color: C.primary },
+    { key: 'magnitud',    label: 'Magnitud',  color: C.warning },
+    { key: 'profundidad', label: 'Profund.',  color: C.indigo  },
+    { key: 'irc',         label: 'IRC ▸Top',  color: C.amber   },
   ]
+
+  // IRC ranking — top 15 distritos
+  const ircTop = [...ircRanking]
+    .sort((a, b) => b.indice_riesgo_construccion - a.indice_riesgo_construccion)
+    .slice(0, 15)
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -115,11 +154,18 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading }: Props) {
           ))}
         </div>
         <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>
-          <span style={{ color: C.text, fontWeight: 700 }}>{total.toLocaleString('es-PE')}</span> total
-          {estadisticas.length > 0 && (
-            <span style={{ color: C.textMuted }}>
-              {' · '}{estadisticas[0].anio}–{estadisticas[estadisticas.length - 1].anio}
-            </span>
+          {modo === 'irc' ? (
+            <span style={{ color: C.amber, fontWeight: 700 }}>{ircTop.length} distritos · IRC CENEPRED</span>
+          ) : (
+            <>
+              <span style={{ color: C.text, fontWeight: 700 }}>{total.toLocaleString('es-PE')}</span>
+              {' total'}
+              {estadisticas.length > 0 && (
+                <span style={{ color: C.textMuted }}>
+                  {' · '}{estadisticas[0].anio}–{estadisticas[estadisticas.length - 1].anio}
+                </span>
+              )}
+            </>
           )}
         </span>
       </div>
@@ -129,11 +175,8 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading }: Props) {
         <ResponsiveContainer width="100%" height="100%">
           {modo === 'cantidad' ? (
             <BarChart data={estadisticas} margin={{ top: 2, right: 0, left: -30, bottom: 0 }}>
-              <XAxis dataKey="anio"
-                tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }}
-                tickLine={false} axisLine={false} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }}
-                tickLine={false} axisLine={false} />
+              <XAxis dataKey="anio" tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+              <YAxis tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }} tickLine={false} axisLine={false} />
               <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(5,150,105,0.04)' }} />
               <ReferenceLine y={avg} stroke={C.border} strokeDasharray="3 3" />
               <Bar dataKey="cantidad" radius={[2, 2, 0, 0]} maxBarSize={12}>
@@ -152,9 +195,29 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading }: Props) {
               <XAxis dataKey="anio" tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
               <YAxis tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }} tickLine={false} axisLine={false} domain={[4, 'auto']} />
               <Tooltip content={<CustomTooltip />} />
-              <Area dataKey="magnitud_max" stroke={C.warning} strokeWidth={1.5} fill="url(#gMag)" dot={false} />
-              <Area dataKey="magnitud_prom" stroke={C.primary} strokeWidth={1} fill="none" strokeDasharray="3 3" dot={false} />
+              <Area dataKey="magnitud_max"  stroke={C.warning} strokeWidth={1.5} fill="url(#gMag)" dot={false} />
+              <Area dataKey="magnitud_prom" stroke={C.primary} strokeWidth={1}   fill="none" strokeDasharray="3 3" dot={false} />
             </AreaChart>
+          ) : modo === 'irc' ? (
+            <BarChart
+              data={ircTop}
+              layout="vertical"
+              margin={{ top: 0, right: 10, left: 8, bottom: 0 }}
+            >
+              <XAxis type="number" domain={[0, 5]} tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }} tickLine={false} axisLine={false} />
+              <YAxis
+                type="category" dataKey="distrito"
+                tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }}
+                tickLine={false} axisLine={false} width={70}
+              />
+              <Tooltip content={<IRCTooltip />} cursor={{ fill: 'rgba(245,158,11,0.05)' }} />
+              <Bar dataKey="indice_riesgo_construccion" radius={[0, 3, 3, 0]} maxBarSize={10}>
+                {ircTop.map((e, i) => {
+                  const nivel = Math.max(1, Math.min(5, Math.round(e.indice_riesgo_construccion)))
+                  return <Cell key={i} fill={RISK_COLORS[nivel - 1]} />
+                })}
+              </Bar>
+            </BarChart>
           ) : (
             <AreaChart data={estadisticas} margin={{ top: 2, right: 0, left: -30, bottom: 0 }}>
               <defs>

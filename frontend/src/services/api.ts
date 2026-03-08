@@ -1,38 +1,43 @@
 // ══════════════════════════════════════════════════════════
-// GeoRiesgo Perú — API Service v6.0
-// Mejoras: deduplicación de requests en vuelo, nuevos endpoints
-// riesgo + diagnostico/regiones, sismos con rango amplio
+// GeoRiesgo Perú — API Service v7.0
+// Nuevos endpoints: zonas-sismicas, riesgo/construccion,
+// infraestructura/cobertura, poblacion, IRC mapa/ranking
 // ══════════════════════════════════════════════════════════
 
-import type { EstadisticaAnual, FiltrosSismos, RiesgoInfo, DiagnosticoLayer } from '../types'
+import type {
+  EstadisticaAnual, FiltrosSismos, RiesgoInfo, DiagnosticoLayer,
+  ZonaSismicaInfo, RiesgoConstruccionPunto, RiesgoConstruccionRanking,
+  CoberturaTipo, PoblacionZona,
+} from '../types'
 
 const BASE = (import.meta.env.VITE_API_URL ?? '') as string
 const API  = `${BASE}/api/v1`
 
-// ── Cache en memoria (TTL por capa) ───────────────────────
-interface CacheEntry<T> {
-  data:   T
-  ts:     number
-  etag?:  string
-}
+// ── Cache en memoria ──────────────────────────────────────
+interface CacheEntry<T> { data: T; ts: number; etag?: string }
 const CACHE    = new Map<string, CacheEntry<unknown>>()
-// Deduplicación: map de requests en vuelo (evita llamadas paralelas idénticas)
 const INFLIGHT = new Map<string, Promise<unknown>>()
 
 const TTL: Record<string, number> = {
-  departamentos:  20 * 60_000,
-  distritos:      10 * 60_000,
-  fallas:         15 * 60_000,
-  inundaciones:   15 * 60_000,
-  tsunamis:       15 * 60_000,
-  deslizamientos: 15 * 60_000,
-  infraestructura:10 * 60_000,
-  estaciones:     20 * 60_000,
-  estadisticas:    5 * 60_000,
-  sismos:          5 * 60_000,  // 5 min — carga amplia una sola vez
-  heatmap:         2 * 60_000,
-  riesgo:         30_000,
-  diagnostico:     5 * 60_000,
+  departamentos:         20 * 60_000,
+  distritos:             10 * 60_000,
+  fallas:                15 * 60_000,
+  inundaciones:          15 * 60_000,
+  tsunamis:              15 * 60_000,
+  deslizamientos:        15 * 60_000,
+  infraestructura:       10 * 60_000,
+  estaciones:            20 * 60_000,
+  estadisticas:           5 * 60_000,
+  sismos:                 5 * 60_000,
+  heatmap:                2 * 60_000,
+  riesgo:                    30_000,
+  diagnostico:            5 * 60_000,
+  'zonas-sismicas':      30 * 60_000,
+  'riesgo-construccion':      60_000,
+  'riesgo-construccion-ranking': 5 * 60_000,
+  'riesgo-construccion-mapa':    5 * 60_000,
+  'infra-cobertura':      5 * 60_000,
+  poblacion:             30 * 60_000,
 }
 
 function isFresh(key: string): boolean {
@@ -42,7 +47,6 @@ function isFresh(key: string): boolean {
   return Date.now() - entry.ts < ttl
 }
 
-// ── Fetch con deduplicación, reintentos y cache ───────────
 async function apiFetch<T>(
   path:    string,
   params?: Record<string, string | number | boolean | undefined>,
@@ -50,12 +54,10 @@ async function apiFetch<T>(
 ): Promise<T> {
   const { cacheKey, retries = 2, timeout = 25_000 } = opts
 
-  // Hit cache fresco
   if (cacheKey && isFresh(cacheKey)) {
     return (CACHE.get(cacheKey) as CacheEntry<T>).data
   }
 
-  // Deduplicación: si ya hay un request idéntico en vuelo, reutilizarlo
   if (cacheKey && INFLIGHT.has(cacheKey)) {
     return INFLIGHT.get(cacheKey) as Promise<T>
   }
@@ -97,7 +99,6 @@ async function apiFetch<T>(
           })
         }
         return data
-
       } catch (err) {
         lastErr = err
         if (err instanceof Error && err.name === 'AbortError') {
@@ -113,7 +114,6 @@ async function apiFetch<T>(
     throw lastErr
   })()
 
-  // Registrar en INFLIGHT y limpiar al resolver
   if (cacheKey) {
     INFLIGHT.set(cacheKey, fetchPromise)
     fetchPromise.finally(() => INFLIGHT.delete(cacheKey))
@@ -123,16 +123,12 @@ async function apiFetch<T>(
 }
 
 // ══════════════════════════════════════════════════════════
-//  Endpoints
+//  Endpoints existentes
 // ══════════════════════════════════════════════════════════
 
-/**
- * Sismos con rango amplio para filtrado GPU-side vía DataFilterExtension.
- * Si se pasa región/profundidad se usa para filtrado server-side.
- */
 export const getSismos = (f: Partial<FiltrosSismos> = {}) =>
   apiFetch<GeoJSON.FeatureCollection>('/sismos', {
-    mag_min:    f.mag_min    ?? 2.5,   // carga amplia para DataFilterExtension
+    mag_min:    f.mag_min    ?? 2.5,
     mag_max:    f.mag_max    ?? 9.9,
     year_start: f.year_start ?? 1900,
     year_end:   f.year_end   ?? 2030,
@@ -140,8 +136,6 @@ export const getSismos = (f: Partial<FiltrosSismos> = {}) =>
     region:     f.region,
     limit:      10_000,
   }, {
-    // La clave de caché incluye sólo los filtros server-side (región, profundidad)
-    // para maximizar reutilización del caché cuando cambian mag/year
     cacheKey: `sismos:${f.profundidad ?? ''}:${f.region ?? ''}`,
     retries: 3,
   })
@@ -186,10 +180,10 @@ export const getDeslizamientos = (riesgoMin = 1, zoom = 9) =>
     { riesgo_min: riesgoMin, zoom },
     { cacheKey: `deslizamientos:${riesgoMin}` })
 
-export const getInfraestructura = (tipo?: string, criticidadMin = 3) =>
+export const getInfraestructura = (tipo?: string, criticidadMin = 3, fuenteTipo?: string) =>
   apiFetch<GeoJSON.FeatureCollection>('/infraestructura',
-    { tipo, criticidad_min: criticidadMin, limit: 1000 },
-    { cacheKey: `infra:${tipo}:${criticidadMin}` })
+    { tipo, criticidad_min: criticidadMin, fuente_tipo: fuenteTipo, limit: 1000 },
+    { cacheKey: `infra:${tipo}:${criticidadMin}:${fuenteTipo ?? ''}` })
 
 export const getEstaciones = () =>
   apiFetch<GeoJSON.FeatureCollection>('/estaciones',
@@ -201,13 +195,11 @@ export const getEstadisticas = (yearStart = 1900, yearEnd = 2030, magMin = 2.5) 
     { year_start: yearStart, year_end: yearEnd, mag_min: magMin },
     { cacheKey: `stats:${yearStart}:${yearEnd}:${magMin}` })
 
-/** NUEVO v6.0 — Análisis de riesgo para un punto (f_riesgo_punto) */
 export const getRiesgo = (lon: number, lat: number) =>
   apiFetch<RiesgoInfo>('/riesgo',
     { lon, lat },
     { cacheKey: `riesgo:${lon.toFixed(4)}:${lat.toFixed(4)}`, retries: 1, timeout: 10_000 })
 
-/** NUEVO v6.0 — Diagnóstico de cobertura espacial por tabla */
 export const getDiagnosticoRegiones = () =>
   apiFetch<DiagnosticoLayer[]>('/diagnostico/regiones',
     undefined,
@@ -224,6 +216,76 @@ export const getHealth = () =>
   apiFetch<{ status: string }>('/health'.replace('/v1', ''),
     undefined, { retries: 0, timeout: 5_000 })
 
+// ══════════════════════════════════════════════════════════
+//  Nuevos endpoints v7.0
+// ══════════════════════════════════════════════════════════
+
+/** Zonas sísmicas NTE E.030-2018 por departamento con sismicidad histórica */
+export const getZonasSismicas = async (): Promise<ZonaSismicaInfo[]> => {
+  const res = await apiFetch<{ departamentos?: ZonaSismicaInfo[] } | ZonaSismicaInfo[]>(
+    '/zonas-sismicas', undefined, { cacheKey: 'zonas-sismicas', retries: 1 }
+  )
+  // API devuelve { norma, referencia, descripcion_z, departamentos: [...] }
+  return Array.isArray(res) ? res : ((res as { departamentos?: ZonaSismicaInfo[] }).departamentos ?? [])
+}
+
+/** IRC CENEPRED para un punto geográfico */
+export const getRiesgoConstruccionPunto = (lon: number, lat: number) =>
+  apiFetch<RiesgoConstruccionPunto>('/riesgo/construccion',
+    { lon, lat },
+    {
+      cacheKey: `riesgo-construccion:${lon.toFixed(4)}:${lat.toFixed(4)}`,
+      retries: 1, timeout: 8_000,
+    })
+
+/** Ranking de distritos por IRC desde mv_riesgo_construccion */
+export const getRiesgoConstruccionRanking = async (limit = 20, departamento?: string): Promise<RiesgoConstruccionRanking[]> => {
+  const res = await apiFetch<{ ranking?: RiesgoConstruccionRanking[] } | RiesgoConstruccionRanking[]>(
+    '/riesgo/construccion/ranking', { limit, departamento },
+    { cacheKey: `riesgo-construccion-ranking:${limit}:${departamento ?? ''}` }
+  )
+  // API devuelve { metodologia, ponderacion, escala, total_resultados, ranking: [...] }
+  return Array.isArray(res) ? res : ((res as { ranking?: RiesgoConstruccionRanking[] }).ranking ?? [])
+}
+
+/** GeoJSON distritos coloreados por IRC — para capa de mapa */
+export const getRiesgoConstruccionMapa = () =>
+  apiFetch<GeoJSON.FeatureCollection>('/riesgo/construccion/mapa',
+    undefined,
+    { cacheKey: 'riesgo-construccion-mapa', retries: 2 })
+
+/** Cobertura oficial vs OSM por tipo de infraestructura */
+export const getCoberturaTipos = async (): Promise<CoberturaTipo[]> => {
+  interface RawRow {
+    tipo: string; fuente_tipo: 'oficial' | 'osm'; total: number
+    criticidad_prom?: number
+  }
+  const res = await apiFetch<{ resumen: unknown; por_tipo: RawRow[] }>(
+    '/infraestructura/cobertura', undefined,
+    { cacheKey: 'infra-cobertura', retries: 1 }
+  )
+  // API devuelve { resumen, por_tipo: rows por (tipo, fuente_tipo) }
+  // Pivotar a { tipo, oficial, osm, total, pct_oficial }
+  const rows: RawRow[] = Array.isArray(res) ? res : (res?.por_tipo ?? [])
+  const pivot = new Map<string, CoberturaTipo>()
+  for (const row of rows) {
+    const entry = pivot.get(row.tipo) ?? { tipo: row.tipo, total: 0, oficial: 0, osm: 0, pct_oficial: 0 }
+    if (row.fuente_tipo === 'oficial') entry.oficial += row.total
+    else                               entry.osm     += row.total
+    entry.total = entry.oficial + entry.osm
+    entry.pct_oficial = entry.total > 0 ? Math.round(entry.oficial / entry.total * 100) : 0
+    pivot.set(row.tipo, entry)
+  }
+  return Array.from(pivot.values()).sort((a, b) => b.total - a.total)
+}
+
+/** Población expuesta por zona sísmica (INEI 2017) */
+export const getPoblacionExposicion = () =>
+  apiFetch<PoblacionZona[]>('/poblacion',
+    undefined,
+    { cacheKey: 'poblacion', retries: 1 })
+
+// ── Limpieza de caché ─────────────────────────────────────
 export const clearCache = (prefix?: string) => {
   if (!prefix) { CACHE.clear(); INFLIGHT.clear(); return }
   for (const k of CACHE.keys())    if (k.startsWith(prefix)) CACHE.delete(k)

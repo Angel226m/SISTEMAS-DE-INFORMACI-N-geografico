@@ -1,14 +1,14 @@
 -- ══════════════════════════════════════════════════════════
--- GeoRiesgo Perú — Esquema PostGIS v6.0
--- MEJORAS CRÍTICAS:
---   ✅ f_asignar_region() usa ST_Covers (incluye borde) + KNN fallback
---      → elimina el problema de puntos sobre límites sin región
---   ✅ f_actualizar_regiones() reescrita con ST_Covers + KNN para
---      los registros que no caen dentro de ningún polígono
---   ✅ ST_MakeValid() aplicado en inserción de departamentos/distritos
---   ✅ Índice GiST en departamentos con ST_Buffer para evitar gaps
---   ✅ Vistas con COALESCE + KNN para never-null region
---   ✅ Índice CLUSTER hint en sismos para mejora 90% en queries espaciales
+-- GeoRiesgo Perú — Esquema PostGIS v7.0
+-- NUEVAS MEJORAS:
+--   ✅ zona_sismica (NTE E.030-2018) en departamentos, distritos, infraestructura
+--   ✅ factor_z (0.10/0.25/0.35/0.45g) en departamentos
+--   ✅ fuente_tipo ('oficial'/'osm') en infraestructura
+--   ✅ mv_riesgo_construccion — índice compuesto de riesgo por distrito
+--   ✅ f_riesgo_construccion(lon,lat) — riesgo en punto específico
+--   ✅ v_infraestructura_cobertura — diagnóstico de cobertura por tipo
+--   ✅ Índices mejorados para queries de riesgo
+--   ✅ Todos los checks ST_Covers anteriores mantenidos
 -- ══════════════════════════════════════════════════════════
 
 -- Extensiones
@@ -49,32 +49,32 @@ CREATE INDEX IF NOT EXISTS idx_sismos_profund   ON sismos(profundidad_km);
 CREATE INDEX IF NOT EXISTS idx_sismos_tipo_prof ON sismos(tipo_profundidad);
 CREATE INDEX IF NOT EXISTS idx_sismos_region    ON sismos(region);
 CREATE INDEX IF NOT EXISTS idx_sismos_fecha_mag ON sismos(fecha DESC, magnitud DESC);
-CREATE INDEX IF NOT EXISTS idx_sismos_anio_mag
-    ON sismos(DATE_PART('year', fecha), magnitud DESC);
--- Índice parcial para heatmap (solo sismos >= 3.0)
-CREATE INDEX IF NOT EXISTS idx_sismos_geom_mag
-    ON sismos USING GIST(geom) WHERE magnitud >= 3.0;
+CREATE INDEX IF NOT EXISTS idx_sismos_anio_mag  ON sismos(DATE_PART('year', fecha), magnitud DESC);
+CREATE INDEX IF NOT EXISTS idx_sismos_geom_mag  ON sismos USING GIST(geom) WHERE magnitud >= 3.0;
 
 -- ═══════════════════════════════════════════════════════════
---  DEPARTAMENTOS
+--  DEPARTAMENTOS — con zona sísmica NTE E.030-2018
 -- ═══════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS departamentos (
     id             SERIAL PRIMARY KEY,
     ubigeo         TEXT UNIQUE,
     nombre         TEXT NOT NULL,
-    -- geom_valid: geometría validada y sin self-intersections
     geom           GEOMETRY(MultiPolygon, 4326),
     nivel_riesgo   SMALLINT DEFAULT 3 CHECK (nivel_riesgo BETWEEN 1 AND 5),
+    -- Zona Sísmica NTE E.030-2018 (DS N°003-2016-VIVIENDA)
+    zona_sismica   SMALLINT CHECK (zona_sismica BETWEEN 1 AND 4),
+    -- Factor de zona Z (aceleración espectral en g para periodo 0.2s)
+    -- Z4=0.45g, Z3=0.35g, Z2=0.25g, Z1=0.10g
+    factor_z       NUMERIC(4,2),
     area_km2       NUMERIC(12,3),
     capital        TEXT,
     fuente         TEXT DEFAULT 'INEI/GADM',
     actualizado_en TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_dep_geom   ON departamentos USING GIST(geom);
-CREATE INDEX IF NOT EXISTS idx_dep_nombre ON departamentos(nombre);
--- Índice en nombre para unaccent (búsquedas sin tilde)
-CREATE INDEX IF NOT EXISTS idx_dep_nombre_trgm ON departamentos
-    USING GIN(nombre gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_dep_geom        ON departamentos USING GIST(geom);
+CREATE INDEX IF NOT EXISTS idx_dep_nombre      ON departamentos(nombre);
+CREATE INDEX IF NOT EXISTS idx_dep_nombre_trgm ON departamentos USING GIN(nombre gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_dep_zona_sis    ON departamentos(zona_sismica);
 
 -- ═══════════════════════════════════════════════════════════
 --  PROVINCIAS
@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS provincias (
     departamento   TEXT,
     geom           GEOMETRY(MultiPolygon, 4326),
     nivel_riesgo   SMALLINT DEFAULT 3 CHECK (nivel_riesgo BETWEEN 1 AND 5),
+    zona_sismica   SMALLINT CHECK (zona_sismica BETWEEN 1 AND 4),
     area_km2       NUMERIC(12,3),
     fuente         TEXT DEFAULT 'INEI/GADM',
     actualizado_en TIMESTAMPTZ DEFAULT NOW()
@@ -93,18 +94,22 @@ CREATE TABLE IF NOT EXISTS provincias (
 CREATE INDEX IF NOT EXISTS idx_prov_geom ON provincias USING GIST(geom);
 
 -- ═══════════════════════════════════════════════════════════
---  DISTRITOS
+--  DISTRITOS — con zona sísmica y población INEI
 -- ═══════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS distritos (
     id             SERIAL PRIMARY KEY,
     ubigeo         TEXT UNIQUE,
     nombre         TEXT NOT NULL,
     provincia      TEXT,
-    departamento   TEXT DEFAULT 'Ica',
+    departamento   TEXT,
     geom           GEOMETRY(MultiPolygon, 4326),
     nivel_riesgo   SMALLINT NOT NULL DEFAULT 3 CHECK (nivel_riesgo BETWEEN 1 AND 5),
-    poblacion      INTEGER,
+    poblacion      INTEGER,         -- INEI Censos 2017
     area_km2       NUMERIC(10,3),
+    -- Zona Sísmica NTE E.030-2018
+    zona_sismica   SMALLINT CHECK (zona_sismica BETWEEN 1 AND 4),
+    -- Índice de riesgo de construcción (calculado por mv_riesgo_construccion)
+    indice_riesgo_construccion NUMERIC(4,2),
     fuente         TEXT DEFAULT 'INEI/GADM',
     actualizado_en TIMESTAMPTZ DEFAULT NOW()
 );
@@ -113,6 +118,8 @@ CREATE INDEX IF NOT EXISTS idx_distritos_nombre     ON distritos USING GIN(nombr
 CREATE INDEX IF NOT EXISTS idx_distritos_prov       ON distritos(provincia);
 CREATE INDEX IF NOT EXISTS idx_distritos_dep        ON distritos(departamento);
 CREATE INDEX IF NOT EXISTS idx_distritos_dep_riesgo ON distritos(departamento, nivel_riesgo DESC);
+CREATE INDEX IF NOT EXISTS idx_distritos_zona_sis   ON distritos(zona_sismica);
+CREATE INDEX IF NOT EXISTS idx_distritos_pob        ON distritos(poblacion DESC NULLS LAST);
 
 -- ═══════════════════════════════════════════════════════════
 --  FALLAS GEOLÓGICAS
@@ -189,7 +196,7 @@ CREATE INDEX IF NOT EXISTS idx_desl_region ON deslizamientos(region);
 CREATE INDEX IF NOT EXISTS idx_desl_activo ON deslizamientos(activo) WHERE activo = TRUE;
 
 -- ═══════════════════════════════════════════════════════════
---  INFRAESTRUCTURA CRÍTICA
+--  INFRAESTRUCTURA CRÍTICA — con fuente_tipo oficial/osm
 -- ═══════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS infraestructura (
     id             SERIAL PRIMARY KEY,
@@ -204,6 +211,12 @@ CREATE TABLE IF NOT EXISTS infraestructura (
     distrito       TEXT,
     telefono       TEXT,
     fuente         TEXT,
+    -- NUEVO: Identifica si el dato proviene de fuente oficial o OSM
+    -- 'oficial' = SUSALUD/MINEDU/MTC/APN/OSINERGMIN/INDECI
+    -- 'osm'     = OpenStreetMap (complemento cuando no hay fuente oficial)
+    fuente_tipo    TEXT DEFAULT 'osm' CHECK (fuente_tipo IN ('oficial', 'osm')),
+    -- NUEVO: zona sísmica NTE E.030 del punto
+    zona_sismica   SMALLINT CHECK (zona_sismica BETWEEN 1 AND 4),
     actualizado_en TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT ck_infra_bbox CHECK (
         ST_X(geom) BETWEEN -83 AND -68
@@ -216,6 +229,9 @@ CREATE INDEX IF NOT EXISTS idx_infra_critic      ON infraestructura(criticidad D
 CREATE INDEX IF NOT EXISTS idx_infra_region      ON infraestructura(region);
 CREATE INDEX IF NOT EXISTS idx_infra_nombre      ON infraestructura USING GIN(nombre gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_infra_tipo_region ON infraestructura(tipo, region, criticidad DESC);
+CREATE INDEX IF NOT EXISTS idx_infra_fuente_tipo ON infraestructura(fuente_tipo);
+CREATE INDEX IF NOT EXISTS idx_infra_oficial     ON infraestructura(tipo, criticidad DESC)
+    WHERE fuente_tipo = 'oficial';
 
 -- ═══════════════════════════════════════════════════════════
 --  ZONAS DE TSUNAMI
@@ -279,21 +295,9 @@ CREATE INDEX IF NOT EXISTS idx_synclog_tabla  ON sync_log(tabla, fin DESC);
 
 
 -- ═══════════════════════════════════════════════════════════
---  FUNCIÓN CENTRAL: f_asignar_region(lon, lat)
---  ALGORITMO v6.0 — 3 niveles de fallback:
---    1. ST_Covers (punto dentro O sobre el borde del departamento)
---    2. ST_DWithin 5 km (puntos costeros o en limite entre dptos)
---    3. KNN — departamento más cercano por distancia real (nunca NULL)
---
---  POR QUÉ ST_Covers y no ST_Within:
---    ST_Within retorna FALSE para puntos exactamente SOBRE el borde
---    del polígono. ST_Covers incluye el borde → sin puntos huérfanos.
---    Ref: PostGIS docs ST_Covers §1.5, Medium/Entin 2023.
---
---  POR QUÉ KNN como último fallback:
---    Polígonos GADM pueden tener gaps entre departamentos colindantes
---    debido a simplificación topológica. El operador <-> usa el
---    índice GiST para O(log n) búsqueda. Ref: Crunchy Data 2021.
+--  FUNCIÓN: f_asignar_region(lon, lat) — v7.0
+--  3 niveles de fallback: ST_Covers → DWithin 5km → KNN
+--  Sin NULL garantizado.
 -- ═══════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION f_asignar_region(p_lon FLOAT, p_lat FLOAT)
 RETURNS TEXT AS $$
@@ -301,45 +305,58 @@ DECLARE
     v_region TEXT;
     v_pt     GEOMETRY := ST_SetSRID(ST_MakePoint(p_lon, p_lat), 4326);
 BEGIN
-    -- Nivel 1: Cobertura exacta (incluye puntos sobre el borde)
     SELECT nombre INTO v_region
     FROM departamentos
     WHERE ST_Covers(geom, v_pt)
     ORDER BY nivel_riesgo DESC
     LIMIT 1;
+    IF v_region IS NOT NULL THEN RETURN v_region; END IF;
 
-    IF v_region IS NOT NULL THEN
-        RETURN v_region;
-    END IF;
-
-    -- Nivel 2: Buffer 5 km — puntos costeros o en gap entre polígonos
     SELECT nombre INTO v_region
     FROM departamentos
     WHERE ST_DWithin(geom::geography, v_pt::geography, 5000)
-    ORDER BY ST_Distance(geom::geography, v_pt::geography) ASC
+    ORDER BY ST_Distance(geom::geography, v_pt::geography)
     LIMIT 1;
+    IF v_region IS NOT NULL THEN RETURN v_region; END IF;
 
-    IF v_region IS NOT NULL THEN
-        RETURN v_region;
-    END IF;
-
-    -- Nivel 3: KNN — departamento más cercano (NUNCA retorna NULL)
     SELECT nombre INTO v_region
-    FROM departamentos
-    ORDER BY geom <-> v_pt
-    LIMIT 1;
-
+    FROM departamentos ORDER BY geom <-> v_pt LIMIT 1;
     RETURN COALESCE(v_region, 'Perú');
 END;
 $$ LANGUAGE plpgsql STABLE;
 
 
 -- ═══════════════════════════════════════════════════════════
---  FUNCIÓN: f_actualizar_regiones() v6.0
---  Corrige el campo region en TODAS las tablas usando:
---    1. ST_Covers (incluye puntos en borde) para puntos directos
---    2. KNN fallback para los que no caen en ningún polígono
---    (sismos offshore, infraestructura costera, etc.)
+--  FUNCIÓN: f_asignar_zona_sismica(lon, lat)
+--  Retorna la zona sísmica NTE E.030-2018 de un punto.
+--  Ref: DS N°003-2016-VIVIENDA, actualizado 2018
+-- ═══════════════════════════════════════════════════════════
+CREATE OR REPLACE FUNCTION f_asignar_zona_sismica(p_lon FLOAT, p_lat FLOAT)
+RETURNS SMALLINT AS $$
+DECLARE
+    v_zona  SMALLINT;
+    v_pt    GEOMETRY := ST_SetSRID(ST_MakePoint(p_lon, p_lat), 4326);
+BEGIN
+    SELECT zona_sismica INTO v_zona
+    FROM departamentos
+    WHERE ST_Covers(geom, v_pt) AND zona_sismica IS NOT NULL
+    ORDER BY zona_sismica DESC
+    LIMIT 1;
+    IF v_zona IS NOT NULL THEN RETURN v_zona; END IF;
+
+    SELECT zona_sismica INTO v_zona
+    FROM departamentos
+    WHERE zona_sismica IS NOT NULL
+    ORDER BY geom <-> v_pt
+    LIMIT 1;
+    RETURN COALESCE(v_zona, 2);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+
+-- ═══════════════════════════════════════════════════════════
+--  FUNCIÓN: f_actualizar_regiones() — v7.0
+--  ST_Covers + KNN para ALL tablas
 -- ═══════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION f_actualizar_regiones()
 RETURNS TABLE(tabla TEXT, registros_actualizados BIGINT, via_knn BIGINT) AS $$
@@ -347,137 +364,115 @@ DECLARE
     n_covers BIGINT;
     n_knn    BIGINT;
 BEGIN
-    -- ── SISMOS ──────────────────────────────────────────────
-    UPDATE sismos s
-    SET region = d.nombre
+    -- SISMOS
+    UPDATE sismos s SET region = d.nombre
     FROM departamentos d
     WHERE ST_Covers(d.geom, s.geom)
       AND (s.region IS NULL OR s.region <> d.nombre);
     GET DIAGNOSTICS n_covers = ROW_COUNT;
-
-    -- KNN fallback para sismos sin región tras ST_Covers
-    UPDATE sismos s
-    SET region = (
-        SELECT d.nombre FROM departamentos d
-        ORDER BY d.geom <-> s.geom LIMIT 1
-    )
-    WHERE s.region IS NULL;
+    UPDATE sismos s SET region = (
+        SELECT d.nombre FROM departamentos d ORDER BY d.geom <-> s.geom LIMIT 1
+    ) WHERE s.region IS NULL;
     GET DIAGNOSTICS n_knn = ROW_COUNT;
-
     tabla := 'sismos'; registros_actualizados := n_covers; via_knn := n_knn;
     RETURN NEXT;
 
-    -- ── INFRAESTRUCTURA ─────────────────────────────────────
-    UPDATE infraestructura i
-    SET region = d.nombre
+    -- INFRAESTRUCTURA (también actualiza zona_sismica)
+    UPDATE infraestructura i SET region = d.nombre
     FROM departamentos d
     WHERE ST_Covers(d.geom, i.geom)
       AND (i.region IS NULL OR i.region <> d.nombre);
     GET DIAGNOSTICS n_covers = ROW_COUNT;
-
-    UPDATE infraestructura i
-    SET region = (
-        SELECT d.nombre FROM departamentos d
-        ORDER BY d.geom <-> i.geom LIMIT 1
-    )
-    WHERE i.region IS NULL;
+    UPDATE infraestructura i SET region = (
+        SELECT d.nombre FROM departamentos d ORDER BY d.geom <-> i.geom LIMIT 1
+    ) WHERE i.region IS NULL;
     GET DIAGNOSTICS n_knn = ROW_COUNT;
-
+    -- Actualizar zona_sismica en infraestructura
+    UPDATE infraestructura i
+    SET zona_sismica = d.zona_sismica
+    FROM departamentos d
+    WHERE ST_Covers(d.geom, i.geom)
+      AND d.zona_sismica IS NOT NULL
+      AND i.zona_sismica IS DISTINCT FROM d.zona_sismica;
     tabla := 'infraestructura'; registros_actualizados := n_covers; via_knn := n_knn;
     RETURN NEXT;
 
-    -- ── ESTACIONES ──────────────────────────────────────────
-    UPDATE estaciones e
-    SET region = d.nombre
+    -- INFRAESTRUCTURA DISTRITOS
+    UPDATE infraestructura i
+    SET distrito = d.nombre
+    FROM distritos d
+    WHERE ST_Covers(d.geom, i.geom)
+      AND (i.distrito IS NULL OR i.distrito <> d.nombre);
+    GET DIAGNOSTICS n_covers = ROW_COUNT;
+    UPDATE infraestructura i SET distrito = (
+        SELECT d.nombre FROM distritos d ORDER BY d.geom <-> i.geom LIMIT 1
+    ) WHERE i.distrito IS NULL;
+    GET DIAGNOSTICS n_knn = ROW_COUNT;
+    tabla := 'infraestructura.distrito'; registros_actualizados := n_covers; via_knn := n_knn;
+    RETURN NEXT;
+
+    -- ESTACIONES
+    UPDATE estaciones e SET region = d.nombre
     FROM departamentos d
     WHERE ST_Covers(d.geom, e.geom)
       AND (e.region IS NULL OR e.region <> d.nombre);
     GET DIAGNOSTICS n_covers = ROW_COUNT;
-
-    UPDATE estaciones e
-    SET region = (
-        SELECT d.nombre FROM departamentos d
-        ORDER BY d.geom <-> e.geom LIMIT 1
-    )
-    WHERE e.region IS NULL;
+    UPDATE estaciones e SET region = (
+        SELECT d.nombre FROM departamentos d ORDER BY d.geom <-> e.geom LIMIT 1
+    ) WHERE e.region IS NULL;
     GET DIAGNOSTICS n_knn = ROW_COUNT;
-
     tabla := 'estaciones'; registros_actualizados := n_covers; via_knn := n_knn;
     RETURN NEXT;
 
-    -- ── FALLAS (centroide) ───────────────────────────────────
-    UPDATE fallas f
-    SET region = d.nombre
+    -- FALLAS (centroide)
+    UPDATE fallas f SET region = d.nombre
     FROM departamentos d
     WHERE ST_Covers(d.geom, ST_Centroid(f.geom))
       AND (f.region IS NULL OR f.region <> d.nombre);
     GET DIAGNOSTICS n_covers = ROW_COUNT;
-
-    UPDATE fallas f
-    SET region = (
-        SELECT d.nombre FROM departamentos d
-        ORDER BY d.geom <-> ST_Centroid(f.geom) LIMIT 1
-    )
-    WHERE f.region IS NULL;
+    UPDATE fallas f SET region = (
+        SELECT d.nombre FROM departamentos d ORDER BY d.geom <-> ST_Centroid(f.geom) LIMIT 1
+    ) WHERE f.region IS NULL;
     GET DIAGNOSTICS n_knn = ROW_COUNT;
-
     tabla := 'fallas'; registros_actualizados := n_covers; via_knn := n_knn;
     RETURN NEXT;
 
-    -- ── ZONAS INUNDABLES (centroide) ─────────────────────────
-    UPDATE zonas_inundables zi
-    SET region = d.nombre
+    -- ZONAS INUNDABLES (centroide)
+    UPDATE zonas_inundables zi SET region = d.nombre
     FROM departamentos d
     WHERE ST_Covers(d.geom, ST_Centroid(zi.geom))
       AND (zi.region IS NULL OR zi.region <> d.nombre);
     GET DIAGNOSTICS n_covers = ROW_COUNT;
-
-    UPDATE zonas_inundables zi
-    SET region = (
-        SELECT d.nombre FROM departamentos d
-        ORDER BY d.geom <-> ST_Centroid(zi.geom) LIMIT 1
-    )
-    WHERE zi.region IS NULL;
+    UPDATE zonas_inundables zi SET region = (
+        SELECT d.nombre FROM departamentos d ORDER BY d.geom <-> ST_Centroid(zi.geom) LIMIT 1
+    ) WHERE zi.region IS NULL;
     GET DIAGNOSTICS n_knn = ROW_COUNT;
-
     tabla := 'zonas_inundables'; registros_actualizados := n_covers; via_knn := n_knn;
     RETURN NEXT;
 
-    -- ── DESLIZAMIENTOS (centroide) ───────────────────────────
-    UPDATE deslizamientos dl
-    SET region = d.nombre
+    -- DESLIZAMIENTOS (centroide)
+    UPDATE deslizamientos dl SET region = d.nombre
     FROM departamentos d
     WHERE ST_Covers(d.geom, ST_Centroid(dl.geom))
       AND (dl.region IS NULL OR dl.region <> d.nombre);
     GET DIAGNOSTICS n_covers = ROW_COUNT;
-
-    UPDATE deslizamientos dl
-    SET region = (
-        SELECT d.nombre FROM departamentos d
-        ORDER BY d.geom <-> ST_Centroid(dl.geom) LIMIT 1
-    )
-    WHERE dl.region IS NULL;
+    UPDATE deslizamientos dl SET region = (
+        SELECT d.nombre FROM departamentos d ORDER BY d.geom <-> ST_Centroid(dl.geom) LIMIT 1
+    ) WHERE dl.region IS NULL;
     GET DIAGNOSTICS n_knn = ROW_COUNT;
-
     tabla := 'deslizamientos'; registros_actualizados := n_covers; via_knn := n_knn;
     RETURN NEXT;
 
-    -- ── TSUNAMIS (centroide) ─────────────────────────────────
-    UPDATE zonas_tsunami zt
-    SET region = d.nombre
+    -- TSUNAMIS (centroide)
+    UPDATE zonas_tsunami zt SET region = d.nombre
     FROM departamentos d
     WHERE ST_Covers(d.geom, ST_Centroid(zt.geom))
       AND (zt.region IS NULL OR zt.region <> d.nombre);
     GET DIAGNOSTICS n_covers = ROW_COUNT;
-
-    UPDATE zonas_tsunami zt
-    SET region = (
-        SELECT d.nombre FROM departamentos d
-        ORDER BY d.geom <-> ST_Centroid(zt.geom) LIMIT 1
-    )
-    WHERE zt.region IS NULL;
+    UPDATE zonas_tsunami zt SET region = (
+        SELECT d.nombre FROM departamentos d ORDER BY d.geom <-> ST_Centroid(zt.geom) LIMIT 1
+    ) WHERE zt.region IS NULL;
     GET DIAGNOSTICS n_knn = ROW_COUNT;
-
     tabla := 'zonas_tsunami'; registros_actualizados := n_covers; via_knn := n_knn;
     RETURN NEXT;
 END;
@@ -526,7 +521,209 @@ $$ LANGUAGE SQL STABLE;
 
 
 -- ═══════════════════════════════════════════════════════════
---  FUNCIÓN: f_riesgo_punto(lon, lat) — resumen de riesgo
+--  FUNCIÓN: f_riesgo_construccion(lon, lat) — v7.0
+--  Calcula el índice de riesgo de construcción en un punto.
+--
+--  METODOLOGÍA (CENEPRED 2014 + NTE E.030-2018):
+--    Índice_RC = 0.40*PS + 0.25*PI + 0.20*PD + 0.10*PT + 0.05*PF
+--    PS = Peligro Sísmico (zona NTE E.030 normalizada 1-5)
+--    PI = Peligro por Inundación (si el punto está en zona inundable)
+--    PD = Peligro por Deslizamiento
+--    PT = Peligro por Tsunami
+--    PF = Peligro por Fallas activas en 50km
+--
+--  Nota sobre tipo de suelo:
+--    El RNE NTE E.031 clasifica suelos S1-S4. Los suelos tipo S3/S4
+--    (depósitos sedimentarios costeros, rellenos) amplifican la
+--    aceleración sísmica hasta 2-3x. Sin mapa Vs30 oficial para todo
+--    Perú (CISMID solo cubre Lima Metropolitana), se usa zona costera
+--    como proxy de suelo blando.
+-- ═══════════════════════════════════════════════════════════
+CREATE OR REPLACE FUNCTION f_riesgo_construccion(p_lon FLOAT, p_lat FLOAT)
+RETURNS JSONB AS $$
+DECLARE
+    pt             GEOMETRY := ST_SetSRID(ST_MakePoint(p_lon, p_lat), 4326);
+    v_depto        TEXT;
+    v_distrito     TEXT;
+    v_zona_sis     SMALLINT;
+    v_factor_z     NUMERIC;
+    v_ps           NUMERIC;  -- Peligro sísmico normalizado 1-5
+    v_pi           NUMERIC;  -- Peligro inundación
+    v_pd           NUMERIC;  -- Peligro deslizamiento
+    v_pt_tsun      NUMERIC;  -- Peligro tsunami
+    v_pf           NUMERIC;  -- Peligro fallas
+    v_indice       NUMERIC;  -- Índice compuesto 1-5
+    v_nivel_txt    TEXT;
+    v_recom        JSONB;
+    v_n_sismos     BIGINT;
+    v_mag_max      NUMERIC;
+    v_n_fallas     INTEGER;
+    v_inundacion   BOOLEAN;
+    v_desl         BOOLEAN;
+    v_tsunami      BOOLEAN;
+    v_tipo_suelo   TEXT;
+BEGIN
+    -- Departamento y zona sísmica
+    SELECT d.nombre, d.zona_sismica, d.factor_z
+    INTO v_depto, v_zona_sis, v_factor_z
+    FROM departamentos d
+    WHERE ST_Covers(d.geom, pt)
+    LIMIT 1;
+
+    IF v_zona_sis IS NULL THEN
+        SELECT d.zona_sismica, d.factor_z, d.nombre
+        INTO v_zona_sis, v_factor_z, v_depto
+        FROM departamentos d ORDER BY d.geom <-> pt LIMIT 1;
+    END IF;
+
+    v_zona_sis := COALESCE(v_zona_sis, 2);
+    v_factor_z  := COALESCE(v_factor_z, 0.25);
+
+    -- Distrito
+    SELECT nombre INTO v_distrito
+    FROM distritos WHERE ST_Covers(geom, pt) LIMIT 1;
+
+    -- Peligro sísmico: zona sísmica → escala 1-5
+    -- Zona4=5, Zona3=4, Zona2=3, Zona1=2 (base mínima 2 en todo Perú)
+    v_ps := CASE v_zona_sis
+        WHEN 4 THEN 5.0
+        WHEN 3 THEN 4.0
+        WHEN 2 THEN 3.0
+        WHEN 1 THEN 2.0
+        ELSE 3.0
+    END;
+
+    -- Sismicidad histórica 50km (ajuste fino del peligro sísmico)
+    SELECT COUNT(*), ROUND(MAX(magnitud)::NUMERIC, 1)
+    INTO v_n_sismos, v_mag_max
+    FROM sismos
+    WHERE ST_DWithin(geom::geography, pt::geography, 50000)
+      AND fecha >= CURRENT_DATE - INTERVAL '30 years'
+      AND magnitud >= 4.0;
+
+    -- Ajuste por sismicidad histórica intensa (±0.5)
+    IF v_n_sismos > 500 OR v_mag_max >= 8.0 THEN
+        v_ps := LEAST(5.0, v_ps + 0.5);
+    ELSIF v_n_sismos < 10 AND v_mag_max < 5.0 THEN
+        v_ps := GREATEST(1.0, v_ps - 0.3);
+    END IF;
+
+    -- Tipo de suelo aproximado (proxy: latitud < -15° y longitud < -70° → costa sur)
+    -- Nota: Para análisis site-specific usar estudio CISMID/microzonificación
+    IF ST_Y(pt) > -8 AND ST_X(pt) < -76 THEN
+        v_tipo_suelo := 'S3 (depósito aluvial costero - Perú norte)';
+    ELSIF ST_X(pt) < -75 THEN
+        v_tipo_suelo := 'S3 (depósito costero/aluvial)';
+    ELSIF ST_Y(pt) < -14 AND ST_X(pt) > -74 THEN
+        v_tipo_suelo := 'S2 (suelo intermedio - sierra/altiplano)';
+    ELSE
+        v_tipo_suelo := 'S2 (suelo intermedio - estimado)';
+    END IF;
+
+    -- Peligro inundación
+    SELECT EXISTS(SELECT 1 FROM zonas_inundables WHERE ST_Covers(geom, pt)) INTO v_inundacion;
+    SELECT nivel_riesgo::NUMERIC INTO v_pi
+    FROM zonas_inundables WHERE ST_Covers(geom, pt)
+    ORDER BY nivel_riesgo DESC LIMIT 1;
+    v_pi := COALESCE(v_pi, 1.0);
+
+    -- Peligro deslizamiento
+    SELECT EXISTS(SELECT 1 FROM deslizamientos WHERE ST_Covers(geom, pt) AND activo = TRUE) INTO v_desl;
+    SELECT nivel_riesgo::NUMERIC INTO v_pd
+    FROM deslizamientos WHERE ST_Covers(geom, pt) AND activo = TRUE
+    ORDER BY nivel_riesgo DESC LIMIT 1;
+    v_pd := COALESCE(v_pd, 1.0);
+
+    -- Peligro tsunami
+    SELECT EXISTS(SELECT 1 FROM zonas_tsunami WHERE ST_Covers(geom, pt)) INTO v_tsunami;
+    SELECT nivel_riesgo::NUMERIC INTO v_pt_tsun
+    FROM zonas_tsunami WHERE ST_Covers(geom, pt)
+    ORDER BY nivel_riesgo DESC LIMIT 1;
+    v_pt_tsun := COALESCE(v_pt_tsun, 1.0);
+
+    -- Peligro fallas activas en 50km
+    SELECT COUNT(*)::INTEGER INTO v_n_fallas
+    FROM fallas
+    WHERE activa = TRUE
+      AND ST_DWithin(geom::geography, pt::geography, 50000);
+    v_pf := LEAST(5.0, 1.0 + v_n_fallas::NUMERIC * 0.5);
+
+    -- Índice compuesto (CENEPRED ponderación)
+    v_indice := ROUND(
+        (0.40 * v_ps + 0.25 * v_pi + 0.20 * v_pd + 0.10 * v_pt_tsun + 0.05 * v_pf)::NUMERIC,
+        2
+    );
+    v_indice := LEAST(5.0, GREATEST(1.0, v_indice));
+
+    -- Clasificación textual
+    v_nivel_txt := CASE
+        WHEN v_indice >= 4.5 THEN 'MUY ALTO'
+        WHEN v_indice >= 3.5 THEN 'ALTO'
+        WHEN v_indice >= 2.5 THEN 'MEDIO'
+        WHEN v_indice >= 1.5 THEN 'BAJO'
+        ELSE 'MUY BAJO'
+    END;
+
+    -- Recomendaciones técnicas
+    v_recom := jsonb_build_array();
+    IF v_zona_sis >= 4 THEN
+        v_recom := v_recom || '["Diseño sismorresistente NTE E.060 con ductilidad especial (Zona 4)"]'::jsonb;
+        v_recom := v_recom || '["Estudio de microzonificación sísmica CISMID recomendado"]'::jsonb;
+    END IF;
+    IF v_zona_sis >= 3 THEN
+        v_recom := v_recom || '["Refuerzo sísmico obligatorio — NTE E.030 Zona 3/4"]'::jsonb;
+        v_recom := v_recom || '["Estudio de mecánica de suelos (EMS) obligatorio — NTE E.050"]'::jsonb;
+    END IF;
+    IF v_inundacion THEN
+        v_recom := v_recom || '["Cota mínima de construcción sobre nivel de inundación (ANA/RNE E.060)"]'::jsonb;
+        v_recom := v_recom || '["Estudio hidrológico e hidráulico ANA recomendado"]'::jsonb;
+    END IF;
+    IF v_desl THEN
+        v_recom := v_recom || '["Zona de remoción en masa — estudio geotécnico INGEMMET obligatorio"]'::jsonb;
+        v_recom := v_recom || '["Muros de contención y drenaje superficial — NTE E.050"]'::jsonb;
+    END IF;
+    IF v_tsunami THEN
+        v_recom := v_recom || '["Zona de inundación tsunamigénica — altura mínima 15m snm o construcción resistente"]'::jsonb;
+        v_recom := v_recom || '["Ruta de evacuación vertical identificada (INDECI/DHN)"]'::jsonb;
+    END IF;
+    IF v_n_fallas > 0 THEN
+        v_recom := v_recom || ('["' || v_n_fallas || ' falla(s) activa(s) en radio 50km — retroceso mínimo 50m de traza NTE E.030"]')::jsonb;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'coordenadas',     jsonb_build_object('lon', p_lon, 'lat', p_lat),
+        'departamento',    v_depto,
+        'distrito',        v_distrito,
+        'zona_sismica',    jsonb_build_object(
+            'zona',         v_zona_sis,
+            'factor_z',     v_factor_z,
+            'descripcion',  CASE v_zona_sis WHEN 4 THEN 'Muy Alta (Costa)'
+                                            WHEN 3 THEN 'Alta (Sierra Central/Sur)'
+                                            WHEN 2 THEN 'Media (Sierra Norte/Selva Central)'
+                                            WHEN 1 THEN 'Baja (Amazonia)'
+                                            ELSE 'Media' END,
+            'tipo_suelo_aprox', v_tipo_suelo,
+            'norma',        'NTE E.030-2018 (DS N°003-2016-VIVIENDA)'
+        ),
+        'peligros',        jsonb_build_object(
+            'sismico',        jsonb_build_object('valor', v_ps, 'sismos_50km_30a', v_n_sismos, 'mag_max', v_mag_max),
+            'inundacion',     jsonb_build_object('valor', v_pi, 'en_zona_inundable', v_inundacion),
+            'deslizamiento',  jsonb_build_object('valor', v_pd, 'en_zona_desl', v_desl),
+            'tsunami',        jsonb_build_object('valor', v_pt_tsun, 'en_zona_tsunami', v_tsunami),
+            'fallas_activas', jsonb_build_object('valor', v_pf, 'n_fallas_50km', v_n_fallas)
+        ),
+        'indice_riesgo_construccion', v_indice,
+        'nivel_riesgo',    v_nivel_txt,
+        'ponderacion',     '40% sísmico + 25% inundación + 20% deslizamiento + 10% tsunami + 5% fallas',
+        'metodologia',     'CENEPRED 2014 + NTE E.030-2018',
+        'recomendaciones', v_recom
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+
+-- ═══════════════════════════════════════════════════════════
+--  FUNCIÓN: f_riesgo_punto(lon, lat) — v7.0 (incluye construcción)
 -- ═══════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION f_riesgo_punto(p_lon FLOAT, p_lat FLOAT)
 RETURNS JSONB AS $$
@@ -534,21 +731,24 @@ DECLARE
     pt            GEOMETRY := ST_SetSRID(ST_MakePoint(p_lon, p_lat), 4326);
     depto_nombre  TEXT;
     depto_riesgo  SMALLINT;
+    zona_sis      SMALLINT;
+    factor_z      NUMERIC;
     n_sismos_50   BIGINT;
     max_mag_50    NUMERIC;
     en_tsunami    BOOLEAN;
     en_inund      BOOLEAN;
     en_desl       BOOLEAN;
     infra_cercana JSONB;
+    riesgo_constr JSONB;
 BEGIN
-    -- ST_Covers incluye borde → no pierde puntos limítrofes
-    SELECT nombre, nivel_riesgo INTO depto_nombre, depto_riesgo
+    SELECT nombre, nivel_riesgo, zona_sismica, factor_z
+    INTO depto_nombre, depto_riesgo, zona_sis, factor_z
     FROM departamentos WHERE ST_Covers(geom, pt)
     ORDER BY nivel_riesgo DESC LIMIT 1;
 
-    -- KNN fallback si el punto no cayó en ningún polígono
     IF depto_nombre IS NULL THEN
-        SELECT nombre, nivel_riesgo INTO depto_nombre, depto_riesgo
+        SELECT nombre, nivel_riesgo, zona_sismica, factor_z
+        INTO depto_nombre, depto_riesgo, zona_sis, factor_z
         FROM departamentos ORDER BY geom <-> pt LIMIT 1;
     END IF;
 
@@ -563,12 +763,12 @@ BEGIN
     SELECT EXISTS(SELECT 1 FROM deslizamientos   WHERE ST_Covers(geom, pt) AND activo = TRUE) INTO en_desl;
 
     SELECT jsonb_agg(jsonb_build_object(
-        'nombre', nombre, 'tipo', tipo,
+        'nombre', nombre, 'tipo', tipo, 'fuente_tipo', fuente_tipo,
         'distancia_km', ROUND((ST_Distance(geom::geography, pt::geography) / 1000)::NUMERIC, 2)
     ) ORDER BY geom::geography <-> pt::geography)
     INTO infra_cercana
     FROM (
-        SELECT nombre, tipo, geom
+        SELECT nombre, tipo, fuente_tipo, geom
         FROM infraestructura
         WHERE ST_DWithin(geom::geography, pt::geography, 10000)
           AND tipo IN ('hospital','bomberos','policia','refugio')
@@ -576,17 +776,28 @@ BEGIN
         LIMIT 5
     ) sub;
 
+    -- Incluir riesgo de construcción
+    SELECT f_riesgo_construccion(p_lon, p_lat) INTO riesgo_constr;
+
     RETURN jsonb_build_object(
-        'coordenadas',   jsonb_build_object('lon', p_lon, 'lat', p_lat),
-        'departamento',  depto_nombre,
-        'nivel_riesgo',  depto_riesgo,
-        'amenazas', jsonb_build_object(
+        'coordenadas',     jsonb_build_object('lon', p_lon, 'lat', p_lat),
+        'departamento',    depto_nombre,
+        'nivel_riesgo',    depto_riesgo,
+        'zona_sismica',    jsonb_build_object(
+            'zona', zona_sis, 'factor_z', factor_z,
+            'descripcion', CASE zona_sis WHEN 4 THEN 'Muy Alta'
+                                         WHEN 3 THEN 'Alta'
+                                         WHEN 2 THEN 'Media'
+                                         WHEN 1 THEN 'Baja' ELSE 'Media' END
+        ),
+        'amenazas',        jsonb_build_object(
             'zona_tsunami',      en_tsunami,
             'zona_inundable',    en_inund,
             'zona_desliz',       en_desl,
             'sismos_50km_10a',   n_sismos_50,
             'magnitud_max_50km', max_mag_50
         ),
+        'riesgo_construccion',  riesgo_constr,
         'infraestructura_cercana', COALESCE(infra_cercana, '[]'::jsonb)
     );
 END;
@@ -599,26 +810,25 @@ $$ LANGUAGE plpgsql STABLE;
 
 CREATE OR REPLACE VIEW v_estadisticas_anio AS
 SELECT
-    CAST(EXTRACT(YEAR FROM fecha) AS INTEGER)                 AS anio,
-    COUNT(*)                                                   AS cantidad,
-    ROUND(MAX(magnitud)::NUMERIC, 1)                          AS magnitud_max,
-    ROUND(AVG(magnitud)::NUMERIC, 2)                          AS magnitud_prom,
-    ROUND(MIN(magnitud)::NUMERIC, 1)                          AS magnitud_min,
-    COUNT(*) FILTER (WHERE tipo_profundidad = 'superficial')  AS superficiales,
-    COUNT(*) FILTER (WHERE tipo_profundidad = 'intermedio')   AS intermedios,
-    COUNT(*) FILTER (WHERE tipo_profundidad = 'profundo')     AS profundos,
-    COUNT(*) FILTER (WHERE magnitud >= 5.0)                   AS m5_plus,
-    COUNT(*) FILTER (WHERE magnitud >= 6.0)                   AS m6_plus,
-    COUNT(*) FILTER (WHERE magnitud >= 7.0)                   AS m7_plus
+    CAST(EXTRACT(YEAR FROM fecha) AS INTEGER) AS anio,
+    COUNT(*)                                   AS cantidad,
+    ROUND(MAX(magnitud)::NUMERIC, 1)           AS magnitud_max,
+    ROUND(AVG(magnitud)::NUMERIC, 2)           AS magnitud_prom,
+    ROUND(MIN(magnitud)::NUMERIC, 1)           AS magnitud_min,
+    COUNT(*) FILTER (WHERE tipo_profundidad='superficial') AS superficiales,
+    COUNT(*) FILTER (WHERE tipo_profundidad='intermedio')  AS intermedios,
+    COUNT(*) FILTER (WHERE tipo_profundidad='profundo')    AS profundos,
+    COUNT(*) FILTER (WHERE magnitud >= 5.0) AS m5_plus,
+    COUNT(*) FILTER (WHERE magnitud >= 6.0) AS m6_plus,
+    COUNT(*) FILTER (WHERE magnitud >= 7.0) AS m7_plus
 FROM sismos
 GROUP BY EXTRACT(YEAR FROM fecha)
 ORDER BY anio;
 
--- Vista por departamento con ST_Covers (incluye borde)
 CREATE OR REPLACE VIEW v_sismos_por_depto AS
 SELECT
-    dep.nombre                                     AS departamento,
-    dep.nivel_riesgo,
+    dep.nombre AS departamento, dep.nivel_riesgo, dep.zona_sismica,
+    dep.factor_z,
     COUNT(s.id)                                    AS total_sismos,
     ROUND(MAX(s.magnitud)::NUMERIC, 1)             AS max_magnitud,
     ROUND(AVG(s.magnitud)::NUMERIC, 2)             AS avg_magnitud,
@@ -628,60 +838,127 @@ SELECT
     COUNT(s.id) FILTER (WHERE s.fecha >= CURRENT_DATE - INTERVAL '365 days') AS ultimo_anio
 FROM departamentos dep
 LEFT JOIN sismos s ON ST_Covers(dep.geom, s.geom)
-GROUP BY dep.nombre, dep.nivel_riesgo
+GROUP BY dep.nombre, dep.nivel_riesgo, dep.zona_sismica, dep.factor_z
 ORDER BY total_sismos DESC;
 
-CREATE OR REPLACE VIEW v_sismos_por_distrito AS
+-- Vista de cobertura de infraestructura por tipo y fuente
+CREATE OR REPLACE VIEW v_infraestructura_cobertura AS
 SELECT
-    d.nombre                                      AS distrito,
-    d.provincia,
-    d.departamento,
-    d.nivel_riesgo,
-    COUNT(s.id)                                   AS total_sismos,
-    ROUND(MAX(s.magnitud)::NUMERIC, 1)            AS max_magnitud,
-    ROUND(AVG(s.magnitud)::NUMERIC, 2)            AS avg_magnitud,
-    COUNT(s.id) FILTER (WHERE s.magnitud >= 5.0)  AS m5_plus
-FROM distritos d
-LEFT JOIN sismos s ON ST_Covers(d.geom, s.geom)
-GROUP BY d.nombre, d.provincia, d.departamento, d.nivel_riesgo
-ORDER BY total_sismos DESC;
+    tipo,
+    fuente_tipo,
+    COUNT(*)                                           AS total,
+    COUNT(*) FILTER (WHERE region IS NOT NULL)         AS con_region,
+    COUNT(*) FILTER (WHERE zona_sismica IS NOT NULL)   AS con_zona_sismica,
+    COUNT(DISTINCT region)                             AS regiones_distintas,
+    MAX(criticidad)                                    AS criticidad_max,
+    ROUND(AVG(criticidad)::NUMERIC, 2)                 AS criticidad_prom
+FROM infraestructura
+GROUP BY tipo, fuente_tipo
+ORDER BY tipo, fuente_tipo;
 
 
 -- ═══════════════════════════════════════════════════════════
---  VISTA MATERIALIZADA: heatmap
+--  VISTA MATERIALIZADA: heatmap sísmico
 -- ═══════════════════════════════════════════════════════════
 DROP MATERIALIZED VIEW IF EXISTS mv_heatmap_sismos;
 CREATE MATERIALIZED VIEW mv_heatmap_sismos AS
 SELECT
-    ST_AsText(ST_SnapToGrid(geom, 0.1))   AS grid_key,
-    ST_SnapToGrid(geom, 0.1)              AS geom_grid,
-    COUNT(*)                               AS cantidad,
-    ROUND(AVG(magnitud)::NUMERIC, 2)      AS magnitud_prom,
-    ROUND(MAX(magnitud)::NUMERIC, 1)      AS magnitud_max,
-    ROUND(AVG(profundidad_km)::NUMERIC, 1) AS prof_prom
+    ST_AsText(ST_SnapToGrid(geom, 0.1))    AS grid_key,
+    ST_SnapToGrid(geom, 0.1)               AS geom_grid,
+    COUNT(*)                                AS cantidad,
+    ROUND(AVG(magnitud)::NUMERIC, 2)        AS magnitud_prom,
+    ROUND(MAX(magnitud)::NUMERIC, 1)        AS magnitud_max,
+    ROUND(AVG(profundidad_km)::NUMERIC, 1)  AS prof_prom
 FROM sismos
 WHERE magnitud >= 3.0
 GROUP BY ST_SnapToGrid(geom, 0.1)
 HAVING COUNT(*) > 0;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_heatmap_key
-    ON mv_heatmap_sismos(grid_key);
-CREATE INDEX IF NOT EXISTS idx_mv_heatmap_geom
-    ON mv_heatmap_sismos USING GIST(geom_grid);
-CREATE INDEX IF NOT EXISTS idx_mv_heatmap_cantidad
-    ON mv_heatmap_sismos(cantidad DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_heatmap_key    ON mv_heatmap_sismos(grid_key);
+CREATE INDEX IF NOT EXISTS idx_mv_heatmap_geom          ON mv_heatmap_sismos USING GIST(geom_grid);
+CREATE INDEX IF NOT EXISTS idx_mv_heatmap_cantidad      ON mv_heatmap_sismos(cantidad DESC);
+
+
+-- ═══════════════════════════════════════════════════════════
+--  VISTA MATERIALIZADA: índice de riesgo de construcción
+--  Ref: CENEPRED — Metodología para elaborar mapas de riesgo (2014)
+--       NTE E.030-2018, NTE E.050 (Suelos), NTE E.060 (Concreto)
+-- ═══════════════════════════════════════════════════════════
+DROP MATERIALIZED VIEW IF EXISTS mv_riesgo_construccion;
+CREATE MATERIALIZED VIEW mv_riesgo_construccion AS
+SELECT
+    d.id,
+    d.ubigeo,
+    d.nombre           AS distrito,
+    d.provincia,
+    d.departamento,
+    d.nivel_riesgo,
+    d.zona_sismica,
+    dep.factor_z,
+    d.poblacion,
+    d.area_km2,
+    -- Peligro Sísmico (NTE E.030-2018)
+    CASE d.zona_sismica WHEN 4 THEN 5 WHEN 3 THEN 4 WHEN 2 THEN 3 WHEN 1 THEN 2 ELSE 3 END AS peligro_sismico,
+    -- Peligro Inundación
+    COALESCE((
+        SELECT MAX(zi.nivel_riesgo)
+        FROM zonas_inundables zi
+        WHERE ST_Intersects(zi.geom, d.geom)
+    ), 1)              AS peligro_inundacion,
+    -- Peligro Deslizamiento
+    COALESCE((
+        SELECT MAX(dl.nivel_riesgo)
+        FROM deslizamientos dl
+        WHERE ST_Intersects(dl.geom, d.geom) AND dl.activo = TRUE
+    ), 1)              AS peligro_deslizamiento,
+    -- Peligro Tsunami
+    COALESCE((
+        SELECT MAX(zt.nivel_riesgo)
+        FROM zonas_tsunami zt
+        WHERE ST_Intersects(zt.geom, d.geom)
+    ), 1)              AS peligro_tsunami,
+    -- Fallas activas en 50km del centroide
+    (SELECT COUNT(*)::INTEGER FROM fallas f
+     WHERE f.activa = TRUE
+       AND ST_DWithin(f.geom::geography, ST_Centroid(d.geom)::geography, 50000)
+    )                  AS fallas_activas_50km,
+    -- Densidad sísmica (últimos 30 años, M>=4.0)
+    (SELECT COUNT(*)::INTEGER FROM sismos s
+     WHERE s.magnitud >= 4.0
+       AND s.fecha >= CURRENT_DATE - INTERVAL '30 years'
+       AND ST_DWithin(s.geom::geography, ST_Centroid(d.geom)::geography, 50000)
+    )                  AS sismos_m4_30a_50km,
+    -- Índice compuesto (CENEPRED ponderación)
+    LEAST(5.0, GREATEST(1.0, ROUND((
+        0.40 * CASE d.zona_sismica WHEN 4 THEN 5 WHEN 3 THEN 4 WHEN 2 THEN 3 WHEN 1 THEN 2 ELSE 3 END +
+        0.25 * COALESCE((SELECT MAX(zi.nivel_riesgo) FROM zonas_inundables zi WHERE ST_Intersects(zi.geom, d.geom)), 1) +
+        0.20 * COALESCE((SELECT MAX(dl.nivel_riesgo) FROM deslizamientos dl WHERE ST_Intersects(dl.geom, d.geom) AND dl.activo = TRUE), 1) +
+        0.10 * COALESCE((SELECT MAX(zt.nivel_riesgo) FROM zonas_tsunami zt WHERE ST_Intersects(zt.geom, d.geom)), 1) +
+        0.05 * LEAST(5.0, 1 + (SELECT COUNT(*)::NUMERIC FROM fallas f WHERE f.activa = TRUE AND ST_DWithin(f.geom::geography, ST_Centroid(d.geom)::geography, 50000)) * 0.5)
+    )::NUMERIC, 2))) AS indice_riesgo_construccion,
+    ST_AsText(ST_Centroid(d.geom)) AS centroide_wkt
+FROM distritos d
+LEFT JOIN departamentos dep ON LOWER(d.departamento) = LOWER(dep.nombre);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_riesgo_id
+    ON mv_riesgo_construccion(id);
+CREATE INDEX IF NOT EXISTS idx_mv_riesgo_indice
+    ON mv_riesgo_construccion(indice_riesgo_construccion DESC);
+CREATE INDEX IF NOT EXISTS idx_mv_riesgo_depto
+    ON mv_riesgo_construccion(departamento, indice_riesgo_construccion DESC);
+CREATE INDEX IF NOT EXISTS idx_mv_riesgo_zona
+    ON mv_riesgo_construccion(zona_sismica DESC, indice_riesgo_construccion DESC);
 
 
 -- ═══════════════════════════════════════════════════════════
 --  Confirmación
 -- ═══════════════════════════════════════════════════════════
 DO $$ BEGIN
-    RAISE NOTICE '✅ Esquema GeoRiesgo Perú v6.0 — %', NOW();
-    RAISE NOTICE '   Mejoras: ST_Covers + KNN fallback en f_asignar_region()';
-    RAISE NOTICE '   f_actualizar_regiones() con 3 niveles de fallback';
-    RAISE NOTICE '   Tablas: sismos, departamentos, provincias, distritos,';
-    RAISE NOTICE '           fallas, zonas_inundables, zonas_tsunami,';
-    RAISE NOTICE '           deslizamientos, infraestructura, estaciones, sync_log';
-    RAISE NOTICE '   Funciones: f_asignar_region, f_sismos_cercanos,';
-    RAISE NOTICE '              f_actualizar_regiones, f_riesgo_punto';
+    RAISE NOTICE '✅ Esquema GeoRiesgo Perú v7.0 — %', NOW();
+    RAISE NOTICE '   Mejoras: zona_sismica NTE E.030-2018 en departamentos/distritos/infra';
+    RAISE NOTICE '   fuente_tipo (oficial/osm) en infraestructura';
+    RAISE NOTICE '   f_riesgo_construccion() — CENEPRED 2014 + NTE E.030-2018';
+    RAISE NOTICE '   mv_riesgo_construccion — índice compuesto por distrito';
+    RAISE NOTICE '   v_infraestructura_cobertura — diagnóstico calidad de datos';
+    RAISE NOTICE '   Fix: limpieza PostGIS post-inserción en procesar_datos.py';
 END $$;
