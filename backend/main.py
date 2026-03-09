@@ -1,15 +1,11 @@
 # ══════════════════════════════════════════════════════════
-# GeoRiesgo Perú — API FastAPI v6.0
-# MEJORAS sobre v5.0:
-#   ✅ ST_Covers en lugar de ST_Within en TODAS las queries
-#      → los puntos sobre bordes de polígono devuelven región correcta
-#   ✅ COALESCE(region, f_asignar_region(...)) en sismos/infra
-#      → nunca se retorna region=NULL al frontend
-#   ✅ KNN (<->) en /api/v1/sismos/cercanos y f_riesgo_punto
-#   ✅ Endpoint /api/v1/diagnostico/regiones para verificar cobertura
-#   ✅ SQL-injection safe en todos los endpoints (sin f-strings con valores)
-#   ✅ Cache-Control granular por tipo de dato
-#   ✅ GZip optimizado
+# GeoRiesgo Perú — API FastAPI v7.0
+# CORRECCIONES:
+#   ✅ GET /api/v1/zonas-sismicas            (nuevo)
+#   ✅ GET /api/v1/infraestructura/cobertura  (nuevo — usa v_infraestructura_cobertura)
+#   ✅ GET /api/v1/riesgo/construccion/ranking (nuevo — usa mv_riesgo_construccion)
+#   ✅ GET /api/v1/riesgo/construccion/mapa   (nuevo — GeoJSON distritos con índice)
+#   ✅ Todos los endpoints v6.0 mantenidos
 # ══════════════════════════════════════════════════════════
 
 from __future__ import annotations
@@ -45,7 +41,7 @@ async def lifespan(app: FastAPI):
         min_size=2,
         max_size=10,
         command_timeout=60,
-        server_settings={"application_name": "georiesgo_api_v6"},
+        server_settings={"application_name": "georiesgo_api_v7"},
     )
     yield
     if _pool:
@@ -55,12 +51,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="GeoRiesgo Perú API",
     description="""
-## API de Riesgo Geoespacial — Perú v6.0
+## API de Riesgo Geoespacial — Perú v7.0
 
-### Mejoras v6.0
-- **ST_Covers** en lugar de ST_Within — incluye puntos en bordes de polígonos
-- **KNN fallback** — `region` nunca es NULL (sismos offshore, infraestructura costera)
-- **f_asignar_region()** PostGIS con 3 niveles: ST_Covers → DWithin 5km → KNN
+### Nuevos endpoints v7.0
+- **GET /api/v1/zonas-sismicas** — Departamentos coloreados por zona NTE E.030-2018
+- **GET /api/v1/infraestructura/cobertura** — Diagnóstico de cobertura por tipo y fuente
+- **GET /api/v1/riesgo/construccion/ranking** — Top distritos por índice de riesgo de construcción
+- **GET /api/v1/riesgo/construccion/mapa** — GeoJSON distritos con índice CENEPRED
+
+### Mejoras v6.0 mantenidas
+- **ST_Covers** en lugar de ST_Within
+- **KNN fallback** — `region` nunca es NULL
+- **f_asignar_region()** PostGIS con 3 niveles
 
 ### Fuentes
 | Capa | Fuente | Cobertura |
@@ -70,12 +72,13 @@ app = FastAPI(
 | Inundaciones | ANA + CENEPRED | Nacional |
 | Tsunamis | PREDES + IGP + INDECI | Costa peruana |
 | Deslizamientos | CENEPRED + INGEMMET | Nacional |
-| Infraestructura | OpenStreetMap + MINSA | Nacional |
-| Estaciones | IGP + SENAMHI + ANA | Nacional |
+| Infraestructura | SUSALUD/MINEDU/MTC/APN/OSINERGMIN + OSM | Nacional |
+| Estaciones | IGP + SENAMHI + ANA + DHN | Nacional |
 | Distritos | INEI + GADM | Nacional (1,874 distritos) |
 | Departamentos | INEI + GADM | Nacional (25 regiones) |
+| Zonas sísmicas | NTE E.030-2018 (DS N°003-2016-VIVIENDA) | Nacional |
     """,
-    version="6.0.0",
+    version="7.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -133,7 +136,7 @@ def geojson_response(
         "metadata": {
             "total":  len(features),
             "crs":    "EPSG:4326",
-            "api":    "GeoRiesgo Perú v6.0",
+            "api":    "GeoRiesgo Perú v7.0",
             **(metadata or {}),
         },
     }
@@ -199,25 +202,25 @@ async def root():
             (SELECT COUNT(*) FROM estaciones)        AS estaciones,
             (SELECT MAX(fecha)::TEXT FROM sismos)    AS ultimo_sismo,
             (SELECT MIN(fecha)::TEXT FROM sismos)    AS primer_sismo,
-            -- Diagnóstico de cobertura de región
             (SELECT COUNT(*) FROM sismos WHERE region IS NULL)          AS sismos_sin_region,
             (SELECT COUNT(*) FROM infraestructura WHERE region IS NULL) AS infra_sin_region
     """)
     return {
-        "api":     "GeoRiesgo Perú v6.0",
+        "api":     "GeoRiesgo Perú v7.0",
         "docs":    "/docs",
         "redoc":   "/redoc",
         "capas":   dict(row),
         "spatial": {
             "metodo_region": "ST_Covers + KNN fallback (PostGIS)",
             "null_regions":  {
-                "sismos":        row["sismos_sin_region"],
+                "sismos":          row["sismos_sin_region"],
                 "infraestructura": row["infra_sin_region"],
             },
         },
         "fuentes": [
             "USGS FDSNWS", "IGP", "INGEMMET", "ANA", "CENEPRED",
             "PREDES", "INDECI", "SENAMHI", "OpenStreetMap", "INEI/GADM",
+            "SUSALUD/RENIPRESS", "MINEDU/ESCALE", "MTC/CORPAC", "APN", "OSINERGMIN",
         ],
     }
 
@@ -226,24 +229,19 @@ async def root():
 async def health():
     pool = await db()
     await pool.fetchval("SELECT 1")
-    return {"status": "ok", "ts": time.time(), "version": "6.0"}
+    return {"status": "ok", "ts": time.time(), "version": "7.0"}
 
 
 # ══════════════════════════════════════════════════════════
-#  DIAGNÓSTICO DE REGIONES  (NUEVO v6.0)
+#  DIAGNÓSTICO DE REGIONES
 # ══════════════════════════════════════════════════════════
 
 @app.get("/api/v1/diagnostico/regiones", summary="Cobertura de asignación de regiones", tags=["Sistema"])
 async def diagnostico_regiones():
-    """
-    Muestra cuántos registros tienen región NULL y cuántos fueron
-    asignados por KNN (offshore, límites) vs ST_Covers (dentro del polígono).
-    """
     pool = await db()
     tablas = ["sismos", "infraestructura", "estaciones", "fallas"]
     resultado = {}
     for tabla in tablas:
-        col_geom = "geom" if tabla != "fallas" else "ST_Centroid(geom)"
         row = await pool.fetchrow(f"""
             SELECT
                 COUNT(*) AS total,
@@ -257,10 +255,381 @@ async def diagnostico_regiones():
 
 
 # ══════════════════════════════════════════════════════════
+#  ZONAS SÍSMICAS NTE E.030-2018  ← NUEVO v7.0
+#  GET /api/v1/zonas-sismicas
+# ══════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/v1/zonas-sismicas",
+    summary="Zonificación sísmica NTE E.030-2018 por departamento",
+    tags=["Sismicidad"],
+    response_class=Response,
+)
+async def get_zonas_sismicas(
+    zona:  Optional[int] = Query(None, ge=1, le=4, description="Filtrar por zona (1-4)"),
+    zoom:  Optional[int] = Query(None, ge=1, le=20),
+):
+    """
+    Devuelve los polígonos de departamentos coloreados por zona sísmica
+    según la Norma Técnica de Edificación E.030-2018.
+
+    - **Zona 4** (Z=0.45g): Costa — Tumbes, Piura, Lambayeque, La Libertad,
+      Ancash, Lima, Callao, Ica, Arequipa, Moquegua, Tacna
+    - **Zona 3** (Z=0.35g): Sierra central/sur
+    - **Zona 2** (Z=0.25g): Sierra norte, Selva central
+    - **Zona 1** (Z=0.10g): Amazonia — Loreto, Madre de Dios
+
+    Referencia: DS N°003-2016-VIVIENDA (actualizado 2018)
+    """
+    pool     = await db()
+    geom_col = _geom_expr(zoom)
+    rows     = await pool.fetch(f"""
+        SELECT
+            {geom_col} AS geom_json,
+            id,
+            ubigeo,
+            nombre,
+            COALESCE(zona_sismica, 2)                    AS zona_sismica,
+            COALESCE(factor_z, 0.25)                     AS factor_z,
+            nivel_riesgo,
+            area_km2,
+            capital,
+            CASE COALESCE(zona_sismica, 2)
+                WHEN 4 THEN 'Muy Alta — Costa'
+                WHEN 3 THEN 'Alta — Sierra Central/Sur'
+                WHEN 2 THEN 'Media — Sierra Norte/Selva Central'
+                WHEN 1 THEN 'Baja — Amazonia'
+                ELSE   'No clasificado'
+            END AS descripcion_zona,
+            CASE COALESCE(zona_sismica, 2)
+                WHEN 4 THEN '#d32f2f'
+                WHEN 3 THEN '#f57c00'
+                WHEN 2 THEN '#fbc02d'
+                WHEN 1 THEN '#388e3c'
+                ELSE        '#9e9e9e'
+            END AS color
+        FROM departamentos
+        WHERE ($1::INT IS NULL OR zona_sismica = $1)
+        ORDER BY COALESCE(zona_sismica, 2) DESC, nombre
+    """, zona)
+
+    props_keys = [
+        "id", "ubigeo", "nombre", "zona_sismica", "factor_z",
+        "nivel_riesgo", "area_km2", "capital",
+        "descripcion_zona", "color",
+    ]
+
+    # Estadísticas de resumen
+    stats: dict[int, dict] = {}
+    for row in rows:
+        z = row["zona_sismica"] or 2
+        if z not in stats:
+            stats[z] = {"zona": z, "factor_z": float(row["factor_z"] or 0.25), "departamentos": 0}
+        stats[z]["departamentos"] += 1
+
+    return geojson_response(
+        rows_to_features(rows, props_keys),
+        {
+            "norma":    "NTE E.030-2018 — DS N°003-2016-VIVIENDA",
+            "fuente":   "INEI/GADM + Reglamento Nacional de Edificaciones",
+            "zonas":    sorted(stats.values(), key=lambda x: x["zona"], reverse=True),
+            "zoom":     zoom,
+        },
+        cache_seconds=86400,  # 24h — datos estáticos normativos
+    )
+
+
+# ══════════════════════════════════════════════════════════
+#  INFRAESTRUCTURA COBERTURA  ← NUEVO v7.0
+#  GET /api/v1/infraestructura/cobertura
+# ══════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/v1/infraestructura/cobertura",
+    summary="Diagnóstico de cobertura de infraestructura por tipo y fuente",
+    tags=["Infraestructura"],
+)
+async def get_infraestructura_cobertura(
+    tipo:        Optional[str] = Query(None, description="Filtrar por tipo (hospital, escuela, …)"),
+    fuente_tipo: Optional[str] = Query(None, description="'oficial' o 'osm'"),
+):
+    """
+    Retorna estadísticas de cobertura por tipo de infraestructura y fuente de datos.
+    Usa la vista `v_infraestructura_cobertura` del esquema v7.0.
+
+    Útil para verificar cuántos elementos tienen región asignada,
+    zona sísmica, y la distribución por fuente oficial vs OSM.
+    """
+    pool = await db()
+
+    # Intentar usar la vista materializada; si no existe, calcular en línea
+    try:
+        rows = await pool.fetch("""
+            SELECT
+                tipo,
+                fuente_tipo,
+                total,
+                con_region,
+                con_zona_sismica,
+                regiones_distintas,
+                criticidad_max,
+                criticidad_prom
+            FROM v_infraestructura_cobertura
+            WHERE ($1::TEXT IS NULL OR tipo        = $1)
+              AND ($2::TEXT IS NULL OR fuente_tipo = $2)
+            ORDER BY tipo, fuente_tipo
+        """, tipo, fuente_tipo)
+    except Exception:
+        # Fallback: calcular directamente si la vista no existe
+        rows = await pool.fetch("""
+            SELECT
+                tipo,
+                fuente_tipo,
+                COUNT(*)                                         AS total,
+                COUNT(*) FILTER (WHERE region IS NOT NULL)       AS con_region,
+                COUNT(*) FILTER (WHERE zona_sismica IS NOT NULL) AS con_zona_sismica,
+                COUNT(DISTINCT region)                           AS regiones_distintas,
+                MAX(criticidad)                                  AS criticidad_max,
+                ROUND(AVG(criticidad)::NUMERIC, 2)               AS criticidad_prom
+            FROM infraestructura
+            WHERE ($1::TEXT IS NULL OR tipo        = $1)
+              AND ($2::TEXT IS NULL OR fuente_tipo = $2)
+            GROUP BY tipo, fuente_tipo
+            ORDER BY tipo, fuente_tipo
+        """, tipo, fuente_tipo)
+
+    # Totales globales
+    total_global     = sum(r["total"]          for r in rows)
+    total_oficial    = sum(r["total"]          for r in rows if r["fuente_tipo"] == "oficial")
+    total_osm        = sum(r["total"]          for r in rows if r["fuente_tipo"] == "osm")
+    total_con_region = sum(r["con_region"]     for r in rows)
+    total_con_zona   = sum(r["con_zona_sismica"] for r in rows)
+
+    return {
+        "cobertura": [dict(r) for r in rows],
+        "resumen": {
+            "total_elementos":        total_global,
+            "total_oficial":          total_oficial,
+            "total_osm":              total_osm,
+            "pct_oficial":            round(total_oficial / total_global * 100, 1) if total_global else 0,
+            "pct_con_region":         round(total_con_region / total_global * 100, 1) if total_global else 0,
+            "pct_con_zona_sismica":   round(total_con_zona / total_global * 100, 1) if total_global else 0,
+        },
+        "tipos_disponibles": sorted({r["tipo"] for r in rows}),
+    }
+
+
+# ══════════════════════════════════════════════════════════
+#  RIESGO CONSTRUCCIÓN — RANKING  ← NUEVO v7.0
+#  GET /api/v1/riesgo/construccion/ranking
+# ══════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/v1/riesgo/construccion/ranking",
+    summary="Top distritos con mayor índice de riesgo de construcción",
+    tags=["Riesgo de Construcción"],
+)
+async def get_riesgo_construccion_ranking(
+    limit:        int            = Query(20, ge=1, le=200),
+    departamento: Optional[str] = Query(None, description="Filtrar por departamento"),
+    zona_sismica: Optional[int] = Query(None, ge=1, le=4, description="Filtrar por zona NTE E.030"),
+    indice_min:   float          = Query(1.0, ge=1.0, le=5.0, description="Índice mínimo"),
+):
+    """
+    Devuelve los distritos ordenados por índice de riesgo de construcción (mayor a menor).
+
+    **Metodología** (CENEPRED 2014 + NTE E.030-2018):
+    - 40% Peligro Sísmico (zona NTE E.030)
+    - 25% Peligro por Inundación
+    - 20% Peligro por Deslizamiento
+    - 10% Peligro por Tsunami
+    - 5%  Fallas activas en radio 50km
+
+    Fuente: `mv_riesgo_construccion` (vista materializada PostGIS)
+    """
+    pool = await db()
+
+    # Verificar si la vista materializada existe y tiene datos
+    exists = await pool.fetchval("""
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_name = 'mv_riesgo_construccion'
+              AND table_type = 'BASE TABLE'
+        )
+        OR EXISTS (
+            SELECT 1 FROM pg_matviews WHERE matviewname = 'mv_riesgo_construccion'
+        )
+    """)
+
+    if not exists:
+        raise HTTPException(503, detail={
+            "error":   "vista_no_disponible",
+            "mensaje": "La vista mv_riesgo_construccion no está disponible. "
+                       "Ejecuta: docker exec georiesgo_api python procesar_datos.py --solo riesgo_construccion",
+        })
+
+    rows = await pool.fetch("""
+        SELECT
+            id,
+            ubigeo,
+            distrito,
+            provincia,
+            departamento,
+            zona_sismica,
+            COALESCE(factor_z, 0.25)              AS factor_z,
+            COALESCE(poblacion, 0)                AS poblacion,
+            COALESCE(area_km2, 0)                 AS area_km2,
+            peligro_sismico,
+            peligro_inundacion,
+            peligro_deslizamiento,
+            peligro_tsunami,
+            fallas_activas_50km,
+            sismos_m4_30a_50km,
+            ROUND(indice_riesgo_construccion::NUMERIC, 2) AS indice_riesgo_construccion,
+            CASE
+                WHEN indice_riesgo_construccion >= 4.5 THEN 'MUY ALTO'
+                WHEN indice_riesgo_construccion >= 3.5 THEN 'ALTO'
+                WHEN indice_riesgo_construccion >= 2.5 THEN 'MEDIO'
+                WHEN indice_riesgo_construccion >= 1.5 THEN 'BAJO'
+                ELSE 'MUY BAJO'
+            END AS nivel_riesgo
+        FROM mv_riesgo_construccion
+        WHERE indice_riesgo_construccion >= $1
+          AND ($2::TEXT IS NULL OR LOWER(departamento) ILIKE '%' || LOWER($2) || '%')
+          AND ($3::INT  IS NULL OR zona_sismica = $3)
+        ORDER BY indice_riesgo_construccion DESC
+        LIMIT $4
+    """, indice_min, departamento, zona_sismica, limit)
+
+    resultado = [dict(r) for r in rows]
+    # Convertir Decimal a float para serialización JSON
+    for r in resultado:
+        for k, v in r.items():
+            if hasattr(v, "__float__") and not isinstance(v, (int, float, bool)):
+                r[k] = float(v)
+
+    return {
+        "ranking":      resultado,
+        "total":        len(resultado),
+        "metodologia":  "CENEPRED 2014 + NTE E.030-2018",
+        "ponderacion":  "40% sísmico + 25% inundación + 20% deslizamiento + 10% tsunami + 5% fallas",
+        "filtros": {
+            "departamento": departamento,
+            "zona_sismica": zona_sismica,
+            "indice_min":   indice_min,
+            "limit":        limit,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════
+#  RIESGO CONSTRUCCIÓN — MAPA GEOJSON  ← NUEVO v7.0
+#  GET /api/v1/riesgo/construccion/mapa
+# ══════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/v1/riesgo/construccion/mapa",
+    summary="GeoJSON de distritos coloreados por índice de riesgo de construcción",
+    tags=["Riesgo de Construcción"],
+    response_class=Response,
+)
+async def get_riesgo_construccion_mapa(
+    departamento: Optional[str] = Query(None),
+    zona_sismica: Optional[int] = Query(None, ge=1, le=4),
+    indice_min:   float          = Query(1.0, ge=1.0, le=5.0),
+    zoom:         Optional[int]  = Query(None, ge=1, le=20),
+    limit:        int            = Query(500, ge=1, le=2000),
+):
+    """
+    Devuelve GeoJSON con los polígonos de distritos, enriquecidos con:
+    - `indice_riesgo_construccion` (1.0 – 5.0)
+    - `nivel_riesgo` (MUY BAJO / BAJO / MEDIO / ALTO / MUY ALTO)
+    - `color` HEX sugerido para renderizado en Leaflet / MapLibre
+    - Todos los componentes de peligro (sísmico, inundación, desliz., tsunami, fallas)
+
+    Requiere que `mv_riesgo_construccion` esté actualizado.
+    """
+    pool     = await db()
+    geom_col = _geom_expr(zoom, col="d.geom")
+
+    rows = await pool.fetch(f"""
+        SELECT
+            {geom_col} AS geom_json,
+            mv.id,
+            mv.ubigeo,
+            mv.distrito,
+            mv.provincia,
+            mv.departamento,
+            mv.zona_sismica,
+            COALESCE(mv.factor_z, 0.25)                    AS factor_z,
+            COALESCE(mv.poblacion, 0)                      AS poblacion,
+            mv.peligro_sismico,
+            mv.peligro_inundacion,
+            mv.peligro_deslizamiento,
+            mv.peligro_tsunami,
+            mv.fallas_activas_50km,
+            mv.sismos_m4_30a_50km,
+            ROUND(mv.indice_riesgo_construccion::NUMERIC, 2) AS indice_riesgo_construccion,
+            CASE
+                WHEN mv.indice_riesgo_construccion >= 4.5 THEN 'MUY ALTO'
+                WHEN mv.indice_riesgo_construccion >= 3.5 THEN 'ALTO'
+                WHEN mv.indice_riesgo_construccion >= 2.5 THEN 'MEDIO'
+                WHEN mv.indice_riesgo_construccion >= 1.5 THEN 'BAJO'
+                ELSE 'MUY BAJO'
+            END AS nivel_riesgo,
+            CASE
+                WHEN mv.indice_riesgo_construccion >= 4.5 THEN '#b71c1c'
+                WHEN mv.indice_riesgo_construccion >= 3.5 THEN '#e53935'
+                WHEN mv.indice_riesgo_construccion >= 2.5 THEN '#fb8c00'
+                WHEN mv.indice_riesgo_construccion >= 1.5 THEN '#fdd835'
+                ELSE '#43a047'
+            END AS color
+        FROM mv_riesgo_construccion mv
+        JOIN distritos d ON mv.id = d.id
+        WHERE mv.indice_riesgo_construccion >= $1
+          AND ($2::TEXT IS NULL OR LOWER(mv.departamento) ILIKE '%' || LOWER($2) || '%')
+          AND ($3::INT  IS NULL OR mv.zona_sismica = $3)
+          AND d.geom IS NOT NULL
+        ORDER BY mv.indice_riesgo_construccion DESC
+        LIMIT $4
+    """, indice_min, departamento, zona_sismica, limit)
+
+    props_keys = [
+        "id", "ubigeo", "distrito", "provincia", "departamento",
+        "zona_sismica", "factor_z", "poblacion",
+        "peligro_sismico", "peligro_inundacion", "peligro_deslizamiento",
+        "peligro_tsunami", "fallas_activas_50km", "sismos_m4_30a_50km",
+        "indice_riesgo_construccion", "nivel_riesgo", "color",
+    ]
+
+    return geojson_response(
+        rows_to_features(rows, props_keys),
+        {
+            "metodologia":  "CENEPRED 2014 + NTE E.030-2018",
+            "ponderacion":  "40% sísmico + 25% inundación + 20% deslizamiento + 10% tsunami + 5% fallas",
+            "escala_color": {
+                "MUY ALTO": "#b71c1c",
+                "ALTO":     "#e53935",
+                "MEDIO":    "#fb8c00",
+                "BAJO":     "#fdd835",
+                "MUY BAJO": "#43a047",
+            },
+            "zoom":   zoom,
+            "filtros": {
+                "departamento": departamento,
+                "zona_sismica": zona_sismica,
+                "indice_min":   indice_min,
+            },
+        },
+        cache_seconds=1800,
+    )
+
+
+# ══════════════════════════════════════════════════════════
 #  DEPARTAMENTOS  /api/v1/departamentos
 # ══════════════════════════════════════════════════════════
 
-DEPT_PROPS = ["id", "ubigeo", "nombre", "nivel_riesgo", "area_km2", "capital", "fuente"]
+DEPT_PROPS = ["id", "ubigeo", "nombre", "nivel_riesgo", "zona_sismica", "factor_z", "area_km2", "capital", "fuente"]
 
 
 @app.get(
@@ -279,7 +648,10 @@ async def get_departamentos(
     rows     = await pool.fetch(f"""
         SELECT
             {geom_col} AS geom_json,
-            id, ubigeo, nombre, nivel_riesgo, area_km2, capital, fuente
+            id, ubigeo, nombre, nivel_riesgo,
+            COALESCE(zona_sismica, 2) AS zona_sismica,
+            COALESCE(factor_z, 0.25) AS factor_z,
+            area_km2, capital, fuente
         FROM departamentos
         WHERE nivel_riesgo >= $1
           AND ($2::TEXT IS NULL OR nombre ILIKE '%' || $2 || '%')
@@ -294,8 +666,6 @@ async def get_departamentos(
 
 # ══════════════════════════════════════════════════════════
 #  SISMOS  /api/v1/sismos
-#  CAMBIO v6.0: region via COALESCE + f_asignar_region()
-#  → NUNCA retorna region=NULL al frontend
 # ══════════════════════════════════════════════════════════
 
 SISMOS_PROPS = [
@@ -311,13 +681,13 @@ SISMOS_PROPS = [
     response_class=Response,
 )
 async def get_sismos(
-    mag_min:    float          = Query(3.0,  ge=0,   le=10),
-    mag_max:    float          = Query(9.9,  ge=0,   le=10),
+    mag_min:    float          = Query(3.0,  ge=0,    le=10),
+    mag_max:    float          = Query(9.9,  ge=0,    le=10),
     year_start: int            = Query(1960, ge=1900, le=2100),
     year_end:   int            = Query(2030, ge=1900, le=2100),
     prof_tipo:  Optional[str]  = Query(None),
     region:     Optional[str]  = Query(None),
-    limit:      int            = Query(5000, ge=1,   le=20000),
+    limit:      int            = Query(5000, ge=1,    le=20000),
     offset:     int            = Query(0,    ge=0),
 ):
     if mag_min > mag_max:
@@ -329,7 +699,6 @@ async def get_sismos(
             ST_AsGeoJSON(geom, 6)::TEXT AS geom_json,
             usgs_id, magnitud, profundidad_km, tipo_profundidad,
             fecha::TEXT AS fecha, lugar,
-            -- COALESCE garantiza region nunca NULL en respuesta
             COALESCE(region, f_asignar_region(ST_X(geom), ST_Y(geom))) AS region,
             tipo_magnitud, estado
         FROM sismos
@@ -520,7 +889,7 @@ async def get_sismo_detalle(usgs_id: str):
 # ══════════════════════════════════════════════════════════
 
 DIST_PROPS = ["id", "ubigeo", "nombre", "provincia", "departamento",
-              "nivel_riesgo", "poblacion", "area_km2", "fuente"]
+              "nivel_riesgo", "poblacion", "area_km2", "zona_sismica", "fuente"]
 
 
 @app.get(
@@ -542,7 +911,9 @@ async def get_distritos(
         SELECT
             {geom_col} AS geom_json,
             id, ubigeo, nombre, provincia, departamento,
-            nivel_riesgo, poblacion, area_km2, fuente
+            nivel_riesgo, poblacion, area_km2,
+            COALESCE(zona_sismica, 2) AS zona_sismica,
+            fuente
         FROM distritos
         WHERE nivel_riesgo >= $1
           AND ($2::TEXT IS NULL OR LOWER(provincia)    ILIKE '%' || LOWER($2) || '%')
@@ -568,7 +939,6 @@ async def get_distritos_resumen():
             ROUND(AVG(s.magnitud)::NUMERIC, 2)            AS avg_magnitud,
             COUNT(s.id) FILTER (WHERE s.magnitud >= 5.0)  AS m5_plus
         FROM distritos d
-        -- ST_Covers en lugar de ST_Within — incluye puntos en borde
         LEFT JOIN sismos s ON ST_Covers(d.geom, s.geom)
         GROUP BY d.nombre, d.provincia, d.departamento, d.nivel_riesgo
         ORDER BY total_sismos DESC
@@ -743,7 +1113,7 @@ async def get_deslizamientos(
 
 INFRA_PROPS = [
     "id", "osm_id", "nombre", "tipo", "criticidad",
-    "estado", "region", "distrito", "fuente",
+    "estado", "region", "distrito", "fuente", "fuente_tipo",
 ]
 
 
@@ -757,6 +1127,7 @@ async def get_infraestructura(
     tipo:           Optional[str]  = Query(None),
     criticidad_min: int            = Query(1, ge=1, le=5),
     region:         Optional[str]  = Query(None),
+    fuente_tipo:    Optional[str]  = Query(None, description="'oficial' o 'osm'"),
     radio_km:       Optional[int]  = Query(None, ge=1, le=500),
     lon:            Optional[float]= Query(None, ge=-82, le=-68),
     lat:            Optional[float]= Query(None, ge=-18.5, le=0),
@@ -777,11 +1148,13 @@ async def get_infraestructura(
             id, osm_id, nombre, tipo, criticidad,
             estado,
             COALESCE(region, f_asignar_region(ST_X(geom), ST_Y(geom))) AS region,
-            distrito, fuente
+            distrito, fuente,
+            COALESCE(fuente_tipo, 'osm') AS fuente_tipo
         FROM infraestructura
         WHERE criticidad >= $1
-          AND ($2::TEXT IS NULL OR tipo   ILIKE '%' || $2 || '%')
-          AND ($3::TEXT IS NULL OR region ILIKE '%' || $3 || '%')
+          AND ($2::TEXT IS NULL OR tipo        ILIKE '%' || $2 || '%')
+          AND ($3::TEXT IS NULL OR region      ILIKE '%' || $3 || '%')
+          AND ($9::TEXT IS NULL OR fuente_tipo = $9)
           AND (
               NOT $5::BOOLEAN
               OR ST_DWithin(
@@ -798,6 +1171,7 @@ async def get_infraestructura(
         lon if lon is not None else 0.0,
         lat if lat is not None else 0.0,
         float(radio_km) if radio_km else 0.0,
+        fuente_tipo,
     )
     return geojson_response(rows_to_features(rows, INFRA_PROPS))
 
@@ -924,11 +1298,12 @@ async def get_por_bbox(
 
     if "departamentos" in capas_list:
         rows = await pool.fetch(f"""
-            SELECT {geom_poly} AS geom_json, nombre, nivel_riesgo
+            SELECT {geom_poly} AS geom_json, nombre, nivel_riesgo,
+                   COALESCE(zona_sismica, 2) AS zona_sismica
             FROM departamentos WHERE geom && {bbox}
         """)
         resultado["departamentos"] = {"type": "FeatureCollection",
-                                       "features": rows_to_features(rows, ["nombre","nivel_riesgo"])}
+                                       "features": rows_to_features(rows, ["nombre","nivel_riesgo","zona_sismica"])}
 
     if "distritos" in capas_list:
         rows = await pool.fetch(f"""
