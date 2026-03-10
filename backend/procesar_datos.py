@@ -1,38 +1,55 @@
 ﻿#!/usr/bin/env python3
 # ══════════════════════════════════════════════════════════════════
-# GeoRiesgo Perú — ETL v7.0
-# MEJORAS CRÍTICAS:
-#   ✅ FIX: Limpieza PostGIS post-inserción → elimina puntos fuera de Perú
-#      (soluciona hospitales en Ecuador / Bolivia / Chile)
-#   ✅ SUSALUD RENIPRESS (+22,000 establecimientos oficiales de salud)
-#   ✅ MINEDU ESCALE → WFS oficial (~100,000 II.EE georreferenciadas)
-#   ✅ datos.gob.pe CKAN → PNP comisarías, CGBVP bomberos, APN puertos
-#   ✅ CORPAC/MTC → aeropuertos y aeródromos oficiales
-#   ✅ OSINERGMIN → centrales eléctricas registradas
-#   ✅ Población INEI por distrito (GADM/WorldPop fallback)
-#   ✅ Zona Sísmica NTE E.030-2018 → 4 zonas por departamento/distrito
-#   ✅ Índice de Riesgo de Construcción (peligro sísmico + inundación +
-#      deslizamiento + tsunami + tipo de suelo)
+# GeoRiesgo Perú — ETL v7.1  (BUGFIX RELEASE)
+#
+# BUGS CORREGIDOS RESPECTO A v7.0:
+#
+#  🔴 FIX 1 — ST_Multi() en inserts de geometrías poligonales
+#     Causa raíz de la mayoría de problemas visibles:
+#     GADM devuelve algunos features como Polygon (no MultiPolygon).
+#     El cast directo ::geometry(MultiPolygon,4326) genera un TypeError
+#     silencioso (except: pass) → tabla departamentos queda VACÍA.
+#     Solución: ST_Multi(ST_MakeValid(ST_GeomFromText(%s,4326)))
+#     Aplica en: paso_departamentos, _insertar_distritos_inei,
+#                _insertar_distritos_gadm
+#
+#  🔴 FIX 2 — _limpiar_fuera_peru() segura cuando departamentos vacío
+#     Con departamentos vacío:
+#       ST_Union(empty) → NULL
+#       ST_Buffer(NULL, 0.27) → NULL
+#       ST_Intersects(geom, NULL) → NULL
+#       NOT EXISTS(NULL) → TRUE para TODA fila
+#     → DELETE FROM infraestructura (borraba TODO)
+#     Solución: verificar COUNT antes, con fallback bbox si < 5 deptos,
+#     y verificar que ST_Union no devuelva NULL antes del DELETE.
+#
+#  🔴 FIX 3 — DEPARTAMENTOS_FALLBACK (25 bboxes hardcoded)
+#     Garantiza que departamentos nunca quede vacío aunque GADM falle,
+#     rompiendo la cascada de errores: deptos vacíos → infra borrada
+#     → KNN sin candidatos → region='Perú' en todos los sismos.
+#
+#  🆕 NUEVO — Hospitales MINSA/SUSALUD y bomberos CGBVP hardcoded
+#     Garantizan infraestructura visible incluso si OSM/APIs fallan.
+#
+# Fuentes: USGS·IGP·INEI·GADM·ANA·PREDES·CENEPRED
+#          SUSALUD·MINSA·MINEDU·MTC·APN·OSINERGMIN·CGBVP
 # ══════════════════════════════════════════════════════════════════
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 import psycopg2
 import psycopg2.extras
 import requests
-from shapely.geometry import Point, shape
-from shapely.ops import unary_union
+from shapely.geometry import shape
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -48,13 +65,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────
+# ── Configuración ─────────────────────────────────────────────────
 DB_DSN = os.getenv(
     "DATABASE_URL_SYNC",
     "postgresql://georiesgo:georiesgo_secret@db:5432/georiesgo",
 )
-MAX_WORKERS  = int(os.getenv("ETL_WORKERS", "3"))
-FORCE_SYNC   = os.getenv("FORCE_SYNC", "0") == "1"
+MAX_WORKERS     = int(os.getenv("ETL_WORKERS", "3"))
+FORCE_SYNC      = os.getenv("FORCE_SYNC", "0") == "1"
 REQUEST_TIMEOUT = 45
 
 # ── Bounding box Perú (ampliado) ──────────────────────────────────
@@ -67,31 +84,72 @@ OVERPASS = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
-# ── Zona Sísmica NTE E.030-2018 (Reglamento Nacional de Edificaciones)
-#    Z4=0.45g  Z3=0.35g  Z2=0.25g  Z1=0.10g
-#    Ref: Decreto Supremo N°003-2016-VIVIENDA (actualizado 2018)
+# ── Zona Sísmica NTE E.030-2018 (DS N°003-2016-VIVIENDA)
+#    Z4=0.45g · Z3=0.35g · Z2=0.25g · Z1=0.10g
 ZONA_SISMICA_POR_DEPTO: dict[str, int] = {
-    # Zona 4 — Mayor peligro sísmico (Costa y algunas provincias andinas)
+    # Zona 4 — mayor peligro (costa y algunas provincias andinas)
     "Tumbes": 4, "Piura": 4, "Lambayeque": 4, "La Libertad": 4,
     "Ancash": 4, "Lima": 4, "Callao": 4, "Ica": 4,
     "Arequipa": 4, "Moquegua": 4, "Tacna": 4,
-    # Zona 3 — Alto peligro (Sierra central y sur)
+    # Zona 3 — alto peligro (sierra central y sur)
     "Cajamarca": 3, "San Martín": 3, "Huánuco": 3, "Pasco": 3,
-    "Junín": 3, "Huancavelica": 3, "Ayacucho": 3,
-    "Apurímac": 3, "Cusco": 3,
-    # Zona 2 — Peligro moderado (Sierra norte y Selva central)
+    "Junín": 3, "Huancavelica": 3, "Ayacucho": 3, "Apurímac": 3, "Cusco": 3,
+    # Zona 2 — peligro moderado
     "Amazonas": 2, "Puno": 2, "Ucayali": 2,
-    # Zona 1 — Bajo peligro (Amazonia)
+    # Zona 1 — bajo peligro (amazonia)
     "Loreto": 1, "Madre de Dios": 1,
 }
-
 ZONA_SISMICA_FACTOR = {4: 0.45, 3: 0.35, 2: 0.25, 1: 0.10}
 
-# ── Tipo de suelo Vs30 aproximado por zona (CISMID referencia)
-#    S1=Roca o suelo muy rígido, S2=Suelo intermedio, S3=Suelo flexible, S4=Condiciones especiales
-TIPO_SUELO_COSTA  = "S3"   # Depósitos sedimentarios costeros (más vulnerable)
-TIPO_SUELO_SIERRA = "S2"   # Suelo intermedio
-TIPO_SUELO_SELVA  = "S2"
+
+# ══════════════════════════════════════════════════════════════════
+#  🔴 FIX 3 — DEPARTAMENTOS FALLBACK HARDCODED
+#  Polígonos aproximados (bbox) para los 25 departamentos.
+#  Activan si GADM devuelve < 20 departamentos con geometría.
+#  Garantizan que la tabla nunca quede vacía → rompen la cascada.
+#
+#  Formato: (nombre, ubigeo_fallback,
+#             lon_min, lat_min, lon_max, lat_max, zona_sismica)
+# ══════════════════════════════════════════════════════════════════
+DEPARTAMENTOS_FALLBACK = [
+    ("Tumbes",        "PER_TUM", -80.70, -3.95, -79.75, -3.30, 4),
+    ("Piura",         "PER_PIU", -81.50, -5.85, -79.15, -3.85, 4),
+    ("Lambayeque",    "PER_LAM", -80.55, -7.25, -79.00, -5.78, 4),
+    ("La Libertad",   "PER_LAL", -79.50, -9.38, -76.75, -7.15, 4),
+    ("Cajamarca",     "PER_CAJ", -79.65, -7.96, -77.45, -4.48, 3),
+    ("Amazonas",      "PER_AMA", -79.00, -6.58, -77.05, -2.78, 2),
+    ("San Martín",    "PER_SAM", -78.20, -8.38, -75.58, -5.38, 3),
+    ("Loreto",        "PER_LOR", -76.15, -7.12, -70.00, -0.05, 1),
+    ("Ancash",        "PER_ANC", -79.05, -10.58, -76.65, -7.88, 4),
+    ("Huánuco",       "PER_HUA", -77.12, -11.52, -74.15, -8.68, 2),
+    ("Pasco",         "PER_PAS", -76.92, -11.88, -73.68, -9.48, 3),
+    ("Junín",         "PER_JUN", -76.45, -13.08, -73.45, -9.82, 3),
+    ("Lima",          "PER_LIM", -77.92, -13.18, -74.98, -10.08, 4),
+    ("Callao",        "PER_CAL", -77.22, -12.12, -76.98, -11.87, 4),
+    ("Huancavelica",  "PER_HVC", -75.72, -14.28, -73.78, -12.02, 3),
+    ("Ica",           "PER_ICA", -76.72, -15.78, -73.78, -13.02, 4),
+    ("Ayacucho",      "PER_AYA", -75.12, -15.28, -73.08, -12.18, 3),
+    ("Apurímac",      "PER_APU", -73.92, -14.88, -72.08, -13.18, 3),
+    ("Cusco",         "PER_CUS", -73.58, -15.38, -70.18, -11.18, 3),
+    ("Arequipa",      "PER_ARE", -73.22, -17.12, -69.98, -14.38, 4),
+    ("Puno",          "PER_PUN", -71.52, -17.38, -68.58, -13.02, 2),
+    ("Moquegua",      "PER_MOQ", -71.48, -17.68, -69.42, -15.78, 4),
+    ("Tacna",         "PER_TAC", -70.92, -18.52, -69.28, -16.88, 4),
+    ("Madre de Dios", "PER_MDD", -72.28, -14.02, -68.58, -9.78,  1),
+    ("Ucayali",       "PER_UCA", -75.92, -11.92, -70.42, -7.78,  2),
+]
+
+
+def _bbox_to_multipolygon_wkt(lon_min: float, lat_min: float,
+                               lon_max: float, lat_max: float) -> str:
+    """Convierte un bounding box en WKT MULTIPOLYGON."""
+    return (
+        f"MULTIPOLYGON((("
+        f"{lon_min} {lat_min}, {lon_max} {lat_min}, "
+        f"{lon_max} {lat_max}, {lon_min} {lat_max}, "
+        f"{lon_min} {lat_min}"
+        f")))"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -100,7 +158,7 @@ TIPO_SUELO_SELVA  = "S2"
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "GeoRiesgo-Peru-ETL/7.0 (contact: georiesgo@ica.gob.pe)",
+    "User-Agent": "GeoRiesgo-Peru-ETL/7.1 (contact: georiesgo@ica.gob.pe)",
     "Accept": "application/json, application/geo+json",
 })
 
@@ -110,7 +168,8 @@ session.headers.update({
     wait=wait_exponential(multiplier=1, min=2, max=15),
     stop=stop_after_attempt(3),
 )
-def http_get(url: str, params: dict | None = None, timeout: int = REQUEST_TIMEOUT) -> Any:
+def http_get(url: str, params: dict | None = None,
+             timeout: int = REQUEST_TIMEOUT) -> Any:
     r = session.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
@@ -160,17 +219,15 @@ def bulk_insert(conn, table: str, rows: list[dict], conflict: str = "") -> int:
 #  UTILIDADES GEOMÉTRICAS
 # ══════════════════════════════════════════════════════════════════
 
-def make_point_wkt(lon: float, lat: float) -> str:
-    return f"ST_SetSRID(ST_MakePoint({lon}, {lat}), 4326)"
-
-
 def bbox_overpass(margin: float = 0.1) -> str:
     """Área Perú para queries Overpass (sur, oeste, norte, este)."""
-    return (f"{PERU_BBOX['min_lat'] - margin},{PERU_BBOX['min_lon'] - margin},"
-            f"{PERU_BBOX['max_lat'] + margin},{PERU_BBOX['max_lon'] + margin}")
+    return (
+        f"{PERU_BBOX['min_lat'] - margin},{PERU_BBOX['min_lon'] - margin},"
+        f"{PERU_BBOX['max_lat'] + margin},{PERU_BBOX['max_lon'] + margin}"
+    )
 
 
-def overpass_query(tags: str, area_filter: str = "") -> str:
+def overpass_query(tags: str) -> str:
     bbox = bbox_overpass()
     return f"""
 [out:json][timeout:60];
@@ -184,7 +241,7 @@ out center tags;
 
 
 def try_overpass(query: str, label: str) -> list[dict]:
-    """Intenta múltiples endpoints Overpass con fallback."""
+    """Intenta múltiples endpoints Overpass con fallback automático."""
     for ep in OVERPASS:
         for intento in range(3):
             try:
@@ -196,16 +253,16 @@ def try_overpass(query: str, label: str) -> list[dict]:
                     continue
                 r.raise_for_status()
                 elements = r.json().get("elements", [])
-                log.info(f"    {len(elements)} elementos OSM obtenidos")
+                log.info(f"    {len(elements)} elementos OSM")
                 return elements
             except Exception as e:
-                log.warning(f"  Overpass {label} intento {intento+1}/{ep[:40]} falló: {e}")
+                log.warning(f"  Overpass {label} intento {intento+1} falló: {e}")
                 time.sleep(10)
     return []
 
 
 def normalize_osm_element(el: dict) -> tuple[float, float] | None:
-    """Extrae lat/lon de nodo, way o relación OSM."""
+    """Extrae (lon, lat) de nodo, way o relación OSM."""
     if el["type"] == "node":
         return el.get("lon"), el.get("lat")
     center = el.get("center", {})
@@ -216,59 +273,98 @@ def normalize_osm_element(el: dict) -> tuple[float, float] | None:
 
 # ══════════════════════════════════════════════════════════════════
 #  PASO 0: DEPARTAMENTOS (GADM L1)
+#  🔴 FIX 1: ST_Multi() · FIX 3: fallback hardcoded
 # ══════════════════════════════════════════════════════════════════
+
+def _insertar_departamento_row(
+    cur,
+    nombre: str,
+    ubigeo: str,
+    geom_wkt: str,
+    zona: int,
+    factor_z: float,
+    area_km2=None,
+    capital=None,
+    fuente: str = "GADM 4.1",
+) -> bool:
+    """
+    Inserta un departamento con ST_Multi() para tolerar Polygon y MultiPolygon.
+    🔴 FIX 1: ST_Multi() convierte Polygon→MultiPolygon sin error de tipo.
+    """
+    try:
+        cur.execute("""
+            INSERT INTO departamentos
+                (nombre, ubigeo, geom, zona_sismica, factor_z, area_km2, capital, fuente)
+            VALUES (%s, %s,
+                ST_Multi(ST_MakeValid(ST_GeomFromText(%s, 4326)))::geometry(MultiPolygon,4326),
+                %s, %s, %s, %s, %s)
+            ON CONFLICT (ubigeo) DO UPDATE SET
+                geom         = EXCLUDED.geom,
+                zona_sismica = EXCLUDED.zona_sismica,
+                factor_z     = EXCLUDED.factor_z,
+                nombre       = EXCLUDED.nombre,
+                fuente       = EXCLUDED.fuente
+        """, (nombre, ubigeo, geom_wkt, zona, factor_z, area_km2, capital, fuente))
+        return True
+    except Exception as e:
+        log.warning(f"  Error insertando departamento '{nombre}': {e}")
+        return False
+
 
 def paso_departamentos(conn) -> int:
     log.info("Descargando GADM L1 (departamentos)...")
+    n_gadm = 0
+
     url = "https://geodata.ucdavis.edu/gadm/gadm4.1/json/gadm41_PER_1.json"
     try:
-        r = http_get_bytes(url)
+        r = http_get_bytes(url, timeout=60)
         log.info(f"  {len(r)/1e6:.1f} MB descargados")
         gj = json.loads(r)
+        with conn.cursor() as cur:
+            for feat in gj["features"]:
+                props   = feat["properties"]
+                nombre  = props.get("NAME_1", "")
+                # shape().wkt puede devolver Polygon o MultiPolygon → ST_Multi lo normaliza
+                geom_wkt = shape(feat["geometry"]).wkt
+                zona     = ZONA_SISMICA_POR_DEPTO.get(nombre, 2)
+                ubigeo   = props.get("CC_1") or f"GADM_{nombre[:6].upper()}"
+                ok = _insertar_departamento_row(
+                    cur, nombre, ubigeo, geom_wkt, zona,
+                    ZONA_SISMICA_FACTOR[zona], fuente="GADM 4.1",
+                )
+                if ok:
+                    n_gadm += 1
+        conn.commit()
+        log.info(f"  ✅ {n_gadm} departamentos GADM insertados")
     except Exception as e:
-        log.error(f"GADM L1 falló: {e}")
-        return 0
+        log.error(f"  GADM L1 falló: {e}")
 
-    rows = []
-    for feat in gj["features"]:
-        props = feat["properties"]
-        nombre = props.get("NAME_1", "")
-        geom_wkt = shape(feat["geometry"]).wkt
-
-        # Zona sísmica NTE E.030
-        zona = ZONA_SISMICA_POR_DEPTO.get(nombre, 2)
-
-        rows.append({
-            "nombre": nombre,
-            "ubigeo": props.get("CC_1", ""),
-            "geom_wkt": geom_wkt,
-            "zona_sismica": zona,
-            "factor_z": ZONA_SISMICA_FACTOR[zona],
-            "area_km2": None,
-            "capital": None,
-            "fuente": "GADM 4.1",
-        })
-
-    if not rows:
-        return 0
-
+    # ── 🔴 FIX 3: Fallback si GADM insertó menos de 20 departamentos ─
     with conn.cursor() as cur:
-        for r in rows:
-            cur.execute("""
-                INSERT INTO departamentos (nombre, ubigeo, geom, zona_sismica, factor_z, area_km2, capital, fuente)
-                VALUES (%s, %s, ST_MakeValid(ST_GeomFromText(%s, 4326))::geometry(MultiPolygon,4326),
-                        %s, %s, %s, %s, %s)
-                ON CONFLICT (ubigeo) DO UPDATE SET
-                    geom = EXCLUDED.geom,
-                    zona_sismica = EXCLUDED.zona_sismica,
-                    factor_z = EXCLUDED.factor_z,
-                    fuente = EXCLUDED.fuente
-            """, (r["nombre"], r["ubigeo"], r["geom_wkt"],
-                  r["zona_sismica"], r["factor_z"],
-                  r["area_km2"], r["capital"], r["fuente"]))
-    conn.commit()
-    log.info(f"✅ {len(rows)} departamentos insertados (con zona sísmica NTE E.030)")
-    return len(rows)
+        cur.execute("SELECT COUNT(*) FROM departamentos WHERE geom IS NOT NULL")
+        n_actual = cur.fetchone()[0]
+
+    if n_actual < 20:
+        log.warning(
+            f"  ⚠  Solo {n_actual} departamentos con geometría — "
+            "cargando fallback hardcoded..."
+        )
+        n_fb = 0
+        with conn.cursor() as cur:
+            for (nombre, ubigeo, lon_min, lat_min, lon_max, lat_max, zona) in DEPARTAMENTOS_FALLBACK:
+                geom_wkt = _bbox_to_multipolygon_wkt(lon_min, lat_min, lon_max, lat_max)
+                ok = _insertar_departamento_row(
+                    cur, nombre, ubigeo, geom_wkt, zona,
+                    ZONA_SISMICA_FACTOR[zona], fuente="Fallback-bbox",
+                )
+                if ok:
+                    n_fb += 1
+        conn.commit()
+        log.info(f"  ✅ {n_fb} departamentos fallback insertados")
+        n_actual += n_fb
+
+    log.info(f"✅ {n_actual} departamentos disponibles (zona sísmica NTE E.030)")
+    return n_actual
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -298,7 +394,7 @@ BLOQUES_HISTORICOS = [
 def _fetch_bloque_sismos(start: str, end: str) -> list[dict]:
     params = {
         "format": "geojson", "starttime": start, "endtime": end,
-        "minlatitude": PERU_BBOX["min_lat"], "maxlatitude": PERU_BBOX["max_lat"],
+        "minlatitude":  PERU_BBOX["min_lat"], "maxlatitude":  PERU_BBOX["max_lat"],
         "minlongitude": PERU_BBOX["min_lon"], "maxlongitude": PERU_BBOX["max_lon"],
         "minmagnitude": 2.5, "orderby": "time-asc", "limit": 20000,
     }
@@ -309,32 +405,27 @@ def _fetch_bloque_sismos(start: str, end: str) -> list[dict]:
 
 
 def _sismo_row(feat: dict) -> dict | None:
-    props = feat["properties"]
+    props  = feat["properties"]
     coords = feat["geometry"]["coordinates"]
     lon, lat, depth = coords[0], coords[1], coords[2] or 0.0
-    usgs_id = feat["id"]
     mag = props.get("mag")
     if not mag or mag < 0:
         return None
     ts = props.get("time", 0)
     dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) if ts else None
-    fecha = dt.date() if dt else None
-
-    depth = max(0, depth)
-    if depth < 60:
-        tipo_prof = "superficial"
-    elif depth < 300:
-        tipo_prof = "intermedio"
-    else:
-        tipo_prof = "profundo"
-
+    depth = max(0.0, depth)
+    tipo_prof = (
+        "superficial" if depth < 60 else
+        "intermedio"  if depth < 300 else
+        "profundo"
+    )
     return {
-        "usgs_id": usgs_id,
+        "usgs_id": feat["id"],
         "lon": lon, "lat": lat,
         "magnitud": round(mag, 1),
         "profundidad_km": round(depth, 2),
         "tipo_profundidad": tipo_prof,
-        "fecha": fecha,
+        "fecha": dt.date() if dt else None,
         "hora_utc": dt,
         "lugar": props.get("place", ""),
         "tipo_magnitud": props.get("magType", ""),
@@ -344,8 +435,7 @@ def _sismo_row(feat: dict) -> dict | None:
 
 def paso_sismos(conn) -> int:
     log.info(f"USGS: 1900-01-01 → {date.today()}  (M≥2.5)")
-    log.info(f"  {len(BLOQUES_HISTORICOS)} bloques → descarga paralela ({MAX_WORKERS} workers)")
-
+    log.info(f"  {len(BLOQUES_HISTORICOS)} bloques · descarga paralela ({MAX_WORKERS} workers)")
     all_features: list[dict] = []
     t0 = time.time()
 
@@ -359,12 +449,7 @@ def paso_sismos(conn) -> int:
                 s, e = futs[fut]
                 log.warning(f"  Bloque {s}→{e} falló: {err}")
 
-    rows = []
-    for feat in all_features:
-        row = _sismo_row(feat)
-        if row:
-            rows.append(row)
-
+    rows = [r for feat in all_features if (r := _sismo_row(feat))]
     inserted = 0
     with conn.cursor() as cur:
         for r in rows:
@@ -373,11 +458,9 @@ def paso_sismos(conn) -> int:
                     INSERT INTO sismos
                         (usgs_id, geom, magnitud, profundidad_km, tipo_profundidad,
                          fecha, hora_utc, lugar, tipo_magnitud, estado)
-                    VALUES (
-                        %s,
+                    VALUES (%s,
                         ST_SetSRID(ST_MakePoint(%s, %s), 4326),
-                        %s, %s, %s, %s, %s, %s, %s, %s
-                    )
+                        %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (usgs_id) DO NOTHING
                 """, (r["usgs_id"], r["lon"], r["lat"],
                       r["magnitud"], r["profundidad_km"], r["tipo_profundidad"],
@@ -387,26 +470,23 @@ def paso_sismos(conn) -> int:
             except Exception:
                 pass
     conn.commit()
-    elapsed = time.time() - t0
-    log.info(f"✅ {inserted} sismos cargados ({elapsed:.1f}s)")
+    log.info(f"✅ {inserted} sismos cargados ({time.time()-t0:.1f}s)")
     return inserted
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PASO 2: DISTRITOS + POBLACIÓN (INEI vía GADM L3)
+#  PASO 2: DISTRITOS + POBLACIÓN (INEI WFS → GADM L3 fallback)
+#  🔴 FIX 1: ST_Multi() en ambas funciones de inserción
 # ══════════════════════════════════════════════════════════════════
 
 def paso_distritos(conn) -> int:
-    """
-    Carga distritos desde INEI (WFS) → GADM L3 (fallback).
-    GADM L3 incluye campo de población de INEI Censos.
-    """
-    # Intento 1: INEI WFS
     for inei_url in [
-        "https://geoservidor.inei.gob.pe/geoserver/ows?service=WFS&version=1.0.0"
-        "&request=GetFeature&typeName=INEI:LIMITEDISTRITAL&outputFormat=application/json&srsName=EPSG:4326",
-        "https://geoservidorperu.inei.gob.pe/geoserver/ows?service=WFS&version=1.0.0"
-        "&request=GetFeature&typeName=INEI:LIMITEDISTRITAL&outputFormat=application/json&srsName=EPSG:4326",
+        ("https://geoservidor.inei.gob.pe/geoserver/ows?service=WFS&version=1.0.0"
+         "&request=GetFeature&typeName=INEI:LIMITEDISTRITAL"
+         "&outputFormat=application/json&srsName=EPSG:4326"),
+        ("https://geoservidorperu.inei.gob.pe/geoserver/ows?service=WFS&version=1.0.0"
+         "&request=GetFeature&typeName=INEI:LIMITEDISTRITAL"
+         "&outputFormat=application/json&srsName=EPSG:4326"),
     ]:
         try:
             log.info(f"Descargando distritos INEI: {inei_url[:70]}...")
@@ -416,13 +496,12 @@ def paso_distritos(conn) -> int:
             if features:
                 return _insertar_distritos_inei(conn, features)
         except Exception as e:
-            log.warning(f"  INEI falló ({inei_url[:50]}): {e}")
+            log.warning(f"  INEI falló: {e}")
 
-    # Fallback: GADM L3
-    log.info("Descargando GADM L3...")
+    log.info("Descargando GADM L3 (fallback)...")
     try:
         url = "https://geodata.ucdavis.edu/gadm/gadm4.1/json/gadm41_PER_3.json"
-        r = http_get_bytes(url, timeout=120)
+        r = http_get_bytes(url, timeout=180)
         log.info(f"  {len(r)/1e6:.1f} MB descargados")
         gj = json.loads(r)
         return _insertar_distritos_gadm(conn, gj["features"])
@@ -435,18 +514,20 @@ def _insertar_distritos_inei(conn, features: list) -> int:
     count = 0
     with conn.cursor() as cur:
         for feat in features:
-            p = feat["properties"]
+            p        = feat["properties"]
             geom_wkt = shape(feat["geometry"]).wkt
-            depto = p.get("NOMBDEP", "") or ""
-            zona = ZONA_SISMICA_POR_DEPTO.get(depto, 2)
+            depto    = p.get("NOMBDEP", "") or ""
+            zona     = ZONA_SISMICA_POR_DEPTO.get(depto, 2)
             try:
+                # 🔴 FIX 1: ST_Multi()
                 cur.execute("""
                     INSERT INTO distritos
                         (ubigeo, nombre, provincia, departamento, geom,
                          nivel_riesgo, poblacion, zona_sismica, fuente)
-                    VALUES (%s,%s,%s,%s,
-                        ST_MakeValid(ST_GeomFromText(%s,4326))::geometry(MultiPolygon,4326),
-                        %s,%s,%s,%s)
+                    VALUES (%s, %s, %s, %s,
+                        ST_Multi(ST_MakeValid(ST_GeomFromText(%s, 4326)))
+                            ::geometry(MultiPolygon,4326),
+                        %s, %s, %s, %s)
                     ON CONFLICT (ubigeo) DO NOTHING
                 """, (p.get("IDDIST"), p.get("NOMBDIST"), p.get("NOMBPROV"),
                       depto, geom_wkt, 3,
@@ -464,18 +545,20 @@ def _insertar_distritos_gadm(conn, features: list) -> int:
     count = 0
     with conn.cursor() as cur:
         for feat in features:
-            p = feat["properties"]
+            p        = feat["properties"]
             geom_wkt = shape(feat["geometry"]).wkt
-            depto = p.get("NAME_1", "")
-            zona = ZONA_SISMICA_POR_DEPTO.get(depto, 2)
+            depto    = p.get("NAME_1", "")
+            zona     = ZONA_SISMICA_POR_DEPTO.get(depto, 2)
             try:
+                # 🔴 FIX 1: ST_Multi()
                 cur.execute("""
                     INSERT INTO distritos
                         (ubigeo, nombre, provincia, departamento, geom,
                          nivel_riesgo, zona_sismica, fuente)
-                    VALUES (%s,%s,%s,%s,
-                        ST_MakeValid(ST_GeomFromText(%s,4326))::geometry(MultiPolygon,4326),
-                        %s,%s,%s)
+                    VALUES (%s, %s, %s, %s,
+                        ST_Multi(ST_MakeValid(ST_GeomFromText(%s, 4326)))
+                            ::geometry(MultiPolygon,4326),
+                        %s, %s, %s)
                     ON CONFLICT (ubigeo) DO NOTHING
                 """, (p.get("CC_3"), p.get("NAME_3"),
                       p.get("NAME_2"), depto, geom_wkt,
@@ -489,25 +572,27 @@ def _insertar_distritos_gadm(conn, features: list) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PASO 3: FALLAS GEOLÓGICAS (INGEMMET + dataset IGP/Audin 2008)
+#  PASO 3: FALLAS GEOLÓGICAS
+#  Ref: Audin et al. 2008 + INGEMMET 2021 + IGP
 # ══════════════════════════════════════════════════════════════════
 
-# Dataset científico de fallas activas del Perú
-# Ref: Audin et al. 2008 - "Geodynamics of the Andes" + INGEMMET 2021
 FALLAS_DATASET = [
-    # Costa y subducción
-    {"nombre": "Sistema de fallas de Lima", "tipo": "inversa", "mecanismo": "compresión",
-     "magnitud_max": 8.0, "longitud_km": 120, "region": "Lima", "activa": True,
+    # ── Costa y subducción ─────────────────────────────────────────
+    {"nombre": "Sistema de fallas de Lima", "tipo": "inversa",
+     "mecanismo": "compresión", "magnitud_max": 8.0, "longitud_km": 120,
+     "region": "Lima", "activa": True,
      "coords": [(-77.1,-12.0),(-76.8,-11.5),(-76.5,-11.0),(-76.2,-10.5)]},
-    {"nombre": "Falla de Paracas", "tipo": "inversa", "mecanismo": "compresión",
-     "magnitud_max": 7.5, "longitud_km": 80, "region": "Ica", "activa": True,
+    {"nombre": "Falla de Paracas", "tipo": "inversa",
+     "mecanismo": "compresión", "magnitud_max": 7.5, "longitud_km": 80,
+     "region": "Ica", "activa": True,
      "coords": [(-76.2,-13.8),(-75.9,-13.5),(-75.6,-13.2),(-75.3,-12.9)]},
     {"nombre": "Sistema de fallas de Ica", "tipo": "inversa-desplazamiento",
      "mecanismo": "compresión oblicua", "magnitud_max": 7.8, "longitud_km": 200,
      "region": "Ica", "activa": True,
      "coords": [(-75.7,-14.5),(-75.4,-14.0),(-75.1,-13.5),(-74.8,-13.0)]},
-    {"nombre": "Falla de Nazca", "tipo": "transcurrente", "mecanismo": "deslizamiento lateral",
-     "magnitud_max": 7.2, "longitud_km": 150, "region": "Ica", "activa": True,
+    {"nombre": "Falla de Nazca", "tipo": "transcurrente",
+     "mecanismo": "deslizamiento lateral", "magnitud_max": 7.2, "longitud_km": 150,
+     "region": "Ica", "activa": True,
      "coords": [(-74.9,-14.8),(-74.6,-14.5),(-74.3,-14.2),(-74.0,-13.9)]},
     {"nombre": "Sistema de fallas de Arequipa", "tipo": "inversa",
      "mecanismo": "compresión", "magnitud_max": 8.4, "longitud_km": 300,
@@ -520,28 +605,23 @@ FALLAS_DATASET = [
      "mecanismo": "compresión", "magnitud_max": 7.3, "longitud_km": 120,
      "region": "Tacna", "activa": True,
      "coords": [(-70.3,-17.0),(-70.0,-17.5),(-69.7,-18.0)]},
-    # Sierra
-    {"nombre": "Falla Quiches-Sihuas", "tipo": "inversa", "mecanismo": "compresión",
-     "magnitud_max": 7.5, "longitud_km": 90, "region": "Ancash", "activa": True,
+    {"nombre": "Falla Pisco-Ayacucho", "tipo": "inversa",
+     "mecanismo": "compresión", "magnitud_max": 7.0, "longitud_km": 100,
+     "region": "Ica", "activa": True,
+     "coords": [(-75.0,-13.7),(-74.7,-14.0),(-74.4,-14.3),(-74.1,-14.6)]},
+    {"nombre": "Falla Tumbes-Zarumilla", "tipo": "inversa",
+     "mecanismo": "compresión", "magnitud_max": 7.2, "longitud_km": 110,
+     "region": "Tumbes", "activa": True,
+     "coords": [(-80.4,-3.5),(-80.1,-3.8),(-79.8,-4.1)]},
+    {"nombre": "Falla de Piura-Sullana", "tipo": "transcurrente",
+     "mecanismo": "deslizamiento lateral", "magnitud_max": 6.8, "longitud_km": 80,
+     "region": "Piura", "activa": True,
+     "coords": [(-80.5,-4.5),(-80.2,-4.8),(-79.9,-5.1),(-79.6,-5.4)]},
+    # ── Sierra ────────────────────────────────────────────────────
+    {"nombre": "Falla Quiches-Sihuas", "tipo": "inversa",
+     "mecanismo": "compresión", "magnitud_max": 7.5, "longitud_km": 90,
+     "region": "Ancash", "activa": True,
      "coords": [(-77.8,-8.5),(-77.5,-8.8),(-77.2,-9.1)]},
-    {"nombre": "Sistema de fallas del Cusco", "tipo": "normal",
-     "mecanismo": "extensión", "magnitud_max": 6.8, "longitud_km": 110,
-     "region": "Cusco", "activa": True,
-     "coords": [(-72.0,-13.5),(-71.7,-13.8),(-71.4,-14.1),(-71.1,-14.4)]},
-    {"nombre": "Falla de Tambomachay (Cusco)", "tipo": "normal",
-     "mecanismo": "extensión", "magnitud_max": 6.5, "longitud_km": 25,
-     "region": "Cusco", "activa": True,
-     "coords": [(-71.9,-13.4),(-71.7,-13.5),(-71.5,-13.6)]},
-    {"nombre": "Falla Urcos-Cusipata", "tipo": "normal", "mecanismo": "extensión",
-     "magnitud_max": 6.3, "longitud_km": 40, "region": "Cusco", "activa": True,
-     "coords": [(-71.6,-13.7),(-71.4,-13.9),(-71.2,-14.1)]},
-    {"nombre": "Falla Vilcañota", "tipo": "normal", "mecanismo": "extensión",
-     "magnitud_max": 7.0, "longitud_km": 130, "region": "Puno", "activa": True,
-     "coords": [(-70.8,-14.5),(-70.5,-15.0),(-70.2,-15.5)]},
-    {"nombre": "Sistema de fallas de Ayacucho", "tipo": "normal-transcurrente",
-     "mecanismo": "extensión oblicua", "magnitud_max": 6.5, "longitud_km": 80,
-     "region": "Ayacucho", "activa": True,
-     "coords": [(-74.2,-13.5),(-74.0,-14.0),(-73.8,-14.5)]},
     {"nombre": "Falla de Cordillera Blanca", "tipo": "normal",
      "mecanismo": "extensión", "magnitud_max": 7.5, "longitud_km": 200,
      "region": "Ancash", "activa": True,
@@ -550,23 +630,26 @@ FALLAS_DATASET = [
      "mecanismo": "extensión", "magnitud_max": 6.8, "longitud_km": 45,
      "region": "Ancash", "activa": True,
      "coords": [(-77.4,-9.2),(-77.2,-9.5),(-77.0,-9.8)]},
-    # Norte
-    {"nombre": "Sistema de fallas del Marañón", "tipo": "transcurrente",
-     "mecanismo": "deslizamiento lateral", "magnitud_max": 7.0, "longitud_km": 180,
-     "region": "Cajamarca", "activa": True,
-     "coords": [(-78.5,-4.5),(-78.2,-5.0),(-77.9,-5.5),(-77.6,-6.0),(-77.3,-6.5)]},
-    {"nombre": "Falla de Moyobamba", "tipo": "normal",
-     "mecanismo": "extensión", "magnitud_max": 6.5, "longitud_km": 60,
-     "region": "San Martín", "activa": True,
-     "coords": [(-77.0,-5.8),(-76.7,-6.1),(-76.4,-6.4)]},
-    {"nombre": "Falla Alto Chicama", "tipo": "inversa", "mecanismo": "compresión",
-     "magnitud_max": 6.5, "longitud_km": 55, "region": "La Libertad", "activa": True,
-     "coords": [(-78.2,-7.5),(-77.9,-7.8),(-77.6,-8.1)]},
-    # Otras
-    {"nombre": "Falla de Pisco-Ayacucho", "tipo": "inversa",
-     "mecanismo": "compresión", "magnitud_max": 7.0, "longitud_km": 100,
-     "region": "Ica", "activa": True,
-     "coords": [(-75.0,-13.7),(-74.7,-14.0),(-74.4,-14.3),(-74.1,-14.6)]},
+    {"nombre": "Sistema de fallas del Cusco", "tipo": "normal",
+     "mecanismo": "extensión", "magnitud_max": 6.8, "longitud_km": 110,
+     "region": "Cusco", "activa": True,
+     "coords": [(-72.0,-13.5),(-71.7,-13.8),(-71.4,-14.1),(-71.1,-14.4)]},
+    {"nombre": "Falla de Tambomachay (Cusco)", "tipo": "normal",
+     "mecanismo": "extensión", "magnitud_max": 6.5, "longitud_km": 25,
+     "region": "Cusco", "activa": True,
+     "coords": [(-71.9,-13.4),(-71.7,-13.5),(-71.5,-13.6)]},
+    {"nombre": "Falla Urcos-Cusipata", "tipo": "normal",
+     "mecanismo": "extensión", "magnitud_max": 6.3, "longitud_km": 40,
+     "region": "Cusco", "activa": True,
+     "coords": [(-71.6,-13.7),(-71.4,-13.9),(-71.2,-14.1)]},
+    {"nombre": "Falla Vilcañota", "tipo": "normal",
+     "mecanismo": "extensión", "magnitud_max": 7.0, "longitud_km": 130,
+     "region": "Puno", "activa": True,
+     "coords": [(-70.8,-14.5),(-70.5,-15.0),(-70.2,-15.5)]},
+    {"nombre": "Sistema de fallas de Ayacucho", "tipo": "normal-transcurrente",
+     "mecanismo": "extensión oblicua", "magnitud_max": 6.5, "longitud_km": 80,
+     "region": "Ayacucho", "activa": True,
+     "coords": [(-74.2,-13.5),(-74.0,-14.0),(-73.8,-14.5)]},
     {"nombre": "Falla de San Antonio de Cachi", "tipo": "inversa",
      "mecanismo": "compresión", "magnitud_max": 6.5, "longitud_km": 50,
      "region": "Ayacucho", "activa": True,
@@ -579,31 +662,26 @@ FALLAS_DATASET = [
      "mecanismo": "extensión", "magnitud_max": 7.0, "longitud_km": 90,
      "region": "Puno", "activa": True,
      "coords": [(-69.5,-16.0),(-69.2,-16.4),(-68.9,-16.8)]},
-    {"nombre": "Falla de Piura-Sullana", "tipo": "transcurrente",
-     "mecanismo": "deslizamiento lateral", "magnitud_max": 6.8, "longitud_km": 80,
-     "region": "Piura", "activa": True,
-     "coords": [(-80.5,-4.5),(-80.2,-4.8),(-79.9,-5.1),(-79.6,-5.4)]},
-    {"nombre": "Falla Tumbes-Zarumilla", "tipo": "inversa",
-     "mecanismo": "compresión", "magnitud_max": 7.2, "longitud_km": 110,
-     "region": "Tumbes", "activa": True,
-     "coords": [(-80.4,-3.5),(-80.1,-3.8),(-79.8,-4.1)]},
+    # ── Norte ─────────────────────────────────────────────────────
+    {"nombre": "Sistema de fallas del Marañón", "tipo": "transcurrente",
+     "mecanismo": "deslizamiento lateral", "magnitud_max": 7.0, "longitud_km": 180,
+     "region": "Cajamarca", "activa": True,
+     "coords": [(-78.5,-4.5),(-78.2,-5.0),(-77.9,-5.5),(-77.6,-6.0),(-77.3,-6.5)]},
+    {"nombre": "Falla de Moyobamba", "tipo": "normal",
+     "mecanismo": "extensión", "magnitud_max": 6.5, "longitud_km": 60,
+     "region": "San Martín", "activa": True,
+     "coords": [(-77.0,-5.8),(-76.7,-6.1),(-76.4,-6.4)]},
+    {"nombre": "Falla Alto Chicama", "tipo": "inversa",
+     "mecanismo": "compresión", "magnitud_max": 6.5, "longitud_km": 55,
+     "region": "La Libertad", "activa": True,
+     "coords": [(-78.2,-7.5),(-77.9,-7.8),(-77.6,-8.1)]},
 ]
 
 
 def paso_fallas(conn) -> int:
-    # Intentar INGEMMET primero
-    ingemmet_fallas = _try_ingemmet()
-
-    if ingemmet_fallas:
-        log.info(f"✅ {len(ingemmet_fallas)} fallas INGEMMET + {len(FALLAS_DATASET)} dataset científico")
-        all_fallas = ingemmet_fallas + FALLAS_DATASET
-    else:
-        log.info(f"✅ {len(FALLAS_DATASET)} fallas dataset científico (Audin 2008 + IGP 2021)")
-        all_fallas = FALLAS_DATASET
-
     count = 0
     with conn.cursor() as cur:
-        for f in all_fallas:
+        for f in FALLAS_DATASET:
             coords = f.get("coords", [])
             if len(coords) < 2:
                 continue
@@ -615,7 +693,8 @@ def paso_fallas(conn) -> int:
                         (nombre, geom, activa, tipo, mecanismo,
                          longitud_km, magnitud_max, region, fuente)
                     VALUES (%s,
-                        ST_MakeValid(ST_GeomFromText(%s, 4326))::geometry(MultiLineString,4326),
+                        ST_MakeValid(ST_GeomFromText(%s, 4326))
+                            ::geometry(MultiLineString,4326),
                         %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                 """, (f["nombre"], geom_wkt, f.get("activa", True),
@@ -626,40 +705,13 @@ def paso_fallas(conn) -> int:
             except Exception:
                 pass
     conn.commit()
-    log.info(f"✅ {count} fallas totales insertadas")
+    log.info(f"✅ {count} fallas geológicas insertadas")
     return count
 
 
-def _try_ingemmet() -> list[dict]:
-    endpoints = [
-        ("SERV_NEOTECTONICA",  "MapServer/0"),
-        ("SERV_GEOLOGIA_50000", "MapServer/4"),
-        ("SERV_GEOLOGIA_REGIONAL", "MapServer/6"),
-    ]
-    for svc, layer in endpoints:
-        url = (f"https://geocatmin.ingemmet.gob.pe/arcgis/rest/services/"
-               f"{svc}/{layer}/query")
-        params = {
-            "where": "1=1",
-            "geometry": f"{PERU_BBOX['min_lon']},{PERU_BBOX['min_lat']},{PERU_BBOX['max_lon']},{PERU_BBOX['max_lat']}",
-            "geometryType": "esriGeometryEnvelope",
-            "outFields": "*", "outSR": "4326", "f": "geojson",
-            "resultRecordCount": 2000,
-        }
-        try:
-            data = http_get(url, params=params, timeout=20)
-            features = data.get("features", [])
-            if features:
-                log.info(f"  ✅ {len(features)} fallas INGEMMET ({svc})")
-                return []  # Convertir a formato interno si se implementa
-        except Exception as e:
-            log.warning(f"  INGEMMET {svc} falló: {e}")
-    return []
-
-
 # ══════════════════════════════════════════════════════════════════
-#  PASOS 4, 5, 6: INUNDACIONES, TSUNAMIS, DESLIZAMIENTOS
-#  (Dataset interno + ANA/CENEPRED/PREDES cuando disponible)
+#  PASOS 4–6: INUNDACIONES · TSUNAMIS · DESLIZAMIENTOS
+#  Fuente: ANA / PREDES / CENEPRED / IGP
 # ══════════════════════════════════════════════════════════════════
 
 INUNDACIONES_DATASET = [
@@ -667,8 +719,9 @@ INUNDACIONES_DATASET = [
      "nivel_riesgo": 4, "periodo_retorno": 50, "cuenca": "Mantaro",
      "region": "Junín", "profundidad_max_m": 3.5,
      "coords": [(-75.2,-11.8),(-75.0,-12.0),(-74.8,-12.2),(-75.0,-12.4),(-75.2,-12.2),(-75.2,-11.8)]},
-    {"nombre": "Delta del Río Piura", "tipo": "fluvial", "nivel_riesgo": 5,
-     "periodo_retorno": 25, "cuenca": "Piura", "region": "Piura", "profundidad_max_m": 5.0,
+    {"nombre": "Delta del Río Piura", "tipo": "fluvial",
+     "nivel_riesgo": 5, "periodo_retorno": 25, "cuenca": "Piura",
+     "region": "Piura", "profundidad_max_m": 5.0,
      "coords": [(-80.8,-5.0),(-80.5,-5.1),(-80.3,-5.2),(-80.4,-5.4),(-80.7,-5.3),(-80.8,-5.0)]},
     {"nombre": "Bajo Piura (FEN recurrente)", "tipo": "fluvial-pluvial",
      "nivel_riesgo": 5, "periodo_retorno": 10, "cuenca": "Piura",
@@ -722,32 +775,40 @@ INUNDACIONES_DATASET = [
 
 TSUNAMIS_DATASET = [
     {"nombre": "Zona inundación tsunami Lima - Callao",
-     "nivel_riesgo": 5, "altura_ola_m": 15.0, "tiempo_arribo_min": 20, "periodo_retorno": 100,
-     "region": "Lima",
+     "nivel_riesgo": 5, "altura_ola_m": 15.0, "tiempo_arribo_min": 20,
+     "periodo_retorno": 100, "region": "Lima",
      "coords": [(-77.2,-12.0),(-77.0,-12.05),(-76.9,-12.1),(-77.0,-12.2),(-77.2,-12.15),(-77.2,-12.0)]},
-    {"nombre": "Zona tsunami Ica - Pisco", "nivel_riesgo": 5, "altura_ola_m": 12.0,
-     "tiempo_arribo_min": 25, "periodo_retorno": 75, "region": "Ica",
+    {"nombre": "Zona tsunami Ica - Pisco",
+     "nivel_riesgo": 5, "altura_ola_m": 12.0, "tiempo_arribo_min": 25,
+     "periodo_retorno": 75, "region": "Ica",
      "coords": [(-76.3,-13.6),(-76.1,-13.7),(-76.0,-13.9),(-76.2,-14.0),(-76.4,-13.8),(-76.3,-13.6)]},
-    {"nombre": "Zona tsunami Arequipa - Camaná", "nivel_riesgo": 5, "altura_ola_m": 18.0,
-     "tiempo_arribo_min": 30, "periodo_retorno": 150, "region": "Arequipa",
+    {"nombre": "Zona tsunami Arequipa - Camaná",
+     "nivel_riesgo": 5, "altura_ola_m": 18.0, "tiempo_arribo_min": 30,
+     "periodo_retorno": 150, "region": "Arequipa",
      "coords": [(-72.9,-16.5),(-72.6,-16.6),(-72.4,-16.8),(-72.6,-17.0),(-72.8,-16.8),(-72.9,-16.5)]},
-    {"nombre": "Costa norte Moquegua", "nivel_riesgo": 4, "altura_ola_m": 10.0,
-     "tiempo_arribo_min": 35, "periodo_retorno": 100, "region": "Moquegua",
+    {"nombre": "Costa norte Moquegua",
+     "nivel_riesgo": 4, "altura_ola_m": 10.0, "tiempo_arribo_min": 35,
+     "periodo_retorno": 100, "region": "Moquegua",
      "coords": [(-71.4,-17.0),(-71.2,-17.1),(-71.0,-17.3),(-71.2,-17.4),(-71.4,-17.2),(-71.4,-17.0)]},
-    {"nombre": "Litoral Tacna", "nivel_riesgo": 4, "altura_ola_m": 9.0,
-     "tiempo_arribo_min": 40, "periodo_retorno": 100, "region": "Tacna",
+    {"nombre": "Litoral Tacna",
+     "nivel_riesgo": 4, "altura_ola_m": 9.0, "tiempo_arribo_min": 40,
+     "periodo_retorno": 100, "region": "Tacna",
      "coords": [(-70.5,-17.8),(-70.3,-17.9),(-70.1,-18.1),(-70.3,-18.2),(-70.5,-18.0),(-70.5,-17.8)]},
-    {"nombre": "Costa Ancash - Chimbote", "nivel_riesgo": 4, "altura_ola_m": 8.0,
-     "tiempo_arribo_min": 20, "periodo_retorno": 100, "region": "Ancash",
+    {"nombre": "Costa Ancash - Chimbote",
+     "nivel_riesgo": 4, "altura_ola_m": 8.0, "tiempo_arribo_min": 20,
+     "periodo_retorno": 100, "region": "Ancash",
      "coords": [(-78.7,-9.0),(-78.5,-9.1),(-78.3,-9.3),(-78.5,-9.5),(-78.7,-9.3),(-78.7,-9.0)]},
-    {"nombre": "Litoral La Libertad - Salaverry", "nivel_riesgo": 3, "altura_ola_m": 7.0,
-     "tiempo_arribo_min": 20, "periodo_retorno": 100, "region": "La Libertad",
+    {"nombre": "Litoral La Libertad - Salaverry",
+     "nivel_riesgo": 3, "altura_ola_m": 7.0, "tiempo_arribo_min": 20,
+     "periodo_retorno": 100, "region": "La Libertad",
      "coords": [(-79.1,-8.1),(-78.9,-8.2),(-78.7,-8.4),(-78.9,-8.6),(-79.1,-8.4),(-79.1,-8.1)]},
-    {"nombre": "Costa Piura - Sechura", "nivel_riesgo": 3, "altura_ola_m": 6.5,
-     "tiempo_arribo_min": 25, "periodo_retorno": 150, "region": "Piura",
+    {"nombre": "Costa Piura - Sechura",
+     "nivel_riesgo": 3, "altura_ola_m": 6.5, "tiempo_arribo_min": 25,
+     "periodo_retorno": 150, "region": "Piura",
      "coords": [(-81.0,-5.3),(-80.8,-5.4),(-80.6,-5.6),(-80.8,-5.8),(-81.0,-5.6),(-81.0,-5.3)]},
-    {"nombre": "Bahía de Tumbes", "nivel_riesgo": 3, "altura_ola_m": 5.5,
-     "tiempo_arribo_min": 30, "periodo_retorno": 200, "region": "Tumbes",
+    {"nombre": "Bahía de Tumbes",
+     "nivel_riesgo": 3, "altura_ola_m": 5.5, "tiempo_arribo_min": 30,
+     "periodo_retorno": 200, "region": "Tumbes",
      "coords": [(-80.6,-3.4),(-80.4,-3.5),(-80.3,-3.7),(-80.5,-3.9),(-80.7,-3.7),(-80.6,-3.4)]},
 ]
 
@@ -764,7 +825,7 @@ DESLIZAMIENTOS_DATASET = [
      "nivel_riesgo": 4, "area_km2": 45.0, "causa_principal": "sismicidad + lluvias",
      "region": "Cusco", "activo": True,
      "coords": [(-71.8,-13.5),(-71.6,-13.6),(-71.4,-13.7),(-71.5,-13.9),(-71.7,-13.8),(-71.8,-13.5)]},
-    {"nombre": "Deslizamientos en Ceja de Selva (Amazonas)", "tipo": "deslizamiento masivo",
+    {"nombre": "Deslizamientos Ceja de Selva (Amazonas)", "tipo": "deslizamiento masivo",
      "nivel_riesgo": 4, "area_km2": 120.0, "causa_principal": "deforestación + lluvias",
      "region": "Amazonas", "activo": True,
      "coords": [(-78.0,-6.0),(-77.7,-6.3),(-77.4,-6.5),(-77.6,-6.8),(-77.9,-6.6),(-78.0,-6.0)]},
@@ -784,7 +845,7 @@ DESLIZAMIENTOS_DATASET = [
      "nivel_riesgo": 4, "area_km2": 35.0, "causa_principal": "FEN intenso",
      "region": "Piura", "activo": True,
      "coords": [(-79.5,-5.0),(-79.2,-5.2),(-79.0,-5.4),(-79.2,-5.6),(-79.5,-5.4),(-79.5,-5.0)]},
-    {"nombre": "Taludes inestables Junín Selva Central", "tipo": "deslizamiento traslacional",
+    {"nombre": "Taludes Junín Selva Central", "tipo": "deslizamiento traslacional",
      "nivel_riesgo": 3, "area_km2": 60.0, "causa_principal": "deforestación + pendiente",
      "region": "Junín", "activo": True,
      "coords": [(-75.5,-10.8),(-75.2,-11.0),(-75.0,-11.2),(-75.2,-11.4),(-75.5,-11.2),(-75.5,-10.8)]},
@@ -808,19 +869,14 @@ DESLIZAMIENTOS_DATASET = [
      "nivel_riesgo": 3, "area_km2": 30.0, "causa_principal": "lluvias + cambio uso suelo",
      "region": "Cajamarca", "activo": True,
      "coords": [(-78.8,-6.7),(-78.5,-6.9),(-78.3,-7.1),(-78.5,-7.3),(-78.8,-7.1),(-78.8,-6.7)]},
-    {"nombre": "Deslizamientos Alto Mayo", "tipo": "deslizamiento traslacional",
+    {"nombre": "Deslizamientos Alto Mayo (San Martín)", "tipo": "deslizamiento traslacional",
      "nivel_riesgo": 3, "area_km2": 18.0, "causa_principal": "deforestación",
      "region": "San Martín", "activo": True,
      "coords": [(-77.3,-5.9),(-77.0,-6.1),(-76.8,-6.3),(-77.0,-6.5),(-77.3,-6.3),(-77.3,-5.9)]},
 ]
 
 
-def _insertar_poligonos(conn, tabla: str, dataset: list[dict], tipo_geom: str = "zonas") -> int:
-    col_map = {
-        "zonas_inundables": ("nivel_riesgo", "tipo_inundacion", "periodo_retorno", "profundidad_max_m", "cuenca", "region", "fuente"),
-        "zonas_tsunami":    ("nivel_riesgo", "altura_ola_m", "tiempo_arribo_min", "periodo_retorno", "region", "fuente"),
-        "deslizamientos":   ("tipo", "nivel_riesgo", "area_km2", "causa_principal", "region", "activo", "fuente"),
-    }
+def _insertar_poligonos(conn, tabla: str, dataset: list[dict]) -> int:
     count = 0
     with conn.cursor() as cur:
         for item in dataset:
@@ -828,9 +884,8 @@ def _insertar_poligonos(conn, tabla: str, dataset: list[dict], tipo_geom: str = 
             if len(coords) < 3:
                 continue
             coords_sql = ",".join([f"{c[0]} {c[1]}" for c in coords])
-            geom_wkt = f"MULTIPOLYGON((({coords_sql})))"
-            fuente = item.get("fuente", "CENEPRED/IGP 2024")
-
+            geom_wkt   = f"MULTIPOLYGON((({coords_sql})))"
+            fuente     = item.get("fuente", "CENEPRED/IGP 2024")
             try:
                 if tabla == "zonas_inundables":
                     cur.execute("""
@@ -878,22 +933,21 @@ def _insertar_poligonos(conn, tabla: str, dataset: list[dict], tipo_geom: str = 
 
 
 def paso_inundaciones(conn) -> int:
-    # Intentar ANA WFS
+    # Intentar ANA WFS primero
     for url in [
-        "https://snirh.ana.gob.pe/geoserver/snirh/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=snirh:zonas_inundacion&outputFormat=application/json",
-        "https://geoserver.ana.gob.pe/geoserver/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=ana:zonas_inundables&outputFormat=application/json",
+        ("https://snirh.ana.gob.pe/geoserver/snirh/ows?service=WFS&version=1.0.0"
+         "&request=GetFeature&typeName=snirh:zonas_inundacion&outputFormat=application/json"),
     ]:
         try:
             data = http_get_bytes(url, timeout=25)
-            gj = json.loads(data)
-            features = gj.get("features", [])
-            if features:
-                log.info(f"  ✅ {len(features)} inundaciones ANA WFS")
+            gj   = json.loads(data)
+            if gj.get("features"):
+                log.info(f"  ✅ {len(gj['features'])} inundaciones ANA WFS")
         except Exception as e:
             log.warning(f"  ANA WFS falló: {e}")
 
     n = _insertar_poligonos(conn, "zonas_inundables", INUNDACIONES_DATASET)
-    log.info(f"✅ {n} zonas inundables (dataset ANA/CENEPRED)")
+    log.info(f"✅ {n} zonas inundables (ANA/CENEPRED)")
     return n
 
 
@@ -904,17 +958,16 @@ def paso_tsunamis(conn) -> int:
 
 
 def paso_deslizamientos(conn) -> int:
-    # Intentar CENEPRED WFS
+    # Intentar CENEPRED primero
     for url in [
-        "https://sigrid.cenepred.gob.pe/sigridv3/geoserver/ogc/features/v1/collections/cenepred:deslizamientos/items?f=application/geo+json&limit=500",
-        "https://geo.cenepred.gob.pe/geoserver/wfs?service=WFS&version=1.0.0&request=GetFeature&typeName=cenepred:deslizamientos&outputFormat=application/json",
+        ("https://sigrid.cenepred.gob.pe/sigridv3/geoserver/ogc/features/v1/"
+         "collections/cenepred:deslizamientos/items?f=application/geo+json&limit=500"),
     ]:
         try:
             data = http_get_bytes(url, timeout=25)
-            gj = json.loads(data)
-            features = gj.get("features", [])
-            if features:
-                log.info(f"  ✅ {len(features)} deslizamientos CENEPRED")
+            gj   = json.loads(data)
+            if gj.get("features"):
+                log.info(f"  ✅ {len(gj['features'])} deslizamientos CENEPRED")
         except Exception as e:
             log.warning(f"  CENEPRED WFS falló: {e}")
 
@@ -924,19 +977,253 @@ def paso_deslizamientos(conn) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PASO 7: INFRAESTRUCTURA CRÍTICA — FUENTES OFICIALES PRIMERO
-#  Jerarquía: Fuente oficial → datos.gob.pe CKAN → OSM Overpass
+#  PASO 7: INFRAESTRUCTURA CRÍTICA
+#  Jerarquía: datos oficiales hardcoded → APIs oficiales → OSM
+#  🔴 FIX 2: _limpiar_fuera_peru() segura (verificación NULL y bbox)
 # ══════════════════════════════════════════════════════════════════
 
-# ── 7a: Establecimientos de Salud — SUSALUD RENIPRESS / MINSA ─────
+# ── Aeropuertos — CORPAC/MTC 2024 ────────────────────────────────
+AEROPUERTOS_MTC = [
+    {"nombre": "Aeropuerto Internacional Jorge Chávez",
+     "lon": -77.1143, "lat": -12.0219, "region": "Lima", "criticidad": 5},
+    {"nombre": "Aeropuerto Alejandro Velasco Astete (Cusco)",
+     "lon": -71.9388, "lat": -13.5357, "region": "Cusco", "criticidad": 5},
+    {"nombre": "Aeropuerto Rodríguez Ballón (Arequipa)",
+     "lon": -71.5831, "lat": -16.3411, "region": "Arequipa", "criticidad": 5},
+    {"nombre": "Aeropuerto Capitán FAP Quiñones (Chiclayo)",
+     "lon": -79.8282, "lat": -6.7875, "region": "Lambayeque", "criticidad": 5},
+    {"nombre": "Aeropuerto Carlos Martínez de Pinillos (Trujillo)",
+     "lon": -79.1086, "lat": -8.0814, "region": "La Libertad", "criticidad": 5},
+    {"nombre": "Aeropuerto Guillermo Concha Iberico (Piura)",
+     "lon": -80.6164, "lat": -5.2075, "region": "Piura", "criticidad": 4},
+    {"nombre": "Aeropuerto Francisco Secada Vignetta (Iquitos)",
+     "lon": -73.3086, "lat": -3.7847, "region": "Loreto", "criticidad": 4},
+    {"nombre": "Aeropuerto Padre José de Aldamiz (Puerto Maldonado)",
+     "lon": -69.2287, "lat": -12.6136, "region": "Madre de Dios", "criticidad": 4},
+    {"nombre": "Aeropuerto Alfredo Mendívil (Ayacucho)",
+     "lon": -74.2042, "lat": -13.1548, "region": "Ayacucho", "criticidad": 4},
+    {"nombre": "Aeropuerto David Abensur (Pucallpa)",
+     "lon": -74.5742, "lat": -8.3794, "region": "Ucayali", "criticidad": 4},
+    {"nombre": "Aeropuerto Inca Manco Capac (Juliaca)",
+     "lon": -70.1583, "lat": -15.4672, "region": "Puno", "criticidad": 4},
+    {"nombre": "Aeropuerto Pedro Canga Rodríguez (Tumbes)",
+     "lon": -80.3783, "lat": -3.5526, "region": "Tumbes", "criticidad": 4},
+    {"nombre": "Aeropuerto Guillermo del Castillo (Tarapoto)",
+     "lon": -76.3733, "lat": -6.5086, "region": "San Martín", "criticidad": 4},
+    {"nombre": "Aeropuerto Carlos Ciriani Santa Rosa (Tacna)",
+     "lon": -70.2756, "lat": -18.0533, "region": "Tacna", "criticidad": 4},
+    {"nombre": "Aeropuerto Armando Revoredo (Cajamarca)",
+     "lon": -78.4894, "lat": -7.1392, "region": "Cajamarca", "criticidad": 3},
+    {"nombre": "Aeropuerto de Ilo (Moquegua)",
+     "lon": -71.3400, "lat": -17.6944, "region": "Moquegua", "criticidad": 3},
+    {"nombre": "Aeropuerto de Andahuaylas",
+     "lon": -73.3503, "lat": -13.7064, "region": "Apurímac", "criticidad": 3},
+    {"nombre": "Aeropuerto David Figueroa (Huánuco)",
+     "lon": -76.2048, "lat": -9.8781, "region": "Huánuco", "criticidad": 3},
+    {"nombre": "Aeropuerto Jaime Montreuil (Chimbote)",
+     "lon": -78.5244, "lat": -9.1494, "region": "Ancash", "criticidad": 3},
+    {"nombre": "Aeropuerto Germán Arias Graziani (Huaraz)",
+     "lon": -77.5986, "lat": -9.3469, "region": "Ancash", "criticidad": 3},
+]
+
+# ── Puertos — APN / Plan Nacional de Desarrollo Portuario 2024 ───
+PUERTOS_APN = [
+    {"nombre": "Terminal Portuario del Callao",
+     "lon": -77.1483, "lat": -12.0580, "region": "Lima", "criticidad": 5},
+    {"nombre": "Terminal Portuario de Paita",
+     "lon": -81.1129, "lat": -5.0852, "region": "Piura", "criticidad": 5},
+    {"nombre": "Terminal Portuario de Salaverry",
+     "lon": -78.9783, "lat": -8.2239, "region": "La Libertad", "criticidad": 4},
+    {"nombre": "Terminal Portuario de Chimbote",
+     "lon": -78.5861, "lat": -9.0753, "region": "Ancash", "criticidad": 4},
+    {"nombre": "Terminal Portuario de Huarmey",
+     "lon": -78.1669, "lat": -10.0678, "region": "Ancash", "criticidad": 3},
+    {"nombre": "Terminal Portuario de Pisco",
+     "lon": -76.2163, "lat": -13.7211, "region": "Ica", "criticidad": 4},
+    {"nombre": "Terminal Portuario de Matarani (Arequipa)",
+     "lon": -72.1072, "lat": -16.9958, "region": "Arequipa", "criticidad": 4},
+    {"nombre": "Terminal Portuario de Ilo",
+     "lon": -71.3361, "lat": -17.6358, "region": "Moquegua", "criticidad": 4},
+    {"nombre": "Terminal ENAPU Iquitos",
+     "lon": -73.2561, "lat": -3.7433, "region": "Loreto", "criticidad": 4},
+    {"nombre": "Puerto Fluvial de Pucallpa",
+     "lon": -74.5533, "lat": -8.3933, "region": "Ucayali", "criticidad": 3},
+    {"nombre": "Terminal Portuario de Yurimaguas",
+     "lon": -76.0944, "lat": -5.8975, "region": "Loreto", "criticidad": 3},
+    {"nombre": "Puerto de Tumbes",
+     "lon": -80.4514, "lat": -3.5681, "region": "Tumbes", "criticidad": 3},
+    {"nombre": "Terminal de Cabotaje San Martín (Pisco)",
+     "lon": -76.2533, "lat": -13.8081, "region": "Ica", "criticidad": 3},
+    {"nombre": "Muelle Pesquero Parachique (Sechura)",
+     "lon": -80.8611, "lat": -5.5431, "region": "Piura", "criticidad": 3},
+    {"nombre": "Puerto General San Martín (Pisco)",
+     "lon": -76.1994, "lat": -13.7689, "region": "Ica", "criticidad": 4},
+]
+
+# ── Centrales eléctricas — OSINERGMIN / MINEM 2024 ───────────────
+CENTRALES_OSINERGMIN = [
+    {"nombre": "C.H. Mantaro (ElectroPerú)",
+     "lon": -74.9358, "lat": -12.3083, "region": "Junín", "criticidad": 5},
+    {"nombre": "C.H. Chaglla (Pachitea)",
+     "lon": -76.1500, "lat": -9.7833,  "region": "Huánuco", "criticidad": 5},
+    {"nombre": "C.H. Cerro del Águila",
+     "lon": -74.6167, "lat": -12.5333, "region": "Huancavelica", "criticidad": 5},
+    {"nombre": "C.H. Quitaracsa",
+     "lon": -77.7167, "lat": -8.9333,  "region": "Ancash", "criticidad": 4},
+    {"nombre": "C.T. Ventanilla (ENEL)",
+     "lon": -77.1500, "lat": -11.8667, "region": "Lima", "criticidad": 5},
+    {"nombre": "C.T. Chilca 1 (Kallpa)",
+     "lon": -76.7000, "lat": -12.5167, "region": "Lima", "criticidad": 5},
+    {"nombre": "C.T. Ilo 1 (Southern Copper)",
+     "lon": -71.3344, "lat": -17.6394, "region": "Moquegua", "criticidad": 4},
+    {"nombre": "C.H. Machu Picchu (ElectroSur Este)",
+     "lon": -72.5456, "lat": -13.1539, "region": "Cusco", "criticidad": 4},
+    {"nombre": "C.H. San Gabán II",
+     "lon": -69.7833, "lat": -13.3167, "region": "Puno", "criticidad": 4},
+    {"nombre": "C.H. Carhuaquero",
+     "lon": -79.2167, "lat": -6.6833,  "region": "Lambayeque", "criticidad": 4},
+    {"nombre": "Parque Solar Majes (Arequipa)",
+     "lon": -72.3167, "lat": -16.3833, "region": "Arequipa", "criticidad": 3},
+    {"nombre": "C.H. Gallito Ciego (CHAVIMOCHIC)",
+     "lon": -79.1333, "lat": -7.0833,  "region": "La Libertad", "criticidad": 4},
+    {"nombre": "C.H. Oroya — ElectroAndes",
+     "lon": -75.9167, "lat": -11.5333, "region": "Junín", "criticidad": 4},
+    {"nombre": "C.H. Cañon del Pato (Duke Energy)",
+     "lon": -77.7208, "lat": -8.9069,  "region": "Ancash", "criticidad": 5},
+    {"nombre": "C.T. Pisco",
+     "lon": -76.2167, "lat": -13.8333, "region": "Ica", "criticidad": 4},
+    {"nombre": "Sub-Estación Zapallal (Red Alta Tensión)",
+     "lon": -77.0833, "lat": -11.8667, "region": "Lima", "criticidad": 5},
+    {"nombre": "C.H. Yuncan (ElectroPerú)",
+     "lon": -75.5083, "lat": -10.2833, "region": "Pasco", "criticidad": 4},
+    {"nombre": "C.H. Restitución (ElectroPerú)",
+     "lon": -75.0833, "lat": -12.3167, "region": "Junín", "criticidad": 4},
+]
+
+# ── Hospitales — MINSA / SUSALUD 2024 ────────────────────────────
+HOSPITALES_MINSA = [
+    # Lima Metropolitana
+    {"nombre": "Hospital Nacional Dos de Mayo",
+     "lon": -77.0439, "lat": -12.0508, "region": "Lima"},
+    {"nombre": "Hospital Nacional Arzobispo Loayza",
+     "lon": -77.0387, "lat": -12.0475, "region": "Lima"},
+    {"nombre": "Hospital Nacional Guillermo Almenara (EsSalud)",
+     "lon": -77.0100, "lat": -12.0669, "region": "Lima"},
+    {"nombre": "Hospital Nacional Edgardo Rebagliati (EsSalud)",
+     "lon": -77.0511, "lat": -12.0847, "region": "Lima"},
+    {"nombre": "Hospital Nacional Cayetano Heredia",
+     "lon": -77.0633, "lat": -11.9861, "region": "Lima"},
+    {"nombre": "Hospital de Emergencias Grau (EsSalud)",
+     "lon": -77.0156, "lat": -12.0711, "region": "Lima"},
+    {"nombre": "Hospital Nacional San Bartolomé",
+     "lon": -77.0356, "lat": -12.0450, "region": "Lima"},
+    {"nombre": "Hospital Militar Central",
+     "lon": -77.0572, "lat": -12.0781, "region": "Lima"},
+    # Regiones
+    {"nombre": "Hospital Regional de Ica",
+     "lon": -75.7256, "lat": -14.0678, "region": "Ica"},
+    {"nombre": "Hospital Santa María del Socorro (Ica)",
+     "lon": -75.7183, "lat": -14.0750, "region": "Ica"},
+    {"nombre": "Hospital Regional Honorio Delgado (Arequipa)",
+     "lon": -71.5378, "lat": -16.4189, "region": "Arequipa"},
+    {"nombre": "Hospital Nacional Carlos Seguín Escobedo (Arequipa)",
+     "lon": -71.5300, "lat": -16.3900, "region": "Arequipa"},
+    {"nombre": "Hospital Regional del Cusco",
+     "lon": -71.9769, "lat": -13.5161, "region": "Cusco"},
+    {"nombre": "Hospital Nacional Adolfo Guevara Velasco (Cusco)",
+     "lon": -71.9781, "lat": -13.5278, "region": "Cusco"},
+    {"nombre": "Hospital Antonio Lorena (Cusco)",
+     "lon": -71.9667, "lat": -13.5014, "region": "Cusco"},
+    {"nombre": "Hospital Regional de Trujillo",
+     "lon": -79.0372, "lat": -8.1042,  "region": "La Libertad"},
+    {"nombre": "Hospital Víctor Lazarte Echegaray (Trujillo EsSalud)",
+     "lon": -79.0228, "lat": -8.0978,  "region": "La Libertad"},
+    {"nombre": "Hospital Regional de Piura",
+     "lon": -80.6339, "lat": -5.1942,  "region": "Piura"},
+    {"nombre": "Hospital Santa Rosa (Piura)",
+     "lon": -80.6272, "lat": -5.2008,  "region": "Piura"},
+    {"nombre": "Hospital Regional de Chiclayo",
+     "lon": -79.8394, "lat": -6.7744,  "region": "Lambayeque"},
+    {"nombre": "Hospital Almanzor Aguinaga Asenjo (Chiclayo EsSalud)",
+     "lon": -79.8350, "lat": -6.7789,  "region": "Lambayeque"},
+    {"nombre": "Hospital Regional de Ayacucho",
+     "lon": -74.2236, "lat": -13.1597, "region": "Ayacucho"},
+    {"nombre": "Hospital Regional de Puno",
+     "lon": -70.0181, "lat": -15.8508, "region": "Puno"},
+    {"nombre": "Hospital Carlos Monge Medrano (Juliaca)",
+     "lon": -70.1356, "lat": -15.4797, "region": "Puno"},
+    {"nombre": "Hospital Regional de Huancayo",
+     "lon": -75.2181, "lat": -12.0639, "region": "Junín"},
+    {"nombre": "Hospital Ramiro Prialé Prialé (Huancayo EsSalud)",
+     "lon": -75.2044, "lat": -12.0714, "region": "Junín"},
+    {"nombre": "Hospital Regional de Tacna",
+     "lon": -70.0161, "lat": -18.0158, "region": "Tacna"},
+    {"nombre": "Hospital Hipólito Unanue (Tacna)",
+     "lon": -70.0128, "lat": -18.0219, "region": "Tacna"},
+    {"nombre": "Hospital Regional de Tumbes",
+     "lon": -80.4606, "lat": -3.5650,  "region": "Tumbes"},
+    {"nombre": "Hospital Iquitos (Loreto)",
+     "lon": -73.2481, "lat": -3.7481,  "region": "Loreto"},
+    {"nombre": "Hospital Regional de Moquegua",
+     "lon": -70.9372, "lat": -17.1939, "region": "Moquegua"},
+    {"nombre": "Hospital Regional de Cajamarca",
+     "lon": -78.5083, "lat": -7.1631,  "region": "Cajamarca"},
+    {"nombre": "Hospital Regional de Huánuco",
+     "lon": -76.2419, "lat": -9.9281,  "region": "Huánuco"},
+    {"nombre": "Hospital de San Martín (Tarapoto)",
+     "lon": -76.3789, "lat": -6.4844,  "region": "San Martín"},
+    {"nombre": "Hospital La Caleta (Chimbote)",
+     "lon": -78.5839, "lat": -9.0736,  "region": "Ancash"},
+    {"nombre": "Hospital Eleazar Guzmán Barrón (Chimbote)",
+     "lon": -78.5783, "lat": -9.0811,  "region": "Ancash"},
+    {"nombre": "Hospital Regional de Pucallpa",
+     "lon": -74.5358, "lat": -8.3781,  "region": "Ucayali"},
+]
+
+# ── Bomberos — CGBVP 2024 ─────────────────────────────────────────
+BOMBEROS_CGBVP = [
+    {"nombre": "Compañía de Bomberos Lima N°1",
+     "lon": -77.0428, "lat": -12.0464, "region": "Lima"},
+    {"nombre": "Compañía de Bomberos Miraflores N°28",
+     "lon": -77.0294, "lat": -12.1200, "region": "Lima"},   # ← lat corregida
+    {"nombre": "Compañía de Bomberos San Isidro N°10",
+     "lon": -77.0422, "lat": -12.0975, "region": "Lima"},
+    {"nombre": "Compañía de Bomberos Arequipa N°20",
+     "lon": -71.5483, "lat": -16.4011, "region": "Arequipa"},
+    {"nombre": "Compañía de Bomberos Cusco N°25",
+     "lon": -71.9811, "lat": -13.5236, "region": "Cusco"},
+    {"nombre": "Compañía de Bomberos Ica N°15",
+     "lon": -75.7278, "lat": -14.0644, "region": "Ica"},
+    {"nombre": "Compañía de Bomberos Piura N°6",
+     "lon": -80.6394, "lat": -5.1967,  "region": "Piura"},
+    {"nombre": "Compañía de Bomberos Trujillo N°7",
+     "lon": -79.0350, "lat": -8.0994,  "region": "La Libertad"},
+    {"nombre": "Compañía de Bomberos Chiclayo N°12",
+     "lon": -79.8411, "lat": -6.7694,  "region": "Lambayeque"},
+    {"nombre": "Compañía de Bomberos Tacna N°18",
+     "lon": -70.0194, "lat": -18.0106, "region": "Tacna"},
+    {"nombre": "Compañía de Bomberos Puno N°40",
+     "lon": -70.0231, "lat": -15.8531, "region": "Puno"},
+    {"nombre": "Compañía de Bomberos Huancayo N°35",
+     "lon": -75.2233, "lat": -12.0647, "region": "Junín"},
+    {"nombre": "Compañía de Bomberos Ayacucho N°50",
+     "lon": -74.2178, "lat": -13.1556, "region": "Ayacucho"},
+    {"nombre": "Compañía de Bomberos Cajamarca N°55",
+     "lon": -78.5083, "lat": -7.1583,  "region": "Cajamarca"},
+    {"nombre": "Compañía de Bomberos Tumbes N°60",
+     "lon": -80.4583, "lat": -3.5703,  "region": "Tumbes"},
+    {"nombre": "Compañía de Bomberos Iquitos N°65",
+     "lon": -73.2489, "lat": -3.7514,  "region": "Loreto"},
+]
+
+
+# ── Helpers CKAN / OSM ────────────────────────────────────────────
 
 def _buscar_resource_id_ckan(query: str) -> str | None:
-    """Busca en datos.gob.pe el resource_id de un dataset."""
     try:
         data = http_get(
             "https://www.datosabiertos.gob.pe/api/3/action/package_search",
-            params={"q": query, "rows": 5},
-            timeout=20,
+            params={"q": query, "rows": 5}, timeout=20,
         )
         for result in data.get("result", {}).get("results", []):
             for resource in result.get("resources", []):
@@ -944,17 +1231,15 @@ def _buscar_resource_id_ckan(query: str) -> str | None:
                 if fmt in ("CSV", "JSON", "GEOJSON", "XLSX"):
                     rid = resource.get("id")
                     if rid:
-                        log.info(f"  → Dataset '{result['title']}' resource_id={rid}")
+                        log.info(f"  CKAN → '{result['title']}' resource_id={rid}")
                         return rid
-    except Exception as e:
-        log.warning(f"  datos.gob.pe search falló: {e}")
+    except Exception:
+        pass
     return None
 
 
 def _ckan_datastore_fetch(resource_id: str, limit: int = 5000) -> list[dict]:
-    """Pagina sobre un datastore de datos.gob.pe."""
-    rows = []
-    offset = 0
+    rows, offset = [], 0
     while True:
         try:
             data = http_get(
@@ -970,13 +1255,12 @@ def _ckan_datastore_fetch(resource_id: str, limit: int = 5000) -> list[dict]:
                 break
             offset += limit
         except Exception as e:
-            log.warning(f"  CKAN datastore fetch falló en offset={offset}: {e}")
+            log.warning(f"  CKAN datastore falló en offset={offset}: {e}")
             break
     return rows
 
 
 def _extraer_latlon_ckan_record(rec: dict) -> tuple[float, float] | None:
-    """Intenta extraer lat/lon de un registro CKAN con distintos nombres de columna."""
     lat_keys = ["latitud", "lat", "LATITUD", "LAT", "y_coord", "Y"]
     lon_keys = ["longitud", "lon", "lng", "LONGITUD", "LON", "LNG", "x_coord", "X"]
     lat = lon = None
@@ -999,485 +1283,28 @@ def _extraer_latlon_ckan_record(rec: dict) -> tuple[float, float] | None:
     return None
 
 
-def get_infra_salud_oficial() -> list[dict]:
-    """
-    Descarga establecimientos de salud desde fuentes oficiales.
-    Prioridad: SUSALUD RENIPRESS API → MINSA datos.gob.pe → OSM fallback
-    Ref: RENIPRESS (SUSALUD) — Resolución de Superintendencia N°102-2016-SUSALUD
-    """
-    resultados = []
-
-    # Intento 1: SUSALUD RENIPRESS API directa
-    log.info("  Salud: intentando SUSALUD RENIPRESS API...")
-    for base_url in [
-        "https://app.susalud.gob.pe/api/v1/establecimientos",
-        "https://ww3.susalud.gob.pe/sisnet-web/rest/EstablecimientoResource/listarEstablecimiento",
-    ]:
-        try:
-            page = 1
-            while True:
-                data = http_get(f"{base_url}?page={page}&size=500", timeout=25)
-                items = (data.get("data") or data.get("establecimientos") or
-                         data.get("content") or (data if isinstance(data, list) else []))
-                if not items:
-                    break
-                for item in items:
-                    lat = (item.get("latitud") or item.get("lat") or
-                           item.get("LATITUD") or item.get("coordenadaY"))
-                    lon = (item.get("longitud") or item.get("lon") or
-                           item.get("LONGITUD") or item.get("coordenadaX"))
-                    if lat and lon:
-                        try:
-                            resultados.append({
-                                "nombre": item.get("nombre") or item.get("NOMBRE") or "Establecimiento de salud",
-                                "tipo": _normalizar_tipo_salud(
-                                    item.get("tipoEstablecimiento") or item.get("TIPO") or "hospital"),
-                                "lon": float(lon), "lat": float(lat),
-                                "criticidad": _criticidad_salud(item.get("tipoEstablecimiento", "")),
-                                "estado": "operativo",
-                                "fuente": "SUSALUD/RENIPRESS",
-                                "fuente_tipo": "oficial",
-                            })
-                        except (ValueError, TypeError):
-                            pass
-                if len(items) < 500:
-                    break
-                page += 1
-            if resultados:
-                log.info(f"  ✅ {len(resultados)} establecimientos SUSALUD RENIPRESS")
-                return resultados
-        except Exception as e:
-            log.warning(f"  SUSALUD API falló ({base_url[:50]}): {e}")
-
-    # Intento 2: MINSA vía datos.gob.pe CKAN
-    log.info("  Salud: buscando en datos.gob.pe (MINSA/SUSALUD)...")
-    for query in ["renipress establecimientos salud SUSALUD", "MINSA establecimientos salud georreferenciados"]:
-        rid = _buscar_resource_id_ckan(query)
-        if rid:
-            records = _ckan_datastore_fetch(rid, limit=2000)
-            for rec in records:
-                coords = _extraer_latlon_ckan_record(rec)
-                if coords:
-                    lon, lat = coords
-                    nombre = (rec.get("NOMBRE") or rec.get("nombre") or
-                               rec.get("RAZON_SOCIAL") or "Establecimiento de salud")
-                    tipo_raw = (rec.get("TIPO") or rec.get("tipo") or
-                                rec.get("CATEGORIA") or "hospital")
-                    resultados.append({
-                        "nombre": nombre,
-                        "tipo": _normalizar_tipo_salud(tipo_raw),
-                        "lon": lon, "lat": lat,
-                        "criticidad": _criticidad_salud(tipo_raw),
-                        "estado": "operativo",
-                        "fuente": "MINSA/datos.gob.pe",
-                        "fuente_tipo": "oficial",
-                    })
-            if resultados:
-                log.info(f"  ✅ {len(resultados)} establecimientos salud MINSA/CKAN")
-                return resultados
-
-    # Intento 3: OSM fallback
-    log.info("  Salud: fallback a OSM Overpass...")
-    return []  # Señal para usar OSM
-
-
-def _normalizar_tipo_salud(raw: str) -> str:
-    r = (raw or "").lower()
-    if any(x in r for x in ["hospital", "iii", "ii-2", "ii-e"]):
-        return "hospital"
-    if any(x in r for x in ["clinica", "clínica", "policlinico", "policlínico"]):
-        return "clinica"
-    if any(x in r for x in ["puesto", "i-1", "i-2", "i-3", "i-4"]):
-        return "puesto_salud"
-    if any(x in r for x in ["centro", "c.s.", "cs "]):
-        return "centro_salud"
-    return "clinica"
-
-
-def _criticidad_salud(tipo: str) -> int:
-    t = (tipo or "").lower()
-    if any(x in t for x in ["iii", "ii-2", "ii-e", "hospital"]):
-        return 5
-    if any(x in t for x in ["ii-1", "ii", "policlinico", "clinica"]):
-        return 4
-    return 3
-
-
-# ── 7b: Instituciones Educativas — MINEDU ESCALE ─────────────────
-
-def get_infra_educacion_oficial() -> list[dict]:
-    """
-    Descarga II.EE. del Padrón Nacional de Instituciones Educativas.
-    Fuente: MINEDU ESCALE — https://sigmed.minedu.gob.pe/
-    Ref: RM 451-2014-MINEDU - Sistema de Información de Estadística Educativa
-    """
-    resultados = []
-
-    # Intento 1: MINEDU ESCALE WFS
-    for wfs_url in [
-        "https://sigmed.minedu.gob.pe/geoserver/sigmed/ows?service=WFS&version=1.0.0"
-        "&request=GetFeature&typeName=sigmed:iiee_geopunto&outputFormat=application/json"
-        "&maxFeatures=50000&srsName=EPSG:4326",
-        "https://sigmed.minedu.gob.pe/geoserver/ows?service=WFS&version=1.0.0"
-        "&request=GetFeature&typeName=sigmed:iiee&outputFormat=application/json",
-    ]:
-        try:
-            log.info(f"  Educación: MINEDU ESCALE WFS {wfs_url[:60]}...")
-            data = http_get_bytes(wfs_url, timeout=120)
-            gj = json.loads(data)
-            features = gj.get("features", [])
-            for feat in features:
-                p = feat["properties"]
-                coords = feat["geometry"]["coordinates"]
-                lon, lat = coords[0], coords[1]
-                nombre = p.get("NOM_IE") or p.get("nombre") or "Institución Educativa"
-                nivel = p.get("NIV_MOD") or p.get("nivel") or ""
-                resultados.append({
-                    "nombre": nombre,
-                    "tipo": "escuela",
-                    "lon": lon, "lat": lat,
-                    "criticidad": 4,
-                    "estado": p.get("ESTADO") or "operativo",
-                    "fuente": "MINEDU/ESCALE",
-                    "fuente_tipo": "oficial",
-                })
-            if resultados:
-                log.info(f"  ✅ {len(resultados)} II.EE. MINEDU ESCALE")
-                return resultados
-        except Exception as e:
-            log.warning(f"  MINEDU ESCALE WFS falló: {e}")
-
-    # Intento 2: datos.gob.pe
-    log.info("  Educación: buscando en datos.gob.pe...")
-    for query in ["padron instituciones educativas MINEDU ESCALE", "colegios escuelas georreferenciadas Perú"]:
-        rid = _buscar_resource_id_ckan(query)
-        if rid:
-            records = _ckan_datastore_fetch(rid, limit=5000)
-            for rec in records:
-                coords = _extraer_latlon_ckan_record(rec)
-                if coords:
-                    lon, lat = coords
-                    resultados.append({
-                        "nombre": rec.get("NOMBRE") or rec.get("NOM_IE") or "Institución Educativa",
-                        "tipo": "escuela",
-                        "lon": lon, "lat": lat,
-                        "criticidad": 4,
-                        "estado": "operativo",
-                        "fuente": "MINEDU/datos.gob.pe",
-                        "fuente_tipo": "oficial",
-                    })
-            if resultados:
-                log.info(f"  ✅ {len(resultados)} II.EE. MINEDU/CKAN")
-                return resultados
-
-    return []  # fallback OSM
-
-
-# ── 7c: Aeropuertos — CORPAC/MTC ─────────────────────────────────
-
-AEROPUERTOS_MTC = [
-    # Fuente: CORPAC (Corporación Peruana de Aeropuertos y Aviación Comercial) 2024
-    {"nombre": "Aeropuerto Internacional Jorge Chávez", "lon": -77.1143, "lat": -12.0219,
-     "region": "Lima", "criticidad": 5, "estado": "operativo"},
-    {"nombre": "Aeropuerto Internacional Alejandro Velasco Astete (Cusco)", "lon": -71.9388, "lat": -13.5357,
-     "region": "Cusco", "criticidad": 5, "estado": "operativo"},
-    {"nombre": "Aeropuerto Internacional Rodríguez Ballón (Arequipa)", "lon": -71.5831, "lat": -16.3411,
-     "region": "Arequipa", "criticidad": 5, "estado": "operativo"},
-    {"nombre": "Aeropuerto Internacional Capitán FAP José A. Quiñones (Chiclayo)", "lon": -79.8282, "lat": -6.7875,
-     "region": "Lambayeque", "criticidad": 5, "estado": "operativo"},
-    {"nombre": "Aeropuerto Internacional Capitán FAP Carlos Martínez de Pinillos (Trujillo)", "lon": -79.1086, "lat": -8.0814,
-     "region": "La Libertad", "criticidad": 5, "estado": "operativo"},
-    {"nombre": "Aeropuerto Internacional Capitán FAP Guillermo Concha Iberico (Piura)", "lon": -80.6164, "lat": -5.2075,
-     "region": "Piura", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto Internacional Coronel FAP Francisco Secada Vignetta (Iquitos)", "lon": -73.3086, "lat": -3.7847,
-     "region": "Loreto", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto Internacional Padre José de Aldamiz (Puerto Maldonado)", "lon": -69.2287, "lat": -12.6136,
-     "region": "Madre de Dios", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto Coronel FAP Alfredo Mendívil Duarte (Ayacucho)", "lon": -74.2042, "lat": -13.1548,
-     "region": "Ayacucho", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto Teniente FAP Jaime Montreuil Morales (Chimbote)", "lon": -78.5244, "lat": -9.1494,
-     "region": "Ancash", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto Capitan FAP David Abensur Rengifo (Pucallpa)", "lon": -74.5742, "lat": -8.3794,
-     "region": "Ucayali", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto Inca Manco Capac (Juliaca)", "lon": -70.1583, "lat": -15.4672,
-     "region": "Puno", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto Comandante FAP Germán Arias Graziani (Huaraz)", "lon": -77.5986, "lat": -9.3469,
-     "region": "Ancash", "criticidad": 3, "estado": "operativo"},
-    {"nombre": "Aeropuerto Teniente FAP Pedro Canga Rodríguez (Tumbes)", "lon": -80.3783, "lat": -3.5526,
-     "region": "Tumbes", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto de Tarapoto (Cadete FAP Guillermo del Castillo Paredes)", "lon": -76.3733, "lat": -6.5086,
-     "region": "San Martín", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto de Tacna (Coronel FAP Carlos Ciriani Santa Rosa)", "lon": -70.2756, "lat": -18.0533,
-     "region": "Tacna", "criticidad": 4, "estado": "operativo"},
-    {"nombre": "Aeropuerto de Cajamarca (Mayor General FAP Armando Revoredo Iglesias)", "lon": -78.4894, "lat": -7.1392,
-     "region": "Cajamarca", "criticidad": 3, "estado": "operativo"},
-    {"nombre": "Aeropuerto de Ilo (Moquegua)", "lon": -71.3400, "lat": -17.6944,
-     "region": "Moquegua", "criticidad": 3, "estado": "operativo"},
-    {"nombre": "Aeropuerto de Andahuaylazo (Andahuaylas)", "lon": -73.3503, "lat": -13.7064,
-     "region": "Apurímac", "criticidad": 3, "estado": "operativo"},
-    {"nombre": "Aeropuerto de Huánuco (Alférez FAP David Figueroa Fernandini)", "lon": -76.2048, "lat": -9.8781,
-     "region": "Huánuco", "criticidad": 3, "estado": "operativo"},
-]
-
-
-def get_infra_aeropuertos_oficial() -> list[dict]:
-    """Aeropuertos desde registro MTC/CORPAC oficial + OSM complement."""
-    resultados = []
-    for a in AEROPUERTOS_MTC:
-        resultados.append({
-            "nombre": a["nombre"],
-            "tipo": "aeropuerto",
-            "lon": a["lon"], "lat": a["lat"],
-            "criticidad": a["criticidad"],
-            "estado": a["estado"],
-            "fuente": "MTC/CORPAC 2024",
-            "fuente_tipo": "oficial",
-        })
-    log.info(f"  ✅ {len(resultados)} aeropuertos MTC/CORPAC")
-    return resultados
-
-
-# ── 7d: Puertos — APN (Autoridad Portuaria Nacional) ─────────────
-
-PUERTOS_APN = [
-    # Fuente: APN — Plan Nacional de Desarrollo Portuario 2024
-    {"nombre": "Terminal Portuario del Callao (APMT/DPWorld)", "lon": -77.1483, "lat": -12.0580,
-     "region": "Lima", "criticidad": 5},
-    {"nombre": "Terminal Portuario de Paita", "lon": -81.1129, "lat": -5.0852,
-     "region": "Piura", "criticidad": 5},
-    {"nombre": "Terminal Portuario de Salaverry", "lon": -78.9783, "lat": -8.2239,
-     "region": "La Libertad", "criticidad": 4},
-    {"nombre": "Terminal Portuario de Chimbote", "lon": -78.5861, "lat": -9.0753,
-     "region": "Ancash", "criticidad": 4},
-    {"nombre": "Terminal Portuario de Huarmey", "lon": -78.1669, "lat": -10.0678,
-     "region": "Ancash", "criticidad": 3},
-    {"nombre": "Terminal Portuario de Pisco", "lon": -76.2163, "lat": -13.7211,
-     "region": "Ica", "criticidad": 4},
-    {"nombre": "Terminal Portuario de Matarani (Arequipa)", "lon": -72.1072, "lat": -16.9958,
-     "region": "Arequipa", "criticidad": 4},
-    {"nombre": "Terminal Portuario de Ilo", "lon": -71.3361, "lat": -17.6358,
-     "region": "Moquegua", "criticidad": 4},
-    {"nombre": "Terminal Portuario Enapu Iquitos", "lon": -73.2561, "lat": -3.7433,
-     "region": "Loreto", "criticidad": 4},
-    {"nombre": "Puerto Fluvial de Pucallpa", "lon": -74.5533, "lat": -8.3933,
-     "region": "Ucayali", "criticidad": 3},
-    {"nombre": "Terminal Portuario de Yurimaguas", "lon": -76.0944, "lat": -5.8975,
-     "region": "Loreto", "criticidad": 3},
-    {"nombre": "Puerto de Tumbes", "lon": -80.4514, "lat": -3.5681,
-     "region": "Tumbes", "criticidad": 3},
-    {"nombre": "Terminal de Cabotaje San Martín (Pisco)", "lon": -76.2533, "lat": -13.8081,
-     "region": "Ica", "criticidad": 3},
-    {"nombre": "Muelle Pesquero Parachique (Sechura)", "lon": -80.8611, "lat": -5.5431,
-     "region": "Piura", "criticidad": 3},
-    {"nombre": "Puerto de General San Martín (Pisco)", "lon": -76.1994, "lat": -13.7689,
-     "region": "Ica", "criticidad": 4},
-]
-
-
-def get_infra_puertos_oficial() -> list[dict]:
-    """Puertos del Plan Nacional de Desarrollo Portuario — APN 2024."""
-    resultados = [{
-        "nombre": p["nombre"], "tipo": "puerto",
-        "lon": p["lon"], "lat": p["lat"],
-        "criticidad": p["criticidad"], "estado": "operativo",
-        "fuente": "APN/MTC 2024", "fuente_tipo": "oficial",
-    } for p in PUERTOS_APN]
-    log.info(f"  ✅ {len(resultados)} puertos APN/MTC")
-    return resultados
-
-
-# ── 7e: Centrales Eléctricas — OSINERGMIN/MINEM ──────────────────
-
-CENTRALES_OSINERGMIN = [
-    # Fuente: OSINERGMIN — Registro de Generadoras Eléctricas 2024
-    # Ref: Plan Energético Nacional 2014-2025 (MINEM)
-    {"nombre": "C.H. Mantaro (ElectroPerú)", "lon": -74.9358, "lat": -12.3083,
-     "region": "Junín", "criticidad": 5, "tipo": "central_electrica"},
-    {"nombre": "C.H. Chaglla (Pachitea)", "lon": -76.1500, "lat": -9.7833,
-     "region": "Huánuco", "criticidad": 5, "tipo": "central_electrica"},
-    {"nombre": "C.H. Cerro del Águila", "lon": -74.6167, "lat": -12.5333,
-     "region": "Huancavelica", "criticidad": 5, "tipo": "central_electrica"},
-    {"nombre": "C.H. Quitaracsa", "lon": -77.7167, "lat": -8.9333,
-     "region": "Ancash", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "C.T. Ventanilla (ENEL)", "lon": -77.1500, "lat": -11.8667,
-     "region": "Lima", "criticidad": 5, "tipo": "central_electrica"},
-    {"nombre": "C.T. Chilca 1 (Kallpa)", "lon": -76.7000, "lat": -12.5167,
-     "region": "Lima", "criticidad": 5, "tipo": "central_electrica"},
-    {"nombre": "C.T. Ilo 1 (Southern Copper)", "lon": -71.3344, "lat": -17.6394,
-     "region": "Moquegua", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "C.H. Machu Picchu (ElectroSur Este)", "lon": -72.5456, "lat": -13.1539,
-     "region": "Cusco", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "C.H. San Gabán II (San Gabán S.A.)", "lon": -69.7833, "lat": -13.3167,
-     "region": "Puno", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "C.H. Carhuaquero (Duke Energy)", "lon": -79.2167, "lat": -6.6833,
-     "region": "Lambayeque", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "Parque Solar Majes (Arequipa)", "lon": -72.3167, "lat": -16.3833,
-     "region": "Arequipa", "criticidad": 3, "tipo": "central_electrica"},
-    {"nombre": "C.H. Gallito Ciego (CHAVIMOCHIC)", "lon": -79.1333, "lat": -7.0833,
-     "region": "La Libertad", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "C.H. Oroya — ElectroAndes", "lon": -75.9167, "lat": -11.5333,
-     "region": "Junín", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "C.H. Cañon del Pato (Duke Energy)", "lon": -77.7208, "lat": -8.9069,
-     "region": "Ancash", "criticidad": 5, "tipo": "central_electrica"},
-    {"nombre": "C.T. Pisco (GDF Suez)", "lon": -76.2167, "lat": -13.8333,
-     "region": "Ica", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "Sub-Estación Zapallal (Red de Alta Tensión)", "lon": -77.0833, "lat": -11.8667,
-     "region": "Lima", "criticidad": 5, "tipo": "central_electrica"},
-    {"nombre": "C.H. Yuncan (ElectroPerú)", "lon": -75.5083, "lat": -10.2833,
-     "region": "Pasco", "criticidad": 4, "tipo": "central_electrica"},
-    {"nombre": "C.H. Restitucion (ElectroPerú)", "lon": -75.0833, "lat": -12.3167,
-     "region": "Junín", "criticidad": 4, "tipo": "central_electrica"},
-]
-
-
-def get_infra_centrales_oficial() -> list[dict]:
-    """Centrales eléctricas desde OSINERGMIN/MINEM 2024."""
-    resultados = [{
-        "nombre": c["nombre"], "tipo": c["tipo"],
-        "lon": c["lon"], "lat": c["lat"],
-        "criticidad": c["criticidad"], "estado": "operativo",
-        "fuente": "OSINERGMIN/MINEM 2024", "fuente_tipo": "oficial",
-    } for c in CENTRALES_OSINERGMIN]
-    log.info(f"  ✅ {len(resultados)} centrales eléctricas OSINERGMIN")
-    return resultados
-
-
-# ── 7f: Bomberos — CGBVP ─────────────────────────────────────────
-
-def get_infra_bomberos_oficial() -> list[dict]:
-    """
-    Intenta obtener compañías de bomberos del CGBVP.
-    Fuente: CGBVP (Cuerpo General de Bomberos Voluntarios del Perú)
-    """
-    # Intentar datos.gob.pe
-    for query in ["bomberos voluntarios CGBVP Peru", "compañias bomberos Peru"]:
-        rid = _buscar_resource_id_ckan(query)
-        if rid:
-            records = _ckan_datastore_fetch(rid)
-            resultados = []
-            for rec in records:
-                coords = _extraer_latlon_ckan_record(rec)
-                if coords:
-                    lon, lat = coords
-                    resultados.append({
-                        "nombre": rec.get("NOMBRE") or rec.get("nombre") or "Compañía de Bomberos",
-                        "tipo": "bomberos",
-                        "lon": lon, "lat": lat,
-                        "criticidad": 5, "estado": "operativo",
-                        "fuente": "CGBVP/datos.gob.pe", "fuente_tipo": "oficial",
-                    })
-            if resultados:
-                log.info(f"  ✅ {len(resultados)} bomberos CGBVP/CKAN")
-                return resultados
-    return []  # OSM fallback
-
-
-# ── 7g: Policía — PNP ────────────────────────────────────────────
-
-def get_infra_policia_oficial() -> list[dict]:
-    """Comisarías PNP desde datos.gob.pe."""
-    for query in ["comisarias PNP policía nacional Peru", "unidades policiales Peru georreferenciadas"]:
-        rid = _buscar_resource_id_ckan(query)
-        if rid:
-            records = _ckan_datastore_fetch(rid)
-            resultados = []
-            for rec in records:
-                coords = _extraer_latlon_ckan_record(rec)
-                if coords:
-                    lon, lat = coords
-                    resultados.append({
-                        "nombre": rec.get("NOMBRE") or rec.get("UNIDAD") or "Comisaría PNP",
-                        "tipo": "policia",
-                        "lon": lon, "lat": lat,
-                        "criticidad": 4, "estado": "operativo",
-                        "fuente": "PNP/datos.gob.pe", "fuente_tipo": "oficial",
-                    })
-            if resultados:
-                log.info(f"  ✅ {len(resultados)} comisarías PNP/CKAN")
-                return resultados
-    return []  # OSM fallback
-
-
-# ── 7h: Albergues — INDECI ───────────────────────────────────────
-
-def get_infra_albergues_oficial() -> list[dict]:
-    """
-    Albergues y centros de refugio INDECI.
-    Fuente: SIGRID CENEPRED / INDECI (Sistema Nacional de Gestión del Riesgo)
-    """
-    try:
-        url = ("https://sigrid.cenepred.gob.pe/sigridv3/geoserver/ows?service=WFS"
-               "&version=1.0.0&request=GetFeature&typeName=cenepred:albergues"
-               "&outputFormat=application/json&maxFeatures=2000")
-        data = http_get_bytes(url, timeout=30)
-        gj = json.loads(data)
-        resultados = []
-        for feat in gj.get("features", []):
-            p = feat["properties"]
-            coords = feat["geometry"]["coordinates"]
-            resultados.append({
-                "nombre": p.get("NOMBRE") or p.get("nombre") or "Albergue INDECI",
-                "tipo": "refugio",
-                "lon": coords[0], "lat": coords[1],
-                "criticidad": 5, "estado": "operativo",
-                "capacidad": p.get("CAPACIDAD") or p.get("capacidad"),
-                "fuente": "CENEPRED/INDECI", "fuente_tipo": "oficial",
-            })
-        if resultados:
-            log.info(f"  ✅ {len(resultados)} albergues CENEPRED/INDECI")
-            return resultados
-    except Exception as e:
-        log.warning(f"  CENEPRED albergues WFS falló: {e}")
-
-    # Fallback CKAN
-    for query in ["albergues centros evacuacion INDECI Peru", "refugios INDECI georreferenciados"]:
-        rid = _buscar_resource_id_ckan(query)
-        if rid:
-            records = _ckan_datastore_fetch(rid)
-            resultados = []
-            for rec in records:
-                coords = _extraer_latlon_ckan_record(rec)
-                if coords:
-                    lon, lat = coords
-                    resultados.append({
-                        "nombre": rec.get("NOMBRE") or "Albergue",
-                        "tipo": "refugio",
-                        "lon": lon, "lat": lat,
-                        "criticidad": 5, "estado": "operativo",
-                        "fuente": "INDECI/datos.gob.pe", "fuente_tipo": "oficial",
-                    })
-            if resultados:
-                return resultados
-    return []  # OSM fallback
-
-
-# ── OSM fallback por tipo ─────────────────────────────────────────
-
 OSM_QUERIES = {
-    "hospital": 'amenity="hospital"',
-    "clinica":  'amenity~"clinic|pharmacy"',
-    "escuela":  'amenity~"school|kindergarten|university|college"',
-    "bomberos": 'amenity="fire_station"',
-    "policia":  'amenity="police"',
-    "aeropuerto": 'aeroway~"aerodrome|airport"',
-    "puerto":   'industrial~"port|harbour"',
+    "hospital":        'amenity="hospital"',
+    "clinica":         'amenity~"clinic|pharmacy"',
+    "escuela":         'amenity~"school|kindergarten|university|college"',
+    "bomberos":        'amenity="fire_station"',
+    "policia":         'amenity="police"',
+    "aeropuerto":      'aeroway~"aerodrome|airport"',
+    "puerto":          'industrial~"port|harbour"',
     "central_electrica": 'power~"plant|generator"',
-    "planta_agua": 'man_made~"water_works|pumping_station|water_tower"',
-    "refugio":  'amenity~"shelter|social_facility"',
+    "planta_agua":     'man_made~"water_works|pumping_station|water_tower"',
+    "refugio":         'amenity~"shelter|social_facility"',
 }
-
 OSM_CRITICIDAD = {
     "hospital": 5, "clinica": 4, "escuela": 4,
     "bomberos": 5, "policia": 4, "aeropuerto": 4,
-    "puerto": 4, "central_electrica": 4, "planta_agua": 4,
-    "refugio": 5,
+    "puerto": 4, "central_electrica": 4, "planta_agua": 4, "refugio": 5,
 }
 
 
 def get_infra_osm(tipo: str) -> list[dict]:
-    """Obtiene infraestructura de OSM como fallback."""
-    tag = OSM_QUERIES.get(tipo, f'amenity="{tipo}"')
-    query = overpass_query(tag)
+    tag     = OSM_QUERIES.get(tipo, f'amenity="{tipo}"')
+    query   = overpass_query(tag)
     elements = try_overpass(query, tipo)
     resultados = []
     for el in elements:
@@ -1487,7 +1314,7 @@ def get_infra_osm(tipo: str) -> list[dict]:
         lon, lat = coords
         tags = el.get("tags", {})
         nombre = (tags.get("name:es") or tags.get("name") or
-                  tags.get("official_name") or tipo.replace("_", " ").title())
+                  tipo.replace("_", " ").title())
         resultados.append({
             "nombre": nombre, "tipo": tipo,
             "lon": lon, "lat": lat,
@@ -1499,73 +1326,6 @@ def get_infra_osm(tipo: str) -> list[dict]:
     return resultados
 
 
-# ── Inserción infraestructura con validación PostGIS ─────────────
-
-def paso_infraestructura(conn) -> int:
-    """
-    Carga infraestructura crítica desde fuentes oficiales con OSM fallback.
-    CRÍTICO: Después de insertar, elimina puntos fuera de Perú con PostGIS.
-    """
-    t0 = time.time()
-    total = 0
-
-    # Fuentes a procesar: (tipo, getter_oficial)
-    sources = [
-        ("hospital",          get_infra_salud_oficial),
-        ("escuela",           get_infra_educacion_oficial),
-        ("aeropuerto",        get_infra_aeropuertos_oficial),
-        ("puerto",            get_infra_puertos_oficial),
-        ("central_electrica", get_infra_centrales_oficial),
-        ("bomberos",          get_infra_bomberos_oficial),
-        ("policia",           get_infra_policia_oficial),
-        ("refugio",           get_infra_albergues_oficial),
-        ("planta_agua",       None),
-    ]
-
-    for tipo, getter in sources:
-        items = []
-
-        # Intentar fuente oficial primero
-        if getter:
-            try:
-                items = getter()
-            except Exception as e:
-                log.warning(f"  Fuente oficial {tipo} falló: {e}")
-
-        # OSM fallback si no hay datos oficiales
-        if not items:
-            log.info(f"  {tipo}: usando OSM como fuente...")
-            items = get_infra_osm(tipo)
-
-        # Complementar hospitales/escuelas con OSM aunque tengamos datos oficiales
-        if tipo in ("hospital", "clinica", "escuela") and items:
-            osm_complement = get_infra_osm(tipo)
-            # Solo agregamos los que son únicos por nombre+posición aproximada
-            existing_coords = {(round(i["lon"], 2), round(i["lat"], 2)) for i in items}
-            for o in osm_complement:
-                key = (round(o["lon"], 2), round(o["lat"], 2))
-                if key not in existing_coords:
-                    items.append(o)
-
-        n = _insertar_items_infra(conn, items)
-        total += n
-        elapsed_tipo = time.time() - t0
-        log.info(f"  ✅ {n} elementos {tipo} insertados")
-
-    # ════════════════════════════════════════════════════════════
-    # LIMPIEZA CRÍTICA: Eliminar puntos fuera del territorio peruano
-    # FIX v7.1: usa geometría + GIST index (no geography cast) → rápido
-    # ════════════════════════════════════════════════════════════
-    log.info(f"  🔍 Limpiando {total} puntos fuera de Perú (PostGIS GIST)...")
-    t_limpiar = time.time()
-    n_antes = total
-    n_eliminados = _limpiar_fuera_peru(conn)
-    total_final = total - n_eliminados
-    log.info(f"  🗑  {n_eliminados} eliminados fuera de Perú ({time.time()-t_limpiar:.1f}s)")
-    log.info(f"✅ {total_final} elementos infraestructura válidos en Perú ({time.time()-t0:.1f}s)")
-    return total_final
-
-
 def _insertar_items_infra(conn, items: list[dict]) -> int:
     if not items:
         return 0
@@ -1575,7 +1335,7 @@ def _insertar_items_infra(conn, items: list[dict]) -> int:
             lon, lat = item.get("lon"), item.get("lat")
             if not lon or not lat:
                 continue
-            # Validación bbox Perú expandida (antes del check PostGIS)
+            # Pre-filtro bbox ampliado (evita llamadas PostGIS innecesarias)
             if not (-83 <= lon <= -67 and -20 <= lat <= 2):
                 continue
             try:
@@ -1607,28 +1367,66 @@ def _insertar_items_infra(conn, items: list[dict]) -> int:
 
 def _limpiar_fuera_peru(conn) -> int:
     """
-    Elimina infraestructura fuera de Perú usando PostGIS.
-    FIX v7.1: Pre-computa la unión de departamentos UNA SOLA VEZ como
-    geometría (no geography) para que el DELETE use el índice GIST de
-    infraestructura.geom → O(n log n) en vez de O(n×m) sin índice.
-    Buffer 0.27° ≈ 30km incluye islas, costa y fronteras.
-    Ref: Límite territorial peruano — INEI/RREE 2023
+    🔴 FIX 2 — Elimina infraestructura fuera del territorio peruano.
+
+    Tres niveles de seguridad:
+    1. Verifica COUNT(departamentos) antes de cualquier operación.
+    2. Si < 5 departamentos → usa solo bbox (nunca NULL).
+    3. Después de ST_Union, verifica que el resultado no sea NULL
+       antes de ejecutar el DELETE (evita el caso NOT EXISTS(NULL)=TRUE).
+
+    Buffer 0.27° ≈ 30 km cubre islas, costa y fronteras.
+    Ref: Límite territorial — INEI/RREE 2023
     """
+    # ── Nivel 1: verificar que haya departamentos ─────────────────
     with conn.cursor() as cur:
-        # 1) Construir la unión de Perú + buffer como geometría temporal
-        #    Usamos una tabla temporal para poder crear índice GIST sobre ella
+        cur.execute("SELECT COUNT(*) FROM departamentos WHERE geom IS NOT NULL")
+        n_deptos = cur.fetchone()[0]
+
+    if n_deptos < 5:
+        log.warning(
+            f"  ⚠  Solo {n_deptos} departamentos — "
+            "usando bbox Perú para limpieza (modo seguro)"
+        )
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM infraestructura
+                WHERE ST_X(geom) NOT BETWEEN -82.5 AND -68.0
+                   OR ST_Y(geom) NOT BETWEEN -19.0 AND  1.5
+            """)
+            n = cur.rowcount
+        conn.commit()
+        log.info(f"  🗑  {n} elementos eliminados por bbox (fallback)")
+        return n
+
+    # ── Nivel 2: limpieza con geometría real ──────────────────────
+    log.info(f"  🔍 Limpiando con geometría PostGIS ({n_deptos} departamentos)...")
+    t0 = time.time()
+    with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS _tmp_peru_boundary")
         cur.execute("""
             CREATE TEMP TABLE _tmp_peru_boundary AS
             SELECT ST_Buffer(ST_Union(geom), 0.27) AS geom
             FROM departamentos
+            WHERE geom IS NOT NULL
         """)
-        cur.execute(
-            "CREATE INDEX _tmp_peru_gix ON _tmp_peru_boundary USING GIST(geom)"
-        )
 
-        # 2) DELETE usando geometría — aprovecha índice GIST en infraestructura.geom
-        #    ST_Intersects es MUCHO más rápido que ST_DWithin con geography cast
+        # ── Nivel 3: verificar que ST_Union no devolvió NULL ──────
+        cur.execute("SELECT geom IS NOT NULL FROM _tmp_peru_boundary LIMIT 1")
+        row = cur.fetchone()
+        if not row or not row[0]:
+            log.warning("  ⚠  ST_Union devolvió NULL — usando bbox como fallback")
+            cur.execute("DROP TABLE IF EXISTS _tmp_peru_boundary")
+            cur.execute("""
+                DELETE FROM infraestructura
+                WHERE ST_X(geom) NOT BETWEEN -82.5 AND -68.0
+                   OR ST_Y(geom) NOT BETWEEN -19.0 AND  1.5
+            """)
+            n = cur.rowcount
+            conn.commit()
+            return n
+
+        cur.execute("CREATE INDEX _tmp_peru_gix ON _tmp_peru_boundary USING GIST(geom)")
         cur.execute("""
             DELETE FROM infraestructura i
             WHERE NOT EXISTS (
@@ -1637,91 +1435,313 @@ def _limpiar_fuera_peru(conn) -> int:
             )
         """)
         n = cur.rowcount
-
         cur.execute("DROP TABLE IF EXISTS _tmp_peru_boundary")
     conn.commit()
+    log.info(f"  🗑  {n} elementos fuera de Perú eliminados ({time.time()-t0:.1f}s)")
     return n
+
+
+def paso_infraestructura(conn) -> int:
+    t0    = time.time()
+    total = 0
+
+    # ── 1. Datos hardcoded oficiales (siempre disponibles) ────────
+    log.info("  Cargando aeropuertos MTC/CORPAC...")
+    total += _insertar_items_infra(conn, [
+        {"nombre": a["nombre"], "tipo": "aeropuerto",
+         "lon": a["lon"], "lat": a["lat"],
+         "criticidad": a["criticidad"], "estado": "operativo",
+         "fuente": "MTC/CORPAC 2024", "fuente_tipo": "oficial"}
+        for a in AEROPUERTOS_MTC
+    ])
+
+    log.info("  Cargando puertos APN/MTC...")
+    total += _insertar_items_infra(conn, [
+        {"nombre": p["nombre"], "tipo": "puerto",
+         "lon": p["lon"], "lat": p["lat"],
+         "criticidad": p["criticidad"], "estado": "operativo",
+         "fuente": "APN/MTC 2024", "fuente_tipo": "oficial"}
+        for p in PUERTOS_APN
+    ])
+
+    log.info("  Cargando centrales eléctricas OSINERGMIN...")
+    total += _insertar_items_infra(conn, [
+        {"nombre": c["nombre"], "tipo": "central_electrica",
+         "lon": c["lon"], "lat": c["lat"],
+         "criticidad": c["criticidad"], "estado": "operativo",
+         "fuente": "OSINERGMIN/MINEM 2024", "fuente_tipo": "oficial"}
+        for c in CENTRALES_OSINERGMIN
+    ])
+
+    log.info("  Cargando hospitales MINSA/SUSALUD...")
+    total += _insertar_items_infra(conn, [
+        {"nombre": h["nombre"], "tipo": "hospital",
+         "lon": h["lon"], "lat": h["lat"],
+         "criticidad": 5, "estado": "operativo",
+         "fuente": "MINSA/SUSALUD 2024", "fuente_tipo": "oficial"}
+        for h in HOSPITALES_MINSA
+    ])
+
+    log.info("  Cargando bomberos CGBVP...")
+    total += _insertar_items_infra(conn, [
+        {"nombre": b["nombre"], "tipo": "bomberos",
+         "lon": b["lon"], "lat": b["lat"],
+         "criticidad": 5, "estado": "operativo",
+         "fuente": "CGBVP 2024", "fuente_tipo": "oficial"}
+        for b in BOMBEROS_CGBVP
+    ])
+
+    log.info(f"  ✅ {total} elementos oficiales cargados")
+
+    # ── 2. Complementar con OSM ───────────────────────────────────
+    for tipo in ["hospital", "escuela", "policia", "planta_agua", "refugio"]:
+        n = _insertar_items_infra(conn, get_infra_osm(tipo))
+        total += n
+        if n:
+            log.info(f"  OSM {tipo}: +{n}")
+
+    # ── 3. APIs oficiales (SUSALUD, MINEDU, PNP, INDECI) ─────────
+    for getter, label in [
+        (_get_infra_salud_api,       "SUSALUD RENIPRESS"),
+        (_get_infra_educacion_api,   "MINEDU ESCALE"),
+        (_get_infra_policia_api,     "PNP comisarías"),
+        (_get_infra_albergues_api,   "INDECI albergues"),
+    ]:
+        try:
+            items = getter()
+            n = _insertar_items_infra(conn, items)
+            total += n
+            if n:
+                log.info(f"  ✅ {label}: +{n}")
+        except Exception as e:
+            log.warning(f"  {label} falló: {e}")
+
+    # ── 4. 🔴 FIX 2: Limpieza PostGIS segura ─────────────────────
+    log.info(f"  🔍 Verificando {total} elementos contra límites de Perú...")
+    n_eliminados = _limpiar_fuera_peru(conn)
+    total_final  = total - n_eliminados
+
+    log.info(f"✅ {total_final} elementos infraestructura válidos ({time.time()-t0:.1f}s)")
+    return total_final
+
+
+# ── Getters de APIs oficiales (intentan, devuelven [] si fallan) ──
+
+def _get_infra_salud_api() -> list[dict]:
+    for base in [
+        "https://app.susalud.gob.pe/api/v1/establecimientos",
+        "https://ww3.susalud.gob.pe/sisnet-web/rest/EstablecimientoResource/listarEstablecimiento",
+    ]:
+        try:
+            resultados, page = [], 1
+            while True:
+                data  = http_get(f"{base}?page={page}&size=500", timeout=25)
+                items = (data.get("data") or data.get("establecimientos") or
+                         data.get("content") or (data if isinstance(data, list) else []))
+                if not items:
+                    break
+                for item in items:
+                    lat = item.get("latitud") or item.get("lat") or item.get("coordenadaY")
+                    lon = item.get("longitud") or item.get("lon") or item.get("coordenadaX")
+                    if lat and lon:
+                        try:
+                            resultados.append({
+                                "nombre": (item.get("nombre") or "Establecimiento de salud"),
+                                "tipo": "hospital",
+                                "lon": float(lon), "lat": float(lat),
+                                "criticidad": 4, "estado": "operativo",
+                                "fuente": "SUSALUD/RENIPRESS", "fuente_tipo": "oficial",
+                            })
+                        except (ValueError, TypeError):
+                            pass
+                if len(items) < 500:
+                    break
+                page += 1
+            if resultados:
+                log.info(f"  ✅ {len(resultados)} establecimientos SUSALUD")
+                return resultados
+        except Exception as e:
+            log.warning(f"  SUSALUD API falló: {e}")
+
+    # Fallback CKAN
+    for q in ["renipress establecimientos salud SUSALUD",
+              "MINSA establecimientos salud georreferenciados"]:
+        rid = _buscar_resource_id_ckan(q)
+        if rid:
+            records = _ckan_datastore_fetch(rid, limit=2000)
+            out = []
+            for rec in records:
+                coords = _extraer_latlon_ckan_record(rec)
+                if coords:
+                    lon, lat = coords
+                    out.append({
+                        "nombre": (rec.get("NOMBRE") or rec.get("nombre") or "Establecimiento de salud"),
+                        "tipo": "hospital",
+                        "lon": lon, "lat": lat,
+                        "criticidad": 4, "estado": "operativo",
+                        "fuente": "MINSA/datos.gob.pe", "fuente_tipo": "oficial",
+                    })
+            if out:
+                return out
+    return []
+
+
+def _get_infra_educacion_api() -> list[dict]:
+    for wfs in [
+        ("https://sigmed.minedu.gob.pe/geoserver/sigmed/ows?service=WFS&version=1.0.0"
+         "&request=GetFeature&typeName=sigmed:iiee_geopunto"
+         "&outputFormat=application/json&maxFeatures=50000&srsName=EPSG:4326"),
+    ]:
+        try:
+            data = http_get_bytes(wfs, timeout=120)
+            gj   = json.loads(data)
+            out  = []
+            for feat in gj.get("features", []):
+                p = feat["properties"]
+                c = feat["geometry"]["coordinates"]
+                out.append({
+                    "nombre": p.get("NOM_IE") or "Institución Educativa",
+                    "tipo": "escuela",
+                    "lon": c[0], "lat": c[1],
+                    "criticidad": 4, "estado": "operativo",
+                    "fuente": "MINEDU/ESCALE", "fuente_tipo": "oficial",
+                })
+            if out:
+                return out
+        except Exception as e:
+            log.warning(f"  MINEDU WFS falló: {e}")
+    return []
+
+
+def _get_infra_policia_api() -> list[dict]:
+    for q in ["comisarias PNP policía nacional Peru",
+              "unidades policiales Peru georreferenciadas"]:
+        rid = _buscar_resource_id_ckan(q)
+        if rid:
+            out = []
+            for rec in _ckan_datastore_fetch(rid):
+                coords = _extraer_latlon_ckan_record(rec)
+                if coords:
+                    lon, lat = coords
+                    out.append({
+                        "nombre": rec.get("NOMBRE") or rec.get("UNIDAD") or "Comisaría PNP",
+                        "tipo": "policia",
+                        "lon": lon, "lat": lat,
+                        "criticidad": 4, "estado": "operativo",
+                        "fuente": "PNP/datos.gob.pe", "fuente_tipo": "oficial",
+                    })
+            if out:
+                return out
+    return []
+
+
+def _get_infra_albergues_api() -> list[dict]:
+    try:
+        url  = ("https://sigrid.cenepred.gob.pe/sigridv3/geoserver/ows"
+                "?service=WFS&version=1.0.0&request=GetFeature"
+                "&typeName=cenepred:albergues&outputFormat=application/json"
+                "&maxFeatures=2000")
+        data = http_get_bytes(url, timeout=30)
+        gj   = json.loads(data)
+        out  = []
+        for feat in gj.get("features", []):
+            p = feat["properties"]
+            c = feat["geometry"]["coordinates"]
+            out.append({
+                "nombre": p.get("NOMBRE") or "Albergue INDECI",
+                "tipo": "refugio",
+                "lon": c[0], "lat": c[1],
+                "criticidad": 5, "estado": "operativo",
+                "capacidad": p.get("CAPACIDAD"),
+                "fuente": "CENEPRED/INDECI", "fuente_tipo": "oficial",
+            })
+        return out
+    except Exception as e:
+        log.warning(f"  INDECI albergues WFS falló: {e}")
+    return []
 
 
 # ══════════════════════════════════════════════════════════════════
 #  PASO 8: ESTACIONES DE MONITOREO
+#  IGP (RSN + OVI) · SENAMHI · ANA · DHN · IPEN · INDECI
 # ══════════════════════════════════════════════════════════════════
 
 ESTACIONES_DATASET = [
-    # IGP — Red Sísmica Nacional (RSN)
-    {"codigo": "NNA", "nombre": "Estación Sísmica Nanay (Iquitos)", "tipo": "sismica",
-     "lon": -73.1667, "lat": -3.7833, "altitud_m": 110, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "LIM", "nombre": "Estación Sísmica Lima", "tipo": "sismica",
-     "lon": -77.0500, "lat": -11.9000, "altitud_m": 154, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "AYA", "nombre": "Estación Sísmica Ayacucho", "tipo": "sismica",
-     "lon": -74.2167, "lat": -13.1500, "altitud_m": 2765, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "CUS", "nombre": "Estación Sísmica Cusco", "tipo": "sismica",
-     "lon": -71.9700, "lat": -13.5200, "altitud_m": 3399, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "ARE", "nombre": "Estación Sísmica Arequipa", "tipo": "sismica",
-     "lon": -71.4900, "lat": -16.4100, "altitud_m": 2490, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "TAC", "nombre": "Estación Sísmica Tacna", "tipo": "sismica",
-     "lon": -70.0700, "lat": -18.0100, "altitud_m": 550, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "MQG", "nombre": "Estación Sísmica Moquegua", "tipo": "sismica",
-     "lon": -70.9200, "lat": -17.1800, "altitud_m": 1400, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "HCY", "nombre": "Estación Sísmica Huancayo", "tipo": "sismica",
-     "lon": -75.2167, "lat": -12.0500, "altitud_m": 3315, "institucion": "IGP", "red": "RSN", "activa": True},
-    # SENAMHI — Red de Estaciones Meteorológicas
-    {"codigo": "SENA-ICA", "nombre": "Estación Meteorológica Ica", "tipo": "meteorologica",
-     "lon": -75.7200, "lat": -14.0700, "altitud_m": 406, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "SENA-PIU", "nombre": "Estación Meteorológica Piura", "tipo": "meteorologica",
-     "lon": -80.6300, "lat": -5.1800, "altitud_m": 29, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "SENA-HYC", "nombre": "Estación Meteorológica Huancayo", "tipo": "meteorologica",
-     "lon": -75.3300, "lat": -12.0600, "altitud_m": 3313, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "SENA-IQT", "nombre": "Estación Meteorológica Iquitos", "tipo": "meteorologica",
-     "lon": -73.2600, "lat": -3.7800, "altitud_m": 126, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "SENA-ARE", "nombre": "Estación Meteorológica Arequipa", "tipo": "meteorologica",
-     "lon": -71.5600, "lat": -16.3300, "altitud_m": 2525, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    # ANA — Red Hidrométrica Nacional
-    {"codigo": "ANA-RIM", "nombre": "Hidrómetro Rímac - La Atarjea", "tipo": "hidrometrica",
-     "lon": -77.0167, "lat": -11.9667, "altitud_m": 800, "institucion": "ANA", "red": "RHN", "activa": True},
-    {"codigo": "ANA-MAN", "nombre": "Hidrómetro Mantaro - Angasmayo", "tipo": "hidrometrica",
-     "lon": -75.0500, "lat": -11.7833, "altitud_m": 3350, "institucion": "ANA", "red": "RHN", "activa": True},
-    {"codigo": "ANA-CHI", "nombre": "Hidrómetro Chira - Ardilla", "tipo": "hidrometrica",
-     "lon": -80.6167, "lat": -4.9333, "altitud_m": 45, "institucion": "ANA", "red": "RHN", "activa": True},
-    {"codigo": "ANA-AMZ", "nombre": "Hidrómetro Amazonas - Borja", "tipo": "hidrometrica",
-     "lon": -77.5500, "lat": -4.4833, "altitud_m": 200, "institucion": "ANA", "red": "RHN", "activa": True},
-    # INDECI/COEN — Puntos de monitoreo de emergencias
-    {"codigo": "COEN-LIM", "nombre": "Centro Operaciones Emergencias Nacional (Lima)", "tipo": "emergencias",
-     "lon": -77.0500, "lat": -12.0500, "altitud_m": 150, "institucion": "INDECI", "red": "COEN", "activa": True},
-    # IGP — Observatorios vulcanológicos
-    {"codigo": "OVI-UBI", "nombre": "Observatorio Vulcanológico Ubinas", "tipo": "volcanologica",
-     "lon": -70.9000, "lat": -16.3500, "altitud_m": 4800, "institucion": "IGP", "red": "OVI", "activa": True},
-    {"codigo": "OVI-SAP", "nombre": "Observatorio Vulcanológico Sabancaya", "tipo": "volcanologica",
-     "lon": -71.8700, "lat": -15.7300, "altitud_m": 4979, "institucion": "IGP", "red": "OVI", "activa": True},
-    {"codigo": "OVI-ELM", "nombre": "Observatorio Vulcanológico El Misti", "tipo": "volcanologica",
-     "lon": -71.4100, "lat": -16.2900, "altitud_m": 4600, "institucion": "IGP", "red": "OVI", "activa": True},
-    # DHN — Red de Marégrafos y Boyas Tsunamigénicas
-    {"codigo": "DHN-CAL", "nombre": "Mareógrafo Callao (DART)", "tipo": "maregraf",
-     "lon": -77.1500, "lat": -12.0500, "altitud_m": 5, "institucion": "DHN", "red": "DART", "activa": True},
-    {"codigo": "DHN-MAT", "nombre": "Mareógrafo Matarani (Tsunami)", "tipo": "maregraf",
-     "lon": -72.1000, "lat": -17.0000, "altitud_m": 4, "institucion": "DHN", "red": "DART", "activa": True},
-    # IPEN — Radiológica
-    {"codigo": "IPEN-LIM", "nombre": "Estación Radiológica Lima", "tipo": "radiologica",
-     "lon": -77.0500, "lat": -11.9800, "altitud_m": 180, "institucion": "IPEN", "red": "RRM", "activa": True},
-    # SENAMHI adicionales
-    {"codigo": "SENA-JUL", "nombre": "Estación Meteorológica Juliaca", "tipo": "meteorologica",
-     "lon": -70.1800, "lat": -15.4800, "altitud_m": 3820, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "SENA-CJM", "nombre": "Estación Meteorológica Cajamarca", "tipo": "meteorologica",
-     "lon": -78.5100, "lat": -7.1700, "altitud_m": 2720, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "SENA-MCH", "nombre": "Estación Meteorológica Machu Picchu", "tipo": "meteorologica",
-     "lon": -72.5400, "lat": -13.1600, "altitud_m": 2040, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "SENA-TRP", "nombre": "Estación Meteorológica Tarapoto", "tipo": "meteorologica",
-     "lon": -76.3700, "lat": -6.4900, "altitud_m": 356, "institucion": "SENAMHI", "red": "RMN", "activa": True},
-    {"codigo": "ANA-TIT", "nombre": "Hidrómetro Titicaca - Puno", "tipo": "hidrometrica",
-     "lon": -70.0200, "lat": -15.8500, "altitud_m": 3810, "institucion": "ANA", "red": "RHN", "activa": True},
-    {"codigo": "IGP-CHB", "nombre": "Estación Sísmica Chimbote", "tipo": "sismica",
-     "lon": -78.5800, "lat": -9.0800, "altitud_m": 15, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "IGP-PIU", "nombre": "Estación Sísmica Piura", "tipo": "sismica",
-     "lon": -80.6200, "lat": -5.1900, "altitud_m": 30, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "IGP-ICA", "nombre": "Estación Sísmica Ica (post-2007)", "tipo": "sismica",
-     "lon": -75.7300, "lat": -14.0800, "altitud_m": 410, "institucion": "IGP", "red": "RSN", "activa": True},
-    {"codigo": "IGP-MOQ", "nombre": "Estación Sísmica Mollendo", "tipo": "sismica",
-     "lon": -72.0200, "lat": -17.0300, "altitud_m": 60, "institucion": "IGP", "red": "RSN", "activa": True},
+    # ── IGP — Red Sísmica Nacional ────────────────────────────────
+    {"codigo": "NNA",     "nombre": "Estación Sísmica Nanay (Iquitos)",      "tipo": "sismica",
+     "lon": -73.1667, "lat": -3.7833,  "altitud_m": 110,  "institucion": "IGP", "red": "RSN"},
+    {"codigo": "LIM",     "nombre": "Estación Sísmica Lima",                  "tipo": "sismica",
+     "lon": -77.0500, "lat": -11.9000, "altitud_m": 154,  "institucion": "IGP", "red": "RSN"},
+    {"codigo": "AYA",     "nombre": "Estación Sísmica Ayacucho",              "tipo": "sismica",
+     "lon": -74.2167, "lat": -13.1500, "altitud_m": 2765, "institucion": "IGP", "red": "RSN"},
+    {"codigo": "CUS",     "nombre": "Estación Sísmica Cusco",                 "tipo": "sismica",
+     "lon": -71.9700, "lat": -13.5200, "altitud_m": 3399, "institucion": "IGP", "red": "RSN"},
+    {"codigo": "ARE",     "nombre": "Estación Sísmica Arequipa",              "tipo": "sismica",
+     "lon": -71.4900, "lat": -16.4100, "altitud_m": 2490, "institucion": "IGP", "red": "RSN"},
+    {"codigo": "TAC",     "nombre": "Estación Sísmica Tacna",                 "tipo": "sismica",
+     "lon": -70.0700, "lat": -18.0100, "altitud_m": 550,  "institucion": "IGP", "red": "RSN"},
+    {"codigo": "MQG",     "nombre": "Estación Sísmica Moquegua",              "tipo": "sismica",
+     "lon": -70.9200, "lat": -17.1800, "altitud_m": 1400, "institucion": "IGP", "red": "RSN"},
+    {"codigo": "HCY",     "nombre": "Estación Sísmica Huancayo",              "tipo": "sismica",
+     "lon": -75.2167, "lat": -12.0500, "altitud_m": 3315, "institucion": "IGP", "red": "RSN"},
+    {"codigo": "CHB",     "nombre": "Estación Sísmica Chimbote",              "tipo": "sismica",
+     "lon": -78.5800, "lat": -9.0800,  "altitud_m": 15,   "institucion": "IGP", "red": "RSN"},
+    {"codigo": "PIU_S",   "nombre": "Estación Sísmica Piura",                 "tipo": "sismica",
+     "lon": -80.6200, "lat": -5.1900,  "altitud_m": 30,   "institucion": "IGP", "red": "RSN"},
+    {"codigo": "ICA_S",   "nombre": "Estación Sísmica Ica",                   "tipo": "sismica",
+     "lon": -75.7300, "lat": -14.0800, "altitud_m": 410,  "institucion": "IGP", "red": "RSN"},
+    {"codigo": "MOQ_S",   "nombre": "Estación Sísmica Mollendo",              "tipo": "sismica",
+     "lon": -72.0200, "lat": -17.0300, "altitud_m": 60,   "institucion": "IGP", "red": "RSN"},
+    # ── IGP — Observatorios vulcanológicos ────────────────────────
+    {"codigo": "OVI-UBI", "nombre": "Observatorio Vulcanológico Ubinas",      "tipo": "volcanologica",
+     "lon": -70.9000, "lat": -16.3500, "altitud_m": 4800, "institucion": "IGP", "red": "OVI"},
+    {"codigo": "OVI-SAP", "nombre": "Observatorio Vulcanológico Sabancaya",   "tipo": "volcanologica",
+     "lon": -71.8700, "lat": -15.7300, "altitud_m": 4979, "institucion": "IGP", "red": "OVI"},
+    {"codigo": "OVI-ELM", "nombre": "Observatorio Vulcanológico El Misti",    "tipo": "volcanologica",
+     "lon": -71.4100, "lat": -16.2900, "altitud_m": 4600, "institucion": "IGP", "red": "OVI"},
+    # ── SENAMHI — Red Meteorológica Nacional ──────────────────────
+    {"codigo": "SENA-ICA", "nombre": "Estación Meteorológica Ica",            "tipo": "meteorologica",
+     "lon": -75.7200, "lat": -14.0700, "altitud_m": 406,  "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-PIU", "nombre": "Estación Meteorológica Piura",          "tipo": "meteorologica",
+     "lon": -80.6300, "lat": -5.1800,  "altitud_m": 29,   "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-HYC", "nombre": "Estación Meteorológica Huancayo",       "tipo": "meteorologica",
+     "lon": -75.3300, "lat": -12.0600, "altitud_m": 3313, "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-IQT", "nombre": "Estación Meteorológica Iquitos",        "tipo": "meteorologica",
+     "lon": -73.2600, "lat": -3.7800,  "altitud_m": 126,  "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-ARE", "nombre": "Estación Meteorológica Arequipa",       "tipo": "meteorologica",
+     "lon": -71.5600, "lat": -16.3300, "altitud_m": 2525, "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-CUS", "nombre": "Estación Meteorológica Cusco",          "tipo": "meteorologica",
+     "lon": -71.9800, "lat": -13.5600, "altitud_m": 3350, "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-JUL", "nombre": "Estación Meteorológica Juliaca",        "tipo": "meteorologica",
+     "lon": -70.1800, "lat": -15.4800, "altitud_m": 3820, "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-CJM", "nombre": "Estación Meteorológica Cajamarca",      "tipo": "meteorologica",
+     "lon": -78.5100, "lat": -7.1700,  "altitud_m": 2720, "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-MPC", "nombre": "Estación Meteorológica Machu Picchu",   "tipo": "meteorologica",
+     "lon": -72.5400, "lat": -13.1600, "altitud_m": 2040, "institucion": "SENAMHI", "red": "RMN"},
+    {"codigo": "SENA-TRP", "nombre": "Estación Meteorológica Tarapoto",       "tipo": "meteorologica",
+     "lon": -76.3700, "lat": -6.4900,  "altitud_m": 356,  "institucion": "SENAMHI", "red": "RMN"},
+    # ── ANA — Red Hidrométrica Nacional ──────────────────────────
+    {"codigo": "ANA-RIM",  "nombre": "Hidrómetro Rímac - La Atarjea",         "tipo": "hidrometrica",
+     "lon": -77.0167, "lat": -11.9667, "altitud_m": 800,  "institucion": "ANA", "red": "RHN"},
+    {"codigo": "ANA-MAN",  "nombre": "Hidrómetro Mantaro - Angasmayo",        "tipo": "hidrometrica",
+     "lon": -75.0500, "lat": -11.7833, "altitud_m": 3350, "institucion": "ANA", "red": "RHN"},
+    {"codigo": "ANA-CHI",  "nombre": "Hidrómetro Chira - Ardilla",            "tipo": "hidrometrica",
+     "lon": -80.6167, "lat": -4.9333,  "altitud_m": 45,   "institucion": "ANA", "red": "RHN"},
+    {"codigo": "ANA-AMZ",  "nombre": "Hidrómetro Amazonas - Borja",           "tipo": "hidrometrica",
+     "lon": -77.5500, "lat": -4.4833,  "altitud_m": 200,  "institucion": "ANA", "red": "RHN"},
+    {"codigo": "ANA-TIT",  "nombre": "Hidrómetro Titicaca - Puno",            "tipo": "hidrometrica",
+     "lon": -70.0200, "lat": -15.8500, "altitud_m": 3810, "institucion": "ANA", "red": "RHN"},
+    # ── DHN — Mareógrafos y boyas tsunamigénicas ──────────────────
+    {"codigo": "DHN-CAL",  "nombre": "Mareógrafo Callao (DART)",              "tipo": "maregraf",
+     "lon": -77.1500, "lat": -12.0500, "altitud_m": 5,    "institucion": "DHN", "red": "DART"},
+    {"codigo": "DHN-MAT",  "nombre": "Mareógrafo Matarani (Tsunami)",         "tipo": "maregraf",
+     "lon": -72.1000, "lat": -17.0000, "altitud_m": 4,    "institucion": "DHN", "red": "DART"},
+    # ── IPEN — Red Radiológica ────────────────────────────────────
+    {"codigo": "IPEN-LIM", "nombre": "Estación Radiológica Lima",             "tipo": "radiologica",
+     "lon": -77.0500, "lat": -11.9800, "altitud_m": 180,  "institucion": "IPEN", "red": "RRM"},
+    # ── INDECI — COEN ─────────────────────────────────────────────
+    {"codigo": "COEN-LIM", "nombre": "Centro Operaciones Emergencias Nacional", "tipo": "emergencias",
+     "lon": -77.0500, "lat": -12.0500, "altitud_m": 150,  "institucion": "INDECI", "red": "COEN"},
 ]
 
 
@@ -1737,7 +1757,7 @@ def paso_estaciones(conn) -> int:
                         ST_SetSRID(ST_MakePoint(%s, %s), 4326),
                         %s, %s, %s, %s)
                     ON CONFLICT (codigo) DO UPDATE SET
-                        activa = EXCLUDED.activa,
+                        activa    = EXCLUDED.activa,
                         altitud_m = EXCLUDED.altitud_m
                 """, (e["codigo"], e["nombre"], e["tipo"],
                       e["lon"], e["lat"],
@@ -1756,33 +1776,40 @@ def paso_estaciones(conn) -> int:
 # ══════════════════════════════════════════════════════════════════
 
 def paso_heatmap(conn) -> None:
-    log.info("Refrescando heatmap de sismos (CONCURRENTLY)...")
+    log.info("Refrescando mv_heatmap_sismos (CONCURRENTLY)...")
     t0 = time.time()
     with conn.cursor() as cur:
         cur.execute("SET LOCAL statement_timeout = '300000'")
         cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_heatmap_sismos")
     conn.commit()
-    log.info(f"✅ Heatmap materializado actualizado ({time.time()-t0:.1f}s)")
+    log.info(f"✅ Heatmap actualizado ({time.time()-t0:.1f}s)")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PASO 10: REGIONES PostGIS (ST_Covers + KNN — sin NULL)
+#  PASO 10: REGIONES (ST_Covers + KNN — sin NULL)
 # ══════════════════════════════════════════════════════════════════
 
 def paso_regiones(conn) -> int:
     log.info("Actualizando regiones via PostGIS (ST_Covers + KNN)...")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM departamentos WHERE geom IS NOT NULL")
+        n = cur.fetchone()[0]
+
+    if n == 0:
+        log.error("  ✗ Sin departamentos con geometría — región no puede asignarse")
+        log.error("    Solución: python procesar_datos.py --solo departamentos")
+        return 0
+
+    log.info(f"  {n} departamentos disponibles para asignación de región")
     totales = 0
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM f_actualizar_regiones()")
-        rows = cur.fetchall()
-        for row in rows:
-            tabla = row[0]
-            covers = row[1]
-            knn = row[2]
-            log.info(f"  {tabla:<30} covers={covers}  knn={knn}")
+        for tabla, covers, knn in cur.fetchall():
+            log.info(f"  {tabla:<35} covers={covers}  knn={knn}")
             totales += covers + knn
 
-        # Actualizar distritos con zona_sismica desde departamentos
+        # Actualizar zona_sismica en distritos desde departamentos
         cur.execute("""
             UPDATE distritos d
             SET zona_sismica = dep.zona_sismica
@@ -1790,65 +1817,53 @@ def paso_regiones(conn) -> int:
             WHERE LOWER(d.departamento) = LOWER(dep.nombre)
               AND d.zona_sismica IS DISTINCT FROM dep.zona_sismica
         """)
-        n_zonas = cur.rowcount
-        log.info(f"  distritos zona_sismica actualizada: {n_zonas} registros")
+        log.info(f"  distritos zona_sismica actualizada: {cur.rowcount} filas")
 
     conn.commit()
-    log.info("✅ Regiones actualizadas — sin NULL gracias a KNN fallback")
+    log.info("✅ Regiones actualizadas — sin NULL (KNN fallback garantizado)")
     return totales
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PASO 11: ÍNDICE DE RIESGO DE CONSTRUCCIÓN (NUEVO)
-#  Metodología basada en:
-#    - CENEPRED: Metodología para la evaluación del riesgo de desastre (2014)
-#    - RNE NTE E.030-2018: Zonificación sísmica
-#    - NTE E.031: Suelos y cimentaciones (Vs30 tipo de suelo)
-#    - NTE E.060-2009: Concreto armado (zonas sísmicas)
+#  PASO 11: ÍNDICE DE RIESGO DE CONSTRUCCIÓN
+#  Metodología CENEPRED 2014 + NTE E.030-2018
+#  Pesos: 40% sísmico · 25% inundación · 20% deslizamiento
+#         10% tsunami · 5% fallas activas
 # ══════════════════════════════════════════════════════════════════
 
 def paso_riesgo_construccion(conn) -> None:
-    """
-    Calcula y materializa el índice de riesgo de construcción por distrito.
-    Componentes ponderados (CENEPRED metodología):
-      40% peligro sísmico (zona NTE E.030 + sismicidad histórica)
-      25% peligro por inundación
-      20% peligro por deslizamiento / remoción en masa
-      10% peligro por tsunami (solo distritos costeros)
-       5% densidad de fallas activas en radio 50km
-    """
-    log.info("Calculando índice de riesgo de construcción por distrito...")
+    log.info("Actualizando mv_riesgo_construccion...")
     t0 = time.time()
     with conn.cursor() as cur:
-        # Timeout 5 min — si la vista está vacía o hay lock, no cuelga forever
         cur.execute("SET LOCAL statement_timeout = '300000'")
         cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_riesgo_construccion")
     conn.commit()
-    log.info(f"✅ Índice de riesgo de construcción actualizado ({time.time()-t0:.1f}s)")
+    log.info(f"✅ mv_riesgo_construccion actualizado ({time.time()-t0:.1f}s)")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  ETL PRINCIPAL
+#  ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════
 
-def print_banner():
+def print_banner() -> None:
     print("""
-  ╔══════════════════════════════════════════════════════════╗
-  ║  GeoRiesgo Perú — ETL v7.0                             ║
-  ║  Fuentes: USGS·IGP·INEI·GADM·ANA·PREDES·CENEPRED      ║
-  ║           SUSALUD·MINSA·MINEDU·MTC·APN·OSINERGMIN      ║
-  ╚══════════════════════════════════════════════════════════╝""")
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  GeoRiesgo Perú — ETL v7.1 (BUGFIX)                        ║
+  ║  🔴 FIX1: ST_Multi() en inserts geométricos                ║
+  ║  🔴 FIX2: _limpiar_fuera_peru segura (NULL-proof)          ║
+  ║  🔴 FIX3: Departamentos hardcoded (25 bboxes fallback)     ║
+  ║  🆕  NUEVO: Hospitales MINSA + Bomberos CGBVP hardcoded    ║
+  ╚══════════════════════════════════════════════════════════════╝""")
     print(f"  DB:      {DB_DSN.split('@')[-1]}")
     print(f"  Fecha:   {date.today().isoformat()} UTC")
     print(f"  Workers: {MAX_WORKERS}")
-    print(f"  Region:  ST_Covers + KNN (PostGIS) — sin heurística Python")
-    print(f"  Fix:     Limpieza PostGIS post-inserción (elimina puntos fuera de Perú)")
     print()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="GeoRiesgo Perú ETL v7.0")
-    parser.add_argument("--force", action="store_true", help="Forzar re-carga completa")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="GeoRiesgo Perú ETL v7.1")
+    parser.add_argument("--force", action="store_true",
+                        help="Forzar re-carga completa")
     parser.add_argument("--solo", choices=[
         "departamentos", "sismos", "distritos", "fallas",
         "inundaciones", "tsunamis", "deslizamientos",
@@ -1858,57 +1873,56 @@ def main():
     args = parser.parse_args()
 
     print_banner()
-    log.info("Conectando a PostGIS: %s", DB_DSN.split("@")[-1])
-
+    log.info("Conectando: %s", DB_DSN.split("@")[-1])
     conn = get_conn()
 
-    pasos = {
-        "departamentos":      lambda: paso_departamentos(conn),
-        "sismos":             lambda: paso_sismos(conn),
-        "distritos":          lambda: paso_distritos(conn),
-        "fallas":             lambda: paso_fallas(conn),
-        "inundaciones":       lambda: paso_inundaciones(conn),
-        "tsunamis":           lambda: paso_tsunamis(conn),
-        "deslizamientos":     lambda: paso_deslizamientos(conn),
-        "infraestructura":    lambda: paso_infraestructura(conn),
-        "estaciones":         lambda: paso_estaciones(conn),
-        "heatmap":            lambda: paso_heatmap(conn),
-        "regiones":           lambda: paso_regiones(conn),
+    pasos: dict[str, Any] = {
+        "departamentos":       lambda: paso_departamentos(conn),
+        "sismos":              lambda: paso_sismos(conn),
+        "distritos":           lambda: paso_distritos(conn),
+        "fallas":              lambda: paso_fallas(conn),
+        "inundaciones":        lambda: paso_inundaciones(conn),
+        "tsunamis":            lambda: paso_tsunamis(conn),
+        "deslizamientos":      lambda: paso_deslizamientos(conn),
+        "infraestructura":     lambda: paso_infraestructura(conn),
+        "estaciones":          lambda: paso_estaciones(conn),
+        "heatmap":             lambda: paso_heatmap(conn),
+        "regiones":            lambda: paso_regiones(conn),
         "riesgo_construccion": lambda: paso_riesgo_construccion(conn),
     }
-    orden = list(pasos.keys())
 
     if args.solo:
-        log.info(f"── SOLO PASO: {args.solo}")
+        log.info(f"── SOLO PASO: {args.solo.upper()}")
         try:
             result = pasos[args.solo]()
             log.info(f"✅ Paso '{args.solo}' completado: {result}")
         except Exception as e:
             log.error(f"Error en paso '{args.solo}': {e}")
             raise
+        finally:
+            conn.close()
         return
 
     t0 = time.time()
-    resultados = {}
-    for i, paso in enumerate(orden):
-        log.info(f"── PASO {i}: {paso.upper()}")
+    resultados: dict[str, Any] = {}
+    for i, (paso, fn) in enumerate(pasos.items()):
+        log.info(f"── PASO {i:02d}: {paso.upper()}")
         t_paso = time.time()
         try:
-            r = pasos[paso]()
+            r = fn()
             resultados[paso] = r
-            log.info(f"   → {r} registros en {time.time()-t_paso:.1f}s\n")
+            log.info(f"   → {r!r:>10}  ({time.time()-t_paso:.1f}s)\n")
         except Exception as e:
-            log.error(f"   Error en paso {paso}: {e}")
+            log.error(f"   Error en '{paso}': {e}")
             resultados[paso] = f"ERROR: {e}"
 
     elapsed = time.time() - t0
-    print("""
-  ╔══════════════════════════════════════════════════════════╗""")
+    print("\n  ╔══════════════════════════════════════════════════════════════╗")
     for k, v in resultados.items():
-        print(f"  ║  {k:<25} {str(v):>8} registros                  ║")
-    print(f"  ║  Tiempo total: {elapsed:.1f}s                              ║")
-    print("  ║  ✅ ETL v7.0 completado                              ║")
-    print("  ╚══════════════════════════════════════════════════════════╝\n")
+        estado = "✅" if not str(v).startswith("ERROR") else "❌"
+        print(f"  ║  {estado} {k:<26} {str(v):>10}                     ║")
+    print(f"  ║  ⏱  Tiempo total: {elapsed:.0f}s                                   ║")
+    print("  ╚══════════════════════════════════════════════════════════════╝\n")
 
     conn.close()
 
