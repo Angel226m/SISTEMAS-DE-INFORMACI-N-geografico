@@ -1,6 +1,6 @@
 ﻿// ══════════════════════════════════════════════════════════
-// GeoRiesgo Perú — App.tsx v7.0
-// Mejoras v7.0:
+// GeoRiesgo Perú — App.tsx v7.5 ENTERPRISE
+// Mejoras v7.5:
 // - Panel IRC (índice riesgo construcción) con zona sísmica
 // - InfoPopup: muestra zona_sismica, indice_riesgo_construccion
 // - FilterPanel: pasa fuente_tipo para infraestructura
@@ -115,7 +115,7 @@ function Loader({ pct }: { pct: number }) {
           GeoRiesgo <span style={{ color: C.primary }}>Perú</span>
         </p>
         <p style={{ fontFamily: "'DM Mono',monospace", color: C.textMuted, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', marginTop: 4 }}>
-          Cargando datos geoespaciales · v7.0
+          Cargando datos geoespaciales · v7.5
         </p>
       </div>
       <div style={{ width: 220, height: 3, background: C.bgMuted, borderRadius: 2 }}>
@@ -173,7 +173,7 @@ function Row({ label, value, color }: { label: string; value: string | number; c
   )
 }
 
-function InfoPopup({ props, layer, onClose }: {
+function InfoPopup({ props, layer: _layer, onClose }: {
   props: Record<string, unknown>; layer: string; onClose: () => void
 }) {
   const p = props
@@ -592,7 +592,7 @@ export default function App() {
 
   // Estadísticas de cobertura
   // FIX: coberturaTipos puede llegar como objeto {resumen,por_tipo} si la API cambia
-  const coberturaTiposArr: CoberturaTipo[] = Array.isArray(coberturaTipos)
+  const _coberturaTiposArr: CoberturaTipo[] = Array.isArray(coberturaTipos)
     ? coberturaTipos
     : ((coberturaTipos as unknown as { por_tipo?: CoberturaTipo[] })?.por_tipo ?? [])
   /*const totalOficial = coberturaTiposArr.reduce((s, c) => s + (c.oficial ?? 0), 0)
@@ -622,7 +622,7 @@ const totalInfra   = totalOficial + totalOSM
                 GeoRiesgo <span style={{ color: C.primary }}>Perú</span>
               </div>
               <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
-                Riesgo Sísmico · v7.0 · IRC
+                Riesgo Sísmico · v7.5 · IRC
               </div>
             </div>
           </div>
@@ -810,7 +810,7 @@ const totalInfra   = totalOficial + totalOSM
               <span style={{ width: 1, height: 10, background: C.border }} />
               <span style={{ color: C.danger }}>{totalErr} error{totalErr > 1 ? 'es' : ''}</span>
             </>}
-            <span style={{ marginLeft: 'auto' }}>USGS · IGP · SUSALUD · MINEDU · CENEPRED · OSM · v7.0</span>
+            <span style={{ marginLeft: 'auto' }}>USGS · IGP · SUSALUD · MINEDU · CENEPRED · OSM · NTE E.031-2020 · v7.5</span>
           </div>
         </div>
       </div>

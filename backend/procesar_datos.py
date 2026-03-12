@@ -83,11 +83,11 @@ ZONA_SISMICA_POR_DEPTO: dict[str, int] = {
     "Tumbes": 4, "Piura": 4, "Lambayeque": 4, "La Libertad": 4,
     "Ancash": 4, "Lima": 4, "Callao": 4, "Ica": 4,
     "Arequipa": 4, "Moquegua": 4, "Tacna": 4,
-    # Zona 3 — alto peligro (sierra central y sur)
-    "Cajamarca": 3, "San Martín": 3, "Huánuco": 3, "Pasco": 3,
-    "Junín": 3, "Huancavelica": 3, "Ayacucho": 3, "Apurímac": 3, "Cusco": 3,
-    # Zona 2 — peligro moderado
-    "Amazonas": 2, "Puno": 2, "Ucayali": 2,
+    # Zona 3 — alto peligro (sierra central)
+    "Cajamarca": 3, "San Martín": 3, "Pasco": 3,
+    "Junín": 3, "Huancavelica": 3, "Cusco": 3,
+    # Zona 2 — peligro moderado (sierra sur y selva alta)  NTE E.030-2018
+    "Amazonas": 2, "Huánuco": 2, "Ayacucho": 2, "Apurímac": 2, "Puno": 2, "Ucayali": 2,
     # Zona 1 — bajo peligro (amazonia)
     "Loreto": 1, "Madre de Dios": 1,
 }
@@ -116,8 +116,8 @@ DEPARTAMENTOS_FALLBACK = [
     ("Callao",        "PER_CAL", -77.22, -12.12, -76.98, -11.87, 4),
     ("Huancavelica",  "PER_HVC", -75.72, -14.28, -73.78, -12.02, 3),
     ("Ica",           "PER_ICA", -76.72, -15.78, -73.78, -13.02, 4),
-    ("Ayacucho",      "PER_AYA", -75.12, -15.28, -73.08, -12.18, 3),
-    ("Apurímac",      "PER_APU", -73.92, -14.88, -72.08, -13.18, 3),
+    ("Ayacucho",      "PER_AYA", -75.12, -15.28, -73.08, -12.18, 2),  # NTE E.030-2018 Z2
+    ("Apurímac",      "PER_APU", -73.92, -14.88, -72.08, -13.18, 2),  # NTE E.030-2018 Z2
     ("Cusco",         "PER_CUS", -73.58, -15.38, -70.18, -11.18, 3),
     ("Arequipa",      "PER_ARE", -73.22, -17.12, -69.98, -14.38, 4),
     ("Puno",          "PER_PUN", -71.52, -17.38, -68.58, -13.02, 2),
@@ -647,6 +647,15 @@ def _insertar_distritos_fallback(conn) -> int:
 
 
 def paso_distritos(conn) -> int:
+    # Limpieza en cada corrida para garantizar datos frescos y consistentes
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM distritos")
+        n_borrados = cur.rowcount
+    conn.commit()
+    if n_borrados:
+        log.info(f"  🗑  {n_borrados} distritos previos eliminados (fresh load)")
+
+    n_actual = 0
     # — Intentar INEI WFS (ligero, preferido) —
     for inei_url in [
         ("https://geoservidor.inei.gob.pe/geoserver/ows?service=WFS&version=1.0.0"
@@ -664,7 +673,8 @@ def paso_distritos(conn) -> int:
             if features:
                 n = _insertar_distritos_inei(conn, features)
                 if n >= 50:
-                    return n
+                    n_actual = n
+                    break
         except Exception as e:
             log.warning(f"  INEI falló: {e}")
 
@@ -677,29 +687,114 @@ def paso_distritos(conn) -> int:
         gj = json.loads(r)
         n = _insertar_distritos_gadm(conn, gj["features"])
         if n >= 50:
-            return n
+            n_actual = n
+            # Verificación inmediata post-commit
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM distritos")
+                db_count = cur.fetchone()[0]
+            log.info(f"  ✅ BD confirma {db_count} distritos en tabla post-GADM")
     except Exception as e:
         log.error(f"  GADM L3 falló (esperado en Docker con timeout): {e}")
+        n_actual = 0
 
     # ── ACTIVAR FALLBACK HARDCODED ───────────────────────────────
-    # CAUSA #1 del bug: llegamos aquí casi siempre en Docker porque
-    # GADM L3 (80-120 MB) hace timeout. Sin este fallback → IRC vacío.
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM distritos WHERE geom IS NOT NULL")
-        n_actual = cur.fetchone()[0]
-
+    # Llega aquí cuando INEI + GADM no cargaron ≥50 distritos.
     if n_actual < 50:
-        log.warning(
-            f"  ⚠  Solo {n_actual} distritos con geom. "
-            f"Cargando DISTRITOS_FALLBACK ({len(DISTRITOS_FALLBACK)} distritos hardcoded)..."
-        )
-        n_fb = _insertar_distritos_fallback(conn)
-        n_actual += n_fb
-        log.info(f"  → {n_actual} distritos totales. Mapa IRC tendrá datos ✅")
-    else:
-        log.info(f"  {n_actual} distritos disponibles — fallback no necesario")
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM distritos WHERE geom IS NOT NULL")
+            n_actual = cur.fetchone()[0]
+
+        if n_actual < 50:
+            log.warning(
+                f"  ⚠  Solo {n_actual} distritos con geom. "
+                f"Cargando DISTRITOS_FALLBACK ({len(DISTRITOS_FALLBACK)} distritos hardcoded)..."
+            )
+            n_fb = _insertar_distritos_fallback(conn)
+            n_actual += n_fb
+            log.info(f"  → {n_actual} distritos totales. Mapa IRC tendrá datos ✅")
+        else:
+            log.info(f"  {n_actual} distritos disponibles — fallback no necesario")
+
+    # ── v7.5: actualización determinista zona_sismica ────────────
+    # SIEMPRE corre aquí, independientemente de qué fuente cargó
+    # los distritos (INEI / GADM / fallback hardcoded).
+    # Garantiza 100% cobertura y corrige valores del dict Python.
+    n_actualizados = _actualizar_zona_sismica_determinista(conn)
+    log.info(f"  zona_sismica determinista: {n_actualizados} distritos actualizados")
 
     return n_actual
+
+
+def _actualizar_zona_sismica_determinista(conn) -> int:
+    """
+    v7.5 ENTERPRISE — Actualización determinista de zona_sismica en distritos.
+
+    Tres pasos en cascada para garantizar 0 NULL:
+      1. JOIN por texto con unaccent() → zona_sismica_departamento (tabla referencia)
+      2. KNN espacial → departamento más cercano (fallback para bboxes hardcoded)
+      3. Valor por defecto conservador (Zona 2 = 0.25g) para geom NULL
+
+    Este paso SIEMPRE corre después del INSERT de distritos, independientemente
+    de qué fuente se usó (INEI / GADM / fallback hardcoded).
+    """
+    n_total = 0
+    with conn.cursor() as cur:
+        # Paso 1: texto normalizado unaccent → referencia canonical
+        cur.execute("""
+            UPDATE distritos d
+            SET zona_sismica = zsd.zona_sismica
+            FROM zona_sismica_departamento zsd
+            WHERE unaccent(lower(d.departamento)) = unaccent(lower(zsd.departamento))
+              AND d.zona_sismica IS DISTINCT FROM zsd.zona_sismica
+        """)
+        n1 = cur.rowcount
+        log.info(f"    determinista paso1 (unaccent text): {n1} filas")
+        n_total += n1
+
+        # Paso 2: KNN espacial para los que siguen con NULL
+        cur.execute("""
+            UPDATE distritos d
+            SET zona_sismica = (
+                SELECT dep.zona_sismica
+                FROM departamentos dep
+                WHERE dep.zona_sismica IS NOT NULL
+                  AND dep.geom IS NOT NULL
+                ORDER BY dep.geom <-> ST_Centroid(d.geom)
+                LIMIT 1
+            )
+            WHERE d.zona_sismica IS NULL
+              AND d.geom IS NOT NULL
+        """)
+        n2 = cur.rowcount
+        log.info(f"    determinista paso2 (KNN espacial): {n2} filas")
+        n_total += n2
+
+        # Paso 3: valor por defecto para los raros con geom NULL
+        cur.execute("""
+            UPDATE distritos
+            SET zona_sismica = 2
+            WHERE zona_sismica IS NULL
+        """)
+        n3 = cur.rowcount
+        if n3 > 0:
+            log.warning(f"    determinista paso3 (default Z2): {n3} distritos sin geom")
+        n_total += n3
+
+        # Verificación final
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE zona_sismica IS NULL) AS null_count,
+                COUNT(*) AS total
+            FROM distritos
+        """)
+        r = cur.fetchone()
+        if r[0] > 0:
+            log.error(f"    ✗ {r[0]}/{r[1]} distritos AÚN con zona_sismica NULL — revisar ETL")
+        else:
+            log.info(f"    ✅ {r[1]} distritos, 0 NULL en zona_sismica")
+
+    conn.commit()
+    return n_total
 
 
 def _insertar_distritos_inei(conn, features: list) -> int:
@@ -707,10 +802,15 @@ def _insertar_distritos_inei(conn, features: list) -> int:
     with conn.cursor() as cur:
         for feat in features:
             p        = feat["properties"]
-            geom_wkt = shape(feat["geometry"]).wkt
             depto    = p.get("NOMBDEP", "") or ""
             zona     = ZONA_SISMICA_POR_DEPTO.get(depto, 2)
             try:
+                geom_wkt = shape(feat["geometry"]).wkt
+            except Exception as e:
+                log.debug(f"  geometría INEI no parseable ({p.get('NOMBDIST','?')}): {e}")
+                continue
+            try:
+                cur.execute("SAVEPOINT sp_inei")
                 # 🔴 FIX 2: ST_Multi() garantiza MultiPolygon
                 cur.execute("""
                     INSERT INTO distritos
@@ -720,14 +820,21 @@ def _insertar_distritos_inei(conn, features: list) -> int:
                         ST_Multi(ST_MakeValid(ST_GeomFromText(%s, 4326)))
                             ::geometry(MultiPolygon,4326),
                         %s, %s, %s, %s)
-                    ON CONFLICT (ubigeo) DO NOTHING
+                    ON CONFLICT (ubigeo) DO UPDATE SET
+                        geom         = EXCLUDED.geom,
+                        poblacion    = EXCLUDED.poblacion,
+                        zona_sismica = EXCLUDED.zona_sismica,
+                        fuente       = EXCLUDED.fuente
                 """, (p.get("IDDIST"), p.get("NOMBDIST"), p.get("NOMBPROV"),
                       depto, geom_wkt, 3,
                       p.get("POBLACIE") or p.get("PBLCNE_TO"),
                       zona, "INEI"))
+                cur.execute("RELEASE SAVEPOINT sp_inei")
                 count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_inei")
+                cur.execute("RELEASE SAVEPOINT sp_inei")
+                log.debug(f"  fila INEI omitida ({p.get('NOMBDIST','?')}): {e}")
     conn.commit()
     log.info(f"✅ {count} distritos INEI insertados")
     return count
@@ -738,10 +845,19 @@ def _insertar_distritos_gadm(conn, features: list) -> int:
     with conn.cursor() as cur:
         for feat in features:
             p        = feat["properties"]
-            geom_wkt = shape(feat["geometry"]).wkt
             depto    = p.get("NAME_1", "")
             zona     = ZONA_SISMICA_POR_DEPTO.get(depto, 2)
+            # GID_3 es el identificador único garantizado de GADM 4.1
+            # CC_3 suele ser NULL para distritos de Perú — NO usar
+            ubigeo   = p.get("GID_3") or p.get("CC_3") or None
             try:
+                geom_wkt = shape(feat["geometry"]).wkt
+            except Exception as e:
+                log.debug(f"  geometría no parseable ({p.get('NAME_3','?')}): {e}")
+                continue
+            try:
+                # SAVEPOINT por cada fila → evita abortar toda la transacción
+                cur.execute("SAVEPOINT sp_gadm")
                 # 🔴 FIX 2: ST_Multi() garantiza MultiPolygon
                 cur.execute("""
                     INSERT INTO distritos
@@ -751,13 +867,20 @@ def _insertar_distritos_gadm(conn, features: list) -> int:
                         ST_Multi(ST_MakeValid(ST_GeomFromText(%s, 4326)))
                             ::geometry(MultiPolygon,4326),
                         %s, %s, %s)
-                    ON CONFLICT (ubigeo) DO NOTHING
-                """, (p.get("CC_3"), p.get("NAME_3"),
+                    ON CONFLICT (ubigeo) DO UPDATE SET
+                        geom         = EXCLUDED.geom,
+                        departamento = EXCLUDED.departamento,
+                        zona_sismica = EXCLUDED.zona_sismica,
+                        fuente       = EXCLUDED.fuente
+                """, (ubigeo, p.get("NAME_3"),
                       p.get("NAME_2"), depto, geom_wkt,
                       3, zona, "GADM 4.1"))
+                cur.execute("RELEASE SAVEPOINT sp_gadm")
                 count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_gadm")
+                cur.execute("RELEASE SAVEPOINT sp_gadm")
+                log.debug(f"  fila GADM omitida ({p.get('NAME_3','?')}): {e}")
     conn.commit()
     log.info(f"✅ {count} distritos GADM L3 insertados")
     return count
@@ -1953,6 +2076,12 @@ def paso_heatmap(conn) -> None:
 def paso_regiones(conn) -> int:
     log.info("Actualizando regiones via PostGIS (ST_Covers + KNN)...")
 
+    # Diagnóstico rápido — verifica que distritos aún tenga datos
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM distritos")
+        n_dist_check = cur.fetchone()[0]
+    log.info(f"  [diag] distritos en BD al inicio de paso_regiones: {n_dist_check}")
+
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM departamentos WHERE geom IS NOT NULL")
         n = cur.fetchone()[0]
@@ -1970,16 +2099,17 @@ def paso_regiones(conn) -> int:
             log.info(f"  {tabla:<35} covers={covers}  knn={knn}")
             totales += covers + knn
 
-        # 🆕 Actualizar zona_sismica en distritos ANTES del refresh de IRC
+        # 🆕 v7.5: Actualizar zona_sismica en distritos usando tabla de referencia + unaccent
+        # Reemplaza el JOIN de texto simple por unaccent para manejar encodings GADM
         cur.execute("""
             UPDATE distritos d
-            SET zona_sismica = dep.zona_sismica
-            FROM departamentos dep
-            WHERE LOWER(d.departamento) = LOWER(dep.nombre)
-              AND d.zona_sismica IS DISTINCT FROM dep.zona_sismica
+            SET zona_sismica = zsd.zona_sismica
+            FROM zona_sismica_departamento zsd
+            WHERE unaccent(lower(d.departamento)) = unaccent(lower(zsd.departamento))
+              AND d.zona_sismica IS DISTINCT FROM zsd.zona_sismica
         """)
         n_zona = cur.rowcount
-        log.info(f"  distritos zona_sismica actualizada: {n_zona} filas")
+        log.info(f"  distritos zona_sismica actualizada (referencia v7.5): {n_zona} filas")
 
     conn.commit()
     log.info("✅ Regiones actualizadas — sin NULL (KNN fallback garantizado)")
@@ -2005,6 +2135,15 @@ def paso_riesgo_construccion(conn) -> None:
     dentro de una transacción psycopg2. refresh_matview() lo maneja.
     """
     log.info("Actualizando mv_riesgo_construccion (IRC)...")
+
+    # Diagnóstico rápido — detecta si algo borró los distritos entre pasos
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM distritos")
+        n_dist_check = cur.fetchone()[0]
+    log.info(f"  [diag] distritos en BD al inicio de paso_riesgo_construccion: {n_dist_check}")
+
+    # Seguridad v7.5: si zona_sismica anún tiene NULL, corregir ahora
+    _actualizar_zona_sismica_determinista(conn)
 
     # Verificar prereqs antes de refrescar
     with conn.cursor() as cur:
@@ -2042,13 +2181,16 @@ def paso_riesgo_construccion(conn) -> None:
 def print_banner() -> None:
     print("""
   ╔══════════════════════════════════════════════════════════════╗
-  ║  GeoRiesgo Perú — ETL v7.2 (FULL BUGFIX)                   ║
+  ║  GeoRiesgo Perú — ETL v7.5 ENTERPRISE                      ║
   ║  🔴 FIX1: refresh_matview() — autocommit fuera de tx       ║
   ║  🔴 FIX2: ST_Multi() en inserts geométricos                ║
   ║  🔴 FIX3: _limpiar_fuera_peru() NULL-proof                 ║
   ║  🔴 FIX4: Departamentos hardcoded (25 bboxes fallback)     ║
-  ║  🆕  Orden garantizado: regiones → IRC (zona_sismica OK)   ║
-  ║  🆕  Hospitales MINSA + Bomberos CGBVP hardcoded           ║
+  ║  🆕 [v7.5] _actualizar_zona_sismica_determinista()         ║
+  ║      → texto unaccent + referencia tabla → NUNCA NULL      ║
+  ║  🆕 [v7.5] paso_distritos llama determinista post-insert   ║
+  ║  🆕 [v7.5] paso_regiones usa unaccent para zona_sismica    ║
+  ║  🆕 [v7.5] Banner y logs con versión 7.5                   ║
   ╚══════════════════════════════════════════════════════════════╝""")
     print(f"  DB:      {DB_DSN.split('@')[-1]}")
     print(f"  Fecha:   {date.today().isoformat()} UTC")
@@ -2057,7 +2199,7 @@ def print_banner() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GeoRiesgo Perú ETL v7.2")
+    parser = argparse.ArgumentParser(description="GeoRiesgo Perú ETL v7.5 ENTERPRISE")
     parser.add_argument("--force", action="store_true",
                         help="Forzar re-carga completa")
     parser.add_argument("--solo", choices=[

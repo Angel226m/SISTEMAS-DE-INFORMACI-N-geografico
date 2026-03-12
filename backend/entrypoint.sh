@@ -1,15 +1,15 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════
-# GeoRiesgo Perú — Entrypoint v6.0
-# ══════════════════════════════════════════════════════════
+# GeoRiesgo Perú — Entrypoint v7.5 ENTERPRISE
+# ════════════════════════════════════════════════════════
 set -euo pipefail
 
 echo ""
-echo "  ╔══════════════════════════════════════════════════════════╗"
-echo "  ║  GeoRiesgo Perú — Backend v6.0                         ║"
-echo "  ║  FastAPI + PostgreSQL/PostGIS                          ║"
-echo "  ║  Región: ST_Covers + KNN (sin NULL)                    ║"
-echo "  ╚══════════════════════════════════════════════════════════╝"
+echo "  ╔═════════════════════════════════════════════════════════╗"
+echo "  ║  GeoRiesgo Perú — Backend v7.5 ENTERPRISE                 ║"
+echo "  ║  FastAPI + PostgreSQL/PostGIS + NTE E.030/E.031-2020     ║"
+echo "  ║  zona_sismica NUNCA NULL — determinista v7.5             ║"
+echo "  ╚═════════════════════════════════════════════════════════╝"
 echo "  ENV: ${APP_ENV:-production}"
 echo ""
 
@@ -50,11 +50,11 @@ if [ "${POSTGIS_OK}" = "0" ]; then
          -f /app/init.sql 2>&1 | tail -10
 else
     echo "  ✓ PostGIS disponible"
-    # Verificar y actualizar funciones v6.0 si ya existe la BD
-    echo "  Verificando funciones v6.0 (ST_Covers + KNN)..."
+    # Verificar y actualizar funciones v7.5 si ya existe la BD
+    echo "  Verificando funciones v7.5 (zona_sismica determinista)..."
     psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" \
-         -c "SELECT 1 FROM pg_proc WHERE proname='f_asignar_region'" -t -A 2>/dev/null | grep -q "1" || {
-        echo "  ⚠ Función f_asignar_region no encontrada — re-ejecutando init.sql"
+         -c "SELECT 1 FROM pg_proc WHERE proname='f_actualizar_regiones'" -t -A 2>/dev/null | grep -q "1" || {
+        echo "  ⚠ Función f_actualizar_regiones no encontrada — re-ejecutando init.sql"
         psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" \
              -f /app/init.sql 2>&1 | tail -10
     }
@@ -93,16 +93,16 @@ echo "    infra_sin_region=${INFRA_SIN_REGION} (0 = perfecto)"
 # ── ETL inicial o forzado ──────────────────────────────────
 if [ "${SISMOS_N}" = "0" ] || [ "${FORCE_SYNC:-0}" = "1" ]; then
     echo ""
-    echo "  ► Iniciando ETL v6.0 (primera carga o FORCE_SYNC=1)"
+    echo "  ► Iniciando ETL v7.5 ENTERPRISE (primera carga o FORCE_SYNC=1)"
     echo "    Pasos: departamentos → sismos → distritos → fallas →"
     echo "           inundaciones → tsunamis → deslizamientos →"
     echo "           infraestructura → estaciones → heatmap → regiones"
-    echo "    PASO 10: ST_Covers + KNN — región nunca NULL"
+    echo "    PASO 02: _actualizar_zona_sismica_determinista — zona NUNCA NULL"
     echo "    Tiempo estimado: 5-20 min según conexión"
     echo ""
 
     if python /app/procesar_datos.py; then
-        echo "  ✓ ETL v6.0 completado exitosamente"
+        echo "  ✓ ETL v7.5 completado exitosamente"
     else
         echo "  ⚠ ETL terminó con errores parciales — la API iniciará de todos modos"
         echo "    Para reintentar: docker exec georiesgo_api python procesar_datos.py --force"
@@ -122,10 +122,10 @@ else
 fi
 
 echo ""
-echo "  ► Iniciando FastAPI v6.0"
+echo "  ► Iniciando FastAPI v7.5 ENTERPRISE"
 echo "  ► Endpoints: http://0.0.0.0:8000/"
 echo "  ► Docs:      http://0.0.0.0:8000/docs"
-echo "  ► Diagnóstico: http://0.0.0.0:8000/api/v1/diagnostico/regiones"
+echo "  ► Zona sísmica ref: http://0.0.0.0:8000/api/v1/zonas-sismicas/referencia"
 echo ""
 
 WORKERS="${WORKERS:-2}"

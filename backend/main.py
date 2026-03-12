@@ -206,7 +206,7 @@ async def root():
             (SELECT COUNT(*) FROM infraestructura WHERE region IS NULL) AS infra_sin_region
     """)
     return {
-        "api":     "GeoRiesgo Perú v7.0",
+        "api":     "GeoRiesgo Perú v7.5 ENTERPRISE",
         "docs":    "/docs",
         "redoc":   "/redoc",
         "capas":   dict(row),
@@ -229,7 +229,7 @@ async def root():
 async def health():
     pool = await db()
     await pool.fetchval("SELECT 1")
-    return {"status": "ok", "ts": time.time(), "version": "7.0"}
+    return {"status": "ok", "ts": time.time(), "version": "7.5"}
 
 
 # ══════════════════════════════════════════════════════════
@@ -340,7 +340,51 @@ async def get_zonas_sismicas(
 
 
 # ══════════════════════════════════════════════════════════
-#  INFRAESTRUCTURA COBERTURA  ← NUEVO v7.0
+#  REFERENCIA ZONA SÍSMICA POR DEPARTAMENTO  ← v7.5
+#  GET /api/v1/zonas-sismicas/referencia
+# ══════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/v1/zonas-sismicas/referencia",
+    summary="Tabla de referencia inmutable: zona sísmica por departamento (NTE E.030-2018)",
+    tags=["Sismicidad"],
+)
+async def get_zonas_sismicas_referencia():
+    """
+    Devuelve la tabla de referencia `zona_sismica_departamento` (v7.5):
+    25 departamentos del Perú con su zona sísmica oficial según NTE E.030-2018.
+
+    Esta tabla sirve como _fallback_ determinista para garantizar que
+    `zona_sismica` nunca sea NULL en distritos ni en la MV IRC.
+    """
+    pool = await db()
+    try:
+        rows = await pool.fetch("""
+            SELECT
+                departamento,
+                zona_sismica,
+                factor_z,
+                descripcion,
+                referencia,
+                actualizado_en::TEXT AS actualizado_en
+            FROM zona_sismica_departamento
+            ORDER BY zona_sismica DESC, departamento
+        """)
+        return {
+            "referencia": [dict(r) for r in rows],
+            "total": len(rows),
+            "norma": "NTE E.030-2018 — DS N°003-2016-VIVIENDA",
+            "fuente": "Reglamento Nacional de Edificaciones (RNE)",
+        }
+    except Exception:
+        raise HTTPException(503, detail={
+            "error":   "tabla_no_disponible",
+            "mensaje": "zona_sismica_departamento no existe. Re-inicializa el esquema con init.sql.",
+        })
+
+
+# ══════════════════════════════════════════════════════════
+#  INFRAESTRUCTURA COBERTURA  ← v7.0
 #  GET /api/v1/infraestructura/cobertura
 # ══════════════════════════════════════════════════════════
 
@@ -523,7 +567,7 @@ async def get_riesgo_construccion_ranking(
 
 
 # ══════════════════════════════════════════════════════════
-#  RIESGO CONSTRUCCIÓN — MAPA GEOJSON  ← NUEVO v7.0
+#  RIESGO CONSTRUCCIÓN — MAPA GEOJSON  ← v7.5
 #  GET /api/v1/riesgo/construccion/mapa
 # ══════════════════════════════════════════════════════════
 
@@ -562,6 +606,7 @@ async def get_riesgo_construccion_mapa(
             mv.departamento,
             mv.zona_sismica,
             COALESCE(mv.factor_z, 0.25)                    AS factor_z,
+            COALESCE(mv.clasificacion_suelo, 'S2')         AS clasificacion_suelo,
             COALESCE(mv.poblacion, 0)                      AS poblacion,
             mv.peligro_sismico,
             mv.peligro_inundacion,
@@ -596,7 +641,7 @@ async def get_riesgo_construccion_mapa(
 
     props_keys = [
         "id", "ubigeo", "distrito", "provincia", "departamento",
-        "zona_sismica", "factor_z", "poblacion",
+        "zona_sismica", "factor_z", "clasificacion_suelo", "poblacion",
         "peligro_sismico", "peligro_inundacion", "peligro_deslizamiento",
         "peligro_tsunami", "fallas_activas_50km", "sismos_m4_30a_50km",
         "indice_riesgo_construccion", "nivel_riesgo", "color",
@@ -605,7 +650,7 @@ async def get_riesgo_construccion_mapa(
     return geojson_response(
         rows_to_features(rows, props_keys),
         {
-            "metodologia":  "CENEPRED 2014 + NTE E.030-2018",
+            "metodologia":  "CENEPRED 2014 + NTE E.030-2018 + NTE E.031-2020",
             "ponderacion":  "40% sísmico + 25% inundación + 20% deslizamiento + 10% tsunami + 5% fallas",
             "escala_color": {
                 "MUY ALTO": "#b71c1c",
@@ -613,6 +658,12 @@ async def get_riesgo_construccion_mapa(
                 "MEDIO":    "#fb8c00",
                 "BAJO":     "#fdd835",
                 "MUY BAJO": "#43a047",
+            },
+            "clasificacion_suelo": {
+                "S1": "Roca/suelo rígido (Vs30>500 m/s) — Sierra/Roca expuesta",
+                "S2": "Suelo intermedio (Vs30 180-500 m/s) — Valles aluviales",
+                "S3": "Suelo blando (Vs30<180 m/s) — Costa con relleno/llanura",
+                "S4": "Condiciones especiales — Tsunami/licuefacción/relleno artificial",
             },
             "zoom":   zoom,
             "filtros": {

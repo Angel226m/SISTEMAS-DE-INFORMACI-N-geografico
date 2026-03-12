@@ -84,23 +84,49 @@ const PROF_OPTS = [
 ]
 
 const REGIONES = [
-  'Ica', 'Lima', 'Arequipa', 'Cusco', 'Ancash', 'Piura',
-  'Tacna', 'Puno', 'Moquegua', 'San Martin', 'Junin',
+  // Zona 4 — Costa (muy alto)
+  'Tumbes', 'Piura', 'Lambayeque', 'La Libertad', 'Ancash',
+  'Lima', 'Callao', 'Ica', 'Arequipa', 'Moquegua', 'Tacna',
+  // Zona 3 — Sierra/Selva norte-central (alto)
+  'Cajamarca', 'San Martin', 'Huancavelica', 'Junin', 'Pasco',
+  'Cusco',
+  // Zona 2 — Sierra norte / Selva central (medio)
+  'Amazonas', 'Huanuco', 'Ayacucho', 'Apurimac', 'Puno', 'Ucayali',
+  // Zona 1 — Amazonia (bajo)
+  'Loreto', 'Madre de Dios',
 ]
 
-// Zona sísmica por región (NTE E.030-2018)
+// Zona sísmica completa por departamento (NTE E.030-2018) — v7.5
 const ZONA_REGION: Record<string, { zona: number; factor: string; color: string }> = {
-  'Ica':       { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Lima':      { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Arequipa':  { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Ancash':    { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Tacna':     { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Moquegua':  { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Piura':     { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Cusco':     { zona: 3, factor: '0.35g', color: '#f97316' },
-  'San Martin':{ zona: 3, factor: '0.35g', color: '#f97316' },
-  'Junin':     { zona: 3, factor: '0.35g', color: '#f97316' },
-  'Puno':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  // Zona 4 — 0.45g
+  'Tumbes':       { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Piura':        { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Lambayeque':   { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'La Libertad':  { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Ancash':       { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Lima':         { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Callao':       { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Ica':          { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Arequipa':     { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Moquegua':     { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Tacna':        { zona: 4, factor: '0.45g', color: '#dc2626' },
+  // Zona 3 — 0.35g
+  'Cajamarca':    { zona: 3, factor: '0.35g', color: '#f97316' },
+  'San Martin':   { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Huancavelica': { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Junin':        { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Pasco':        { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Cusco':        { zona: 3, factor: '0.35g', color: '#f97316' },
+  // Zona 2 — 0.25g
+  'Amazonas':     { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Huanuco':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Ayacucho':     { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Apurimac':     { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Puno':         { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Ucayali':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  // Zona 1 — 0.10g
+  'Loreto':        { zona: 1, factor: '0.10g', color: '#059669' },
+  'Madre de Dios': { zona: 1, factor: '0.10g', color: '#059669' },
 }
 
 interface Props {

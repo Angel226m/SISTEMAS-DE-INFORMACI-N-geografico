@@ -42,6 +42,7 @@ export interface DistritoProps {
   fuente:                   string
   zona_sismica:             1 | 2 | 3 | 4 | null
   indice_riesgo_construccion: number | null  // 1.0–5.0 IRC CENEPRED
+  clasificacion_suelo:       'S1' | 'S2' | 'S3' | 'S4' | null  // NTE E.031-2020
 }
 
 export interface FallaProps {

@@ -8,7 +8,7 @@ import { useState, memo } from 'react'
 import {
   BarChart, Bar, AreaChart, Area, XAxis, YAxis,
   Tooltip, ResponsiveContainer, Cell, ReferenceLine,
-  CartesianGrid, RadialBarChart, RadialBar, PieChart, Pie,
+  CartesianGrid,
 } from 'recharts'
 import type { EstadisticaAnual, RiesgoConstruccionRanking } from '../types'
 
