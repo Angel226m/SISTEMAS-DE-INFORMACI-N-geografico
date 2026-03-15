@@ -1,25 +1,30 @@
-# ── GeoRiesgo Perú — requirements v4.0 ─────────────────────────
-# Sin GDAL/GeoPandas → imagen Docker ~6x más ligera
+# ══════════════════════════════════════════════════════════════════
+# GeoRiesgo Perú — requirements v8.0  (2025-03)
+# Sin GDAL/GeoPandas → imagen Docker ~6× más ligera
+# Compatible con ETL v8.0 (precipitaciones + eventos FEN)
+# ══════════════════════════════════════════════════════════════════
 
-# API Framework
-fastapi==0.115.6
-uvicorn[standard]==0.32.1
-pydantic==2.10.3
-python-multipart==0.0.18
+# ── API Framework ──────────────────────────────────────────────────
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+pydantic==2.11.3
+python-multipart==0.0.20
 
-# Base de datos async
-asyncpg==0.30.0
-psycopg2-binary==2.9.10
+# ── Base de datos async ────────────────────────────────────────────
+asyncpg==0.31.0            # async PostgreSQL driver
+psycopg2-binary==2.9.10    # sync driver para ETL + migrations
 
-# HTTP / Retries
+# ── HTTP / Retries ─────────────────────────────────────────────────
 requests==2.32.3
 httpx==0.28.1
-tenacity==9.0.0
+tenacity==9.1.4            # retry con jitter exponencial
 
-# Geometría ligera (sin GDAL)
-shapely==2.0.6
-pyproj==3.7.0
+# ── Geometría ligera (sin GDAL) ────────────────────────────────────
+shapely==2.1.2             # Shapely 2.x — make_valid(), thread-safe
+pyproj==3.7.0              # transformaciones CRS
 
-# Utilidades
-python-dotenv==1.0.1
-orjson==3.10.12         # JSON ultrarrápido para GeoJSON grandes
+# ── Serialización ultrarrápida ─────────────────────────────────────
+orjson==3.11.7             # JSON/GeoJSON responses 3-5× más rápido que stdlib
+
+# ── Utilidades ────────────────────────────────────────────────────
+python-dotenv==1.0.1       # .env support local/dev

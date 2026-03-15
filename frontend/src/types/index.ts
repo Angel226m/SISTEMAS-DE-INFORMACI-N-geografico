@@ -1,7 +1,10 @@
 // ══════════════════════════════════════════════════════════
-// GeoRiesgo Perú — Types v7.0
-// Alineado con backend v7.0: zona_sismica NTE E.030-2018,
-// IRC CENEPRED, fuente_tipo oficial/osm, poblacion INEI
+// GeoRiesgo Perú — Types v8.0
+// 🆕 ZonaPrecipitacionProps — 22 zonas climáticas SENAMHI/CHIRPS
+// 🆕 EventoFENData          — catálogo ENSO NOAA-CPC 1957-2024
+// 🆕 RiesgoLluvia           — índice pluvial + FEN para un punto
+// 🆕 FenEstadisticas        — distribución histórica por intensidad
+// ✅ CapasActivas            — añade `precipitaciones`
 // ══════════════════════════════════════════════════════════
 
 export interface SismoProps {
@@ -9,7 +12,7 @@ export interface SismoProps {
   magnitud:         number
   profundidad_km:   number
   tipo_profundidad: 'superficial' | 'intermedio' | 'profundo'
-  fecha:            string       // "YYYY-MM-DD"
+  fecha:            string
   hora_utc:         string | null
   lugar:            string
   region:           string | null
@@ -25,24 +28,24 @@ export interface DepartamentoProps {
   area_km2:     number | null
   capital:      string | null
   fuente:       string
-  zona_sismica: 1 | 2 | 3 | 4 | null  // NTE E.030-2018
-  factor_z:     number | null           // 0.10, 0.25, 0.35, 0.45
+  zona_sismica: 1 | 2 | 3 | 4 | null
+  factor_z:     number | null
   poblacion:    number | null
 }
 
 export interface DistritoProps {
-  id:                       number
-  ubigeo:                   string | null
-  nombre:                   string
-  provincia:                string
-  departamento:             string
-  nivel_riesgo:             1 | 2 | 3 | 4 | 5
-  poblacion:                number | null
-  area_km2:                 number | null
-  fuente:                   string
-  zona_sismica:             1 | 2 | 3 | 4 | null
-  indice_riesgo_construccion: number | null  // 1.0–5.0 IRC CENEPRED
-  clasificacion_suelo:       'S1' | 'S2' | 'S3' | 'S4' | null  // NTE E.031-2020
+  id:                        number
+  ubigeo:                    string | null
+  nombre:                    string
+  provincia:                 string
+  departamento:              string
+  nivel_riesgo:              1 | 2 | 3 | 4 | 5
+  poblacion:                 number | null
+  area_km2:                  number | null
+  fuente:                    string
+  zona_sismica:              1 | 2 | 3 | 4 | null
+  indice_riesgo_construccion: number | null
+  clasificacion_suelo:        'S1' | 'S2' | 'S3' | 'S4' | null
 }
 
 export interface FallaProps {
@@ -73,14 +76,14 @@ export interface ZonaInundableProps {
 }
 
 export interface TsunamiProps {
-  id:                 number
-  nombre:             string
-  nivel_riesgo:       number
-  altura_ola_m:       number | null
-  tiempo_arribo_min:  number | null
-  periodo_retorno:    number | null
-  region:             string | null
-  fuente:             string
+  id:                number
+  nombre:            string
+  nivel_riesgo:      number
+  altura_ola_m:      number | null
+  tiempo_arribo_min: number | null
+  periodo_retorno:   number | null
+  region:            string | null
+  fuente:            string
 }
 
 export interface DeslizamientoProps {
@@ -95,16 +98,16 @@ export interface DeslizamientoProps {
 }
 
 export interface InfraestructuraProps {
-  id:          number
-  osm_id:      number | null
-  nombre:      string
-  tipo:        string
-  criticidad:  number
-  estado:      string | null
-  region:      string | null
-  fuente:      string | null
-  fuente_tipo: 'oficial' | 'osm' | null   // v7.0
-  zona_sismica: 1 | 2 | 3 | 4 | null     // v7.0
+  id:           number
+  osm_id:       number | null
+  nombre:       string
+  tipo:         string
+  criticidad:   number
+  estado:       string | null
+  region:       string | null
+  fuente:       string | null
+  fuente_tipo:  'oficial' | 'osm' | null
+  zona_sismica: 1 | 2 | 3 | 4 | null
 }
 
 export interface EstacionProps {
@@ -117,6 +120,111 @@ export interface EstacionProps {
   institucion: string | null
   region:      string | null
 }
+
+// ── 🆕 v8.0: Precipitaciones ─────────────────────────────
+
+/** Tipo climático de zona de precipitación */
+export type TipoPrecipitacion =
+  | 'muy_alta' | 'alta' | 'moderada' | 'baja' | 'muy_baja'
+
+/** Propiedades de una zona pluviométrica (GeoJSON Feature) */
+export interface ZonaPrecipitacionProps {
+  id:                        number
+  nombre:                    string
+  tipo:                      TipoPrecipitacion
+  region:                    string | null
+  precipitacion_anual_mm:    number
+  precipitacion_dic_mar_mm:  number | null  // estación húmeda
+  precipitacion_jun_ago_mm:  number | null  // estación seca
+  /** Multiplicador de precipitación durante El Niño fuerte (1.0 = sin cambio) */
+  indice_fen:                number
+  /** Riesgo integrado lluvia→inundación 1-5 */
+  nivel_riesgo_inundacion:   1 | 2 | 3 | 4 | 5
+  descripcion_fen:           string   // "Amplificación catastrófica en FEN" etc.
+  color_riesgo:              string   // HEX sugerido para render
+  fuente:                    string
+}
+
+/** Zona de precipitación cercana a un punto (incluye distancia_km) */
+export interface ZonaPrecipitacionCercana extends Omit<ZonaPrecipitacionProps, 'descripcion_fen' | 'color_riesgo'> {
+  distancia_km: number
+}
+
+// ── 🆕 v8.0: Eventos FEN ─────────────────────────────────
+
+export type TipoFEN     = 'el_nino' | 'la_nina' | 'neutro'
+export type IntensidadFEN = 'debil' | 'moderado' | 'fuerte' | 'extraordinario'
+
+/** Evento ENSO histórico (NOAA-CPC ONI) */
+export interface EventoFENData {
+  id:              number
+  año_inicio:      number
+  mes_inicio:      number
+  año_fin:         number
+  mes_fin:         number
+  tipo:            TipoFEN
+  intensidad:      IntensidadFEN | null
+  oni_peak:        number | null   // anomalía SST °C en peak
+  impacto_peru:    string | null
+  fuente:          string
+  duracion_meses:  number | null
+}
+
+export interface FenDistribucion {
+  tipo:                  TipoFEN
+  intensidad:            IntensidadFEN | null
+  cantidad:              number
+  oni_prom:              number | null
+  oni_max:               number | null
+  duracion_prom_meses:   number | null
+}
+
+export interface FenDecadal {
+  decada:   number
+  el_nino:  number
+  la_nina:  number
+  intensos: number
+}
+
+export interface FenEstadisticas {
+  distribucion_tipo_intensidad: FenDistribucion[]
+  frecuencia_decadal:           FenDecadal[]
+  eventos_mas_intensos:         EventoFENData[]
+  nota_metodologica:            string
+}
+
+// ── 🆕 v8.0: Riesgo Lluvia ───────────────────────────────
+
+export interface RiesgoLluviaInundacion {
+  nombre:           string
+  nivel_riesgo:     number
+  tipo_inundacion:  string
+  periodo_retorno:  number | null
+}
+
+/** Respuesta del endpoint /api/v1/riesgo/lluvia */
+export interface RiesgoLluvia {
+  punto:               { lon: number; lat: number }
+  zona_climatica:      ZonaPrecipitacionCercana | null
+  inundaciones:        RiesgoLluviaInundacion[]
+  deslizamientos_20km: number
+  fen_reciente: {
+    año:        number
+    tipo:       TipoFEN
+    intensidad: IntensidadFEN
+    oni_peak:   number
+    impacto:    string
+  } | null
+  indice_pluvial: number   // 1.0-5.0
+  nivel_riesgo:   string   // MUY BAJO / BAJO / MEDIO / ALTO / MUY ALTO
+  metodologia: {
+    formula: string
+    escala:  string
+    nota:    string
+  }
+}
+
+// ── Existentes v7.x ──────────────────────────────────────
 
 export interface EstadisticaAnual {
   anio:          number
@@ -143,26 +251,22 @@ export interface SismoDetalle extends SismoProps {
   lat:  number
 }
 
-// ── v7.0: Zonas Sísmicas NTE E.030-2018 ─────────────────────
-
 export interface ZonaSismicaInfo {
-  zona:              number        // 1–4
-  factor_z:          number        // 0.10 / 0.25 / 0.35 / 0.45
-  descripcion:       string        // "Muy alto riesgo sísmico"
+  zona:              number
+  factor_z:          number
+  descripcion:       string
   departamentos:     string[]
   sismos_historicos: number
   magnitud_max:      number | null
   sismicidad_nivel:  string
 }
 
-// ── v7.0: Riesgo de Construcción IRC CENEPRED ────────────────
-
 export interface RiesgoConstruccionPunto {
   lon:             number
   lat:             number
   zona_sismica:    number | null
   factor_z:        number | null
-  indice:          number          // 1.0–5.0
+  indice:          number
   nivel_txt:       string
   peligros: {
     sismico:       number
@@ -172,7 +276,7 @@ export interface RiesgoConstruccionPunto {
     fallas:        number
   }
   recomendaciones: string[]
-  norma:           string          // "NTE E.030-2018"
+  norma:           string
 }
 
 export interface RiesgoConstruccionRanking {
@@ -188,11 +292,11 @@ export interface RiesgoConstruccionRanking {
 }
 
 export interface CoberturaTipo {
-  tipo:         string
-  total:        number
-  oficial:      number
-  osm:          number
-  pct_oficial:  number
+  tipo:        string
+  total:       number
+  oficial:     number
+  osm:         number
+  pct_oficial: number
 }
 
 export interface PoblacionZona {
@@ -204,15 +308,12 @@ export interface PoblacionZona {
   pct_poblacion: number
 }
 
-// ── v6.0 (mantenido) ────────────────────────────────────────
-
-/** Resultado del endpoint GET /api/v1/riesgo?lon=&lat= */
 export interface RiesgoInfo {
-  lon:          number
-  lat:          number
-  region:       string | null
-  distrito:     string | null
-  nivel_riesgo: number
+  lon:                   number
+  lat:                   number
+  region:                string | null
+  distrito:              string | null
+  nivel_riesgo:          number
   score_sismico:         number
   score_fallas:          number
   score_inundacion:      number
@@ -223,12 +324,10 @@ export interface RiesgoInfo {
   falla_mas_cercana:     string | null
   dist_falla_km:         number | null
   infraestructura_cercana: number
-  fuente:       string
-  // v7.0: objeto IRC
-  riesgo_construccion?: RiesgoConstruccionPunto | null
+  fuente:                string
+  riesgo_construccion?:  RiesgoConstruccionPunto | null
 }
 
-/** Fila del endpoint GET /api/v1/diagnostico/regiones */
 export interface DiagnosticoLayer {
   tabla:         string
   total:         number
@@ -238,7 +337,7 @@ export interface DiagnosticoLayer {
   via_knn:       number
 }
 
-// ── Filtros y estado ─────────────────────────────────────────
+// ── Filtros y estado ─────────────────────────────────────
 
 export interface FiltrosSismos {
   mag_min:      number
@@ -249,21 +348,30 @@ export interface FiltrosSismos {
   region?:      string | undefined
 }
 
+/** Filtros para la capa de precipitaciones */
+export interface FiltrosPrecipitacion {
+  tipo?:                 TipoPrecipitacion | undefined
+  riesgo_inund_min:      number
+  fen_min?:              number | undefined
+}
+
 export type FuenteTipo = 'todos' | 'oficial' | 'osm'
 
 export interface CapasActivas {
-  sismos:             boolean
-  heatmap:            boolean
-  departamentos:      boolean
-  fallas:             boolean
-  inundaciones:       boolean
-  tsunamis:           boolean
-  deslizamientos:     boolean
-  riesgo_distritos:   boolean
-  infraestructura:    boolean
-  estaciones:         boolean
-  riesgo_construccion:boolean   // v7.0 IRC mapa
-  extrusion_3d:       boolean
+  sismos:              boolean
+  heatmap:             boolean
+  departamentos:       boolean
+  fallas:              boolean
+  inundaciones:        boolean
+  tsunamis:            boolean
+  deslizamientos:      boolean
+  riesgo_distritos:    boolean
+  infraestructura:     boolean
+  estaciones:          boolean
+  riesgo_construccion: boolean
+  /** 🆕 v8.0: zonas climáticas coloreadas por indice_fen */
+  precipitaciones:     boolean
+  extrusion_3d:        boolean
 }
 
 export type TipoVista = '2d' | '3d'

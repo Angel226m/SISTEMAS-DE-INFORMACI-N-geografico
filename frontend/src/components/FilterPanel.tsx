@@ -1,27 +1,24 @@
 // ══════════════════════════════════════════════════════════
-// FilterPanel.tsx v6.0
-// Mejoras v6.0:
-// - Filtro fuente_tipo (Oficial / OSM) para infraestructura
-// - Badge zona sísmica calculada desde region
-// - Resumen activo mejorado con IRC context
-// - GPU filter badge mantiene latencia cero para mag/año
+// FilterPanel.tsx v8.0
+// 🆕 Sección FEN/Precipitación: tipo climático + indice_fen
+// 🆕 Badge FEN contextual al seleccionar región
+// ✅ Todos los filtros v7.x mantenidos
 // ══════════════════════════════════════════════════════════
 
 import { useState, useEffect } from 'react'
-import type { FiltrosSismos, FuenteTipo } from '../types'
+import type { FiltrosSismos, FuenteTipo, FiltrosPrecipitacion, TipoPrecipitacion } from '../types'
 
 const C = {
   text: '#0f172a', textSec: '#475569', textMuted: '#94a3b8',
   border: '#e2e8f0', bgSoft: '#f8fafc', bgMuted: '#f1f5f9',
   primary: '#059669', danger: '#dc2626', warning: '#f59e0b',
-  amber: '#f59e0b', orange: '#f97316',
+  amber: '#f59e0b', orange: '#f97316', teal: '#0891b2', cyan: '#06b6d4',
 }
 
-function Slider({ label, value, min, max, step, color, unit, format, onChange, onCommit }: {
+function Slider({ label, value, min, max, step, color, unit, format, onChange }: {
   label: string; value: number; min: number; max: number; step: number
   color: string; unit?: string; format?: (v: number) => string
   onChange: (v: number) => void
-  onCommit?: (v: number) => void
 }) {
   const pct     = ((value - min) / (max - min)) * 100
   const display = format ? format(value) : `${value}${unit ?? ''}`
@@ -34,8 +31,6 @@ function Slider({ label, value, min, max, step, color, unit, format, onChange, o
       <input
         type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(Number(e.target.value))}
-        onMouseUp={e => onCommit?.(Number((e.target as HTMLInputElement).value))}
-        onTouchEnd={e => onCommit?.(Number((e.target as HTMLInputElement).value))}
         style={{
           width: '100%', height: 5, borderRadius: 3,
           appearance: 'none', outline: 'none', cursor: 'pointer',
@@ -77,72 +72,97 @@ const RICHTER = [
 ]
 
 const PROF_OPTS = [
-  { value: undefined              as FiltrosSismos['profundidad'], label: 'Todos',       color: C.textMuted },
-  { value: 'superficial' as const,                                  label: 'Superficial', color: '#dc2626'   },
-  { value: 'intermedio'  as const,                                  label: 'Intermedio',  color: '#f97316'   },
-  { value: 'profundo'    as const,                                  label: 'Profundo',    color: '#0ea5e9'   },
+  { value: undefined as FiltrosSismos['profundidad'], label: 'Todos',       color: C.textMuted },
+  { value: 'superficial' as const,                    label: 'Superficial', color: '#dc2626'   },
+  { value: 'intermedio'  as const,                    label: 'Intermedio',  color: '#f97316'   },
+  { value: 'profundo'    as const,                    label: 'Profundo',    color: '#0ea5e9'   },
 ]
 
 const REGIONES = [
-  // Zona 4 — Costa (muy alto)
-  'Tumbes', 'Piura', 'Lambayeque', 'La Libertad', 'Ancash',
-  'Lima', 'Callao', 'Ica', 'Arequipa', 'Moquegua', 'Tacna',
-  // Zona 3 — Sierra/Selva norte-central (alto)
-  'Cajamarca', 'San Martin', 'Huancavelica', 'Junin', 'Pasco',
-  'Cusco',
-  // Zona 2 — Sierra norte / Selva central (medio)
-  'Amazonas', 'Huanuco', 'Ayacucho', 'Apurimac', 'Puno', 'Ucayali',
-  // Zona 1 — Amazonia (bajo)
-  'Loreto', 'Madre de Dios',
+  'Tumbes','Piura','Lambayeque','La Libertad','Ancash',
+  'Lima','Callao','Ica','Arequipa','Moquegua','Tacna',
+  'Cajamarca','San Martin','Huancavelica','Junin','Pasco','Cusco',
+  'Amazonas','Huanuco','Ayacucho','Apurimac','Puno','Ucayali',
+  'Loreto','Madre de Dios',
 ]
 
-// Zona sísmica completa por departamento (NTE E.030-2018) — v7.5
 const ZONA_REGION: Record<string, { zona: number; factor: string; color: string }> = {
-  // Zona 4 — 0.45g
-  'Tumbes':       { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Piura':        { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Lambayeque':   { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'La Libertad':  { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Ancash':       { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Lima':         { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Callao':       { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Ica':          { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Arequipa':     { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Moquegua':     { zona: 4, factor: '0.45g', color: '#dc2626' },
-  'Tacna':        { zona: 4, factor: '0.45g', color: '#dc2626' },
-  // Zona 3 — 0.35g
-  'Cajamarca':    { zona: 3, factor: '0.35g', color: '#f97316' },
-  'San Martin':   { zona: 3, factor: '0.35g', color: '#f97316' },
-  'Huancavelica': { zona: 3, factor: '0.35g', color: '#f97316' },
-  'Junin':        { zona: 3, factor: '0.35g', color: '#f97316' },
-  'Pasco':        { zona: 3, factor: '0.35g', color: '#f97316' },
-  'Cusco':        { zona: 3, factor: '0.35g', color: '#f97316' },
-  // Zona 2 — 0.25g
-  'Amazonas':     { zona: 2, factor: '0.25g', color: '#f59e0b' },
-  'Huanuco':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
-  'Ayacucho':     { zona: 2, factor: '0.25g', color: '#f59e0b' },
-  'Apurimac':     { zona: 2, factor: '0.25g', color: '#f59e0b' },
-  'Puno':         { zona: 2, factor: '0.25g', color: '#f59e0b' },
-  'Ucayali':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
-  // Zona 1 — 0.10g
+  'Tumbes':        { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Piura':         { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Lambayeque':    { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'La Libertad':   { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Ancash':        { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Lima':          { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Callao':        { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Ica':           { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Arequipa':      { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Moquegua':      { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Tacna':         { zona: 4, factor: '0.45g', color: '#dc2626' },
+  'Cajamarca':     { zona: 3, factor: '0.35g', color: '#f97316' },
+  'San Martin':    { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Huancavelica':  { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Junin':         { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Pasco':         { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Cusco':         { zona: 3, factor: '0.35g', color: '#f97316' },
+  'Amazonas':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Huanuco':       { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Ayacucho':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Apurimac':      { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Puno':          { zona: 2, factor: '0.25g', color: '#f59e0b' },
+  'Ucayali':       { zona: 2, factor: '0.25g', color: '#f59e0b' },
   'Loreto':        { zona: 1, factor: '0.10g', color: '#059669' },
   'Madre de Dios': { zona: 1, factor: '0.10g', color: '#059669' },
 }
 
-interface Props {
-  filtros: FiltrosSismos
-  onChange: (f: FiltrosSismos) => void
-  fuenteTipo?: FuenteTipo
-  onFuenteTipoChange?: (ft: FuenteTipo) => void
+// 🆕 v8.0: índice FEN contextual por región (aproximación)
+const FEN_REGION: Record<string, { indice: number; desc: string; color: string }> = {
+  'Piura':        { indice: 4.5, desc: 'Catastrófico en FEN', color: '#dc2626' },
+  'Tumbes':       { indice: 4.2, desc: 'Catastrófico en FEN', color: '#dc2626' },
+  'Lambayeque':   { indice: 3.2, desc: 'Amplificación alta',  color: '#f97316' },
+  'La Libertad':  { indice: 2.8, desc: 'Amplificación alta',  color: '#f97316' },
+  'Lima':         { indice: 2.0, desc: 'Amplificación mod.',  color: '#f59e0b' },
+  'Ancash':       { indice: 1.4, desc: 'Amplificación mod.',  color: '#f59e0b' },
+  'Ica':          { indice: 1.8, desc: 'Amplificación mod.',  color: '#f59e0b' },
+  'Arequipa':     { indice: 1.6, desc: 'Amplificación mod.',  color: '#f59e0b' },
+  'Puno':         { indice: 0.7, desc: 'Sequía en FEN',       color: '#059669' },
+  'Cusco':        { indice: 0.8, desc: 'Reducción en FEN',    color: '#059669' },
+  'Loreto':       { indice: 1.0, desc: 'Sin cambio',          color: '#94a3b8' },
+  'Madre de Dios':{ indice: 0.95,desc: 'Sin cambio',          color: '#94a3b8' },
 }
 
-export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', onFuenteTipoChange }: Props) {
+const TIPO_PRECIP_OPTS: { value: TipoPrecipitacion | undefined; label: string; color: string }[] = [
+  { value: undefined,     label: 'Todos',    color: C.textMuted },
+  { value: 'muy_alta',    label: 'Muy alta', color: '#0ea5e9'  },
+  { value: 'alta',        label: 'Alta',     color: '#38bdf8'  },
+  { value: 'moderada',    label: 'Moderada', color: '#7dd3fc'  },
+  { value: 'baja',        label: 'Baja',     color: '#f59e0b'  },
+  { value: 'muy_baja',    label: 'Muy baja', color: '#f97316'  },
+]
+
+interface Props {
+  filtros:                FiltrosSismos
+  onChange:               (f: FiltrosSismos) => void
+  fuenteTipo?:            FuenteTipo
+  onFuenteTipoChange?:    (ft: FuenteTipo) => void
+  filtrosPrecip?:         FiltrosPrecipitacion
+  onFiltrosPrecipChange?: (f: FiltrosPrecipitacion) => void
+}
+
+export default function FilterPanel({
+  filtros, onChange,
+  fuenteTipo = 'todos', onFuenteTipoChange,
+  filtrosPrecip, onFiltrosPrecipChange,
+}: Props) {
   const [local, setLocal] = useState(filtros)
+  const [localPrecip, setLocalPrecip] = useState<FiltrosPrecipitacion>(
+    filtrosPrecip ?? { riesgo_inund_min: 1 }
+  )
   useEffect(() => { setLocal(filtros) }, [filtros])
 
-  const apply = (f: FiltrosSismos) => {
-    setLocal(f)
-    onChange(f)
+  const apply = (f: FiltrosSismos) => { setLocal(f); onChange(f) }
+  const applyPrecip = (f: FiltrosPrecipitacion) => {
+    setLocalPrecip(f)
+    onFiltrosPrecipChange?.(f)
   }
 
   const divider = <div style={{ height: 1, background: C.border, margin: '6px 0 16px' }} />
@@ -151,6 +171,7 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
   const wPct    = (años / (2030 - 1900)) * 100
 
   const zonaInfo = local.region ? ZONA_REGION[local.region] : null
+  const fenInfo  = local.region ? FEN_REGION[local.region]  : null
 
   return (
     <div>
@@ -184,7 +205,7 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
 
       {divider}
 
-      {/* Profundidad — server-side */}
+      {/* Profundidad */}
       <div style={{ marginBottom: 16 }}>
         <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textMuted, marginBottom: 6 }}>
           Tipo de profundidad
@@ -205,7 +226,7 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
 
       {divider}
 
-      {/* Región — server-side */}
+      {/* Región */}
       <div style={{ marginBottom: 16 }}>
         <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textMuted, marginBottom: 6 }}>
           Región / Departamento
@@ -226,7 +247,7 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
           ))}
         </div>
 
-        {/* Zona sísmica de la región seleccionada */}
+        {/* Badge zona sísmica */}
         {zonaInfo && (
           <div style={{
             marginTop: 10, padding: '8px 10px',
@@ -248,11 +269,83 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
             </div>
           </div>
         )}
+
+        {/* 🆕 v8.0: Badge FEN contextual */}
+        {fenInfo && (
+          <div style={{
+            marginTop: 6, padding: '7px 10px',
+            background: fenInfo.color + '08',
+            border: `1px solid ${fenInfo.color}25`,
+            borderLeft: `3px solid ${fenInfo.color}`,
+            borderRadius: 8,
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10.5, color: C.textSec }}>
+                Índice FEN (lluvia en El Niño)
+              </span>
+              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, fontWeight: 800, color: fenInfo.color }}>
+                ×{fenInfo.indice.toFixed(1)}
+              </span>
+            </div>
+            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: fenInfo.color, marginTop: 2 }}>
+              {fenInfo.desc} · SENAMHI/CHIRPS 2024
+            </div>
+          </div>
+        )}
       </div>
 
       {divider}
 
-      {/* Fuente infraestructura — v7.0 */}
+      {/* 🆕 v8.0: Filtros Precipitación */}
+      {onFiltrosPrecipChange && (
+        <>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: C.textMuted }}>
+                Precipitaciones
+              </span>
+              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 700, color: C.teal, background: '#ecfeff', border: '1px solid #a5f3fc', padding: '1px 4px', borderRadius: 3 }}>
+                v8.0
+              </span>
+            </div>
+
+            {/* Tipo climático */}
+            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, marginBottom: 5 }}>
+              Tipo climático
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
+              {TIPO_PRECIP_OPTS.map(({ value, label, color }) => (
+                <Chip key={label} label={label} active={localPrecip.tipo === value}
+                  color={color}
+                  onClick={() => applyPrecip({ ...localPrecip, tipo: value })} />
+              ))}
+            </div>
+
+            {/* Riesgo inundación mínimo */}
+            <Slider
+              label="Riesgo inundación mín."
+              value={localPrecip.riesgo_inund_min}
+              min={1} max={5} step={1}
+              color={C.teal}
+              format={v => ['Muy bajo','Bajo','Moderado','Alto','Muy alto'][v-1] ?? String(v)}
+              onChange={v => applyPrecip({ ...localPrecip, riesgo_inund_min: v })}
+            />
+
+            {/* Índice FEN mínimo */}
+            <Slider
+              label="Índice FEN mínimo"
+              value={localPrecip.fen_min ?? 0}
+              min={0} max={4.5} step={0.5}
+              color={C.orange}
+              format={v => v === 0 ? 'Sin filtro' : `×${v.toFixed(1)}`}
+              onChange={v => applyPrecip({ ...localPrecip, fen_min: v === 0 ? undefined : v })}
+            />
+          </div>
+          {divider}
+        </>
+      )}
+
+      {/* Fuente infraestructura */}
       {onFuenteTipoChange && (
         <>
           <div style={{ marginBottom: 16 }}>
@@ -261,9 +354,9 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
             </div>
             <div style={{ display: 'flex', gap: 4 }}>
               {([
-                { value: 'todos', label: 'Todos', color: C.textMuted },
-                { value: 'oficial', label: 'Oficial', color: C.primary },
-                { value: 'osm', label: 'OSM', color: '#6366f1' },
+                { value: 'todos',   label: 'Todos',   color: C.textMuted },
+                { value: 'oficial', label: 'Oficial', color: C.primary   },
+                { value: 'osm',     label: 'OSM',     color: '#6366f1'   },
               ] as { value: FuenteTipo; label: string; color: string }[]).map(({ value, label, color }) => (
                 <Chip key={value} label={label} active={fuenteTipo === value}
                   color={color} onClick={() => onFuenteTipoChange(value)} />
@@ -274,7 +367,7 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
         </>
       )}
 
-      {/* Resumen visual */}
+      {/* Resumen activo */}
       <div style={{ background: C.bgSoft, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
         <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: 10 }}>
           Rango activo
@@ -317,8 +410,7 @@ export default function FilterPanel({ filtros, onChange, fuenteTipo = 'todos', o
         <button
           onClick={() => {
             const reset: FiltrosSismos = { mag_min: 3.0, mag_max: 9.5, year_start: 1960, year_end: 2030 }
-            setLocal(reset)
-            onChange(reset)
+            setLocal(reset); onChange(reset)
           }}
           style={{
             marginTop: 12, width: '100%', padding: '6px 0',

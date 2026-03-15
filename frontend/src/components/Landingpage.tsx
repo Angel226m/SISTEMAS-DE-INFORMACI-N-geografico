@@ -1,7 +1,9 @@
 // ══════════════════════════════════════════════════════════
-// LandingPage.tsx — GeoRiesgo Perú v6.0
-// Actualizado: nuevos endpoints v6.0 (riesgo, diagnostico/regiones)
-// DataFilterExtension destacado, backend v6.0
+// LandingPage.tsx — GeoRiesgo Perú v8.0
+// 🆕 Features: Precipitaciones (SENAMHI/CHIRPS) + FEN NOAA
+// 🆕 Endpoints: /precipitaciones, /fen, /riesgo/lluvia
+// 🆕 Fuentes: SENAMHI, CHIRPS, NOAA-CPC, ENFEN
+// 🆕 Tech: IRC×FEN, peligro_inundacion amplificado
 // ══════════════════════════════════════════════════════════
 import { useEffect, useRef, useState, useCallback } from 'react'
 
@@ -10,65 +12,67 @@ const C = {
   primary:   '#059669', primaryLt: '#10b981', primaryGlow: 'rgba(5,150,105,0.10)',
   secondary: '#0ea5e9', accent: '#0891b2',
   amber:     '#f59e0b', violet: '#7c3aed',
-  brown:     '#92400e',
+  brown:     '#92400e', teal: '#0891b2',
   text:      '#0f172a', textSec: '#334155', textMuted: '#64748b',
   border:    '#e2e8f0',
 }
 
 const STATS = [
-  { value: '+2.5M', label: 'sismos catalogados',       sub: 'desde 1900',       color: C.primary   },
-  { value: '9.5',   label: 'magnitud máx registrada',  sub: 'escala USGS',      color: C.secondary },
-  { value: '32',    label: 'fallas geológicas',         sub: 'INGEMMET/IGP',    color: C.amber     },
-  { value: '25',    label: 'departamentos cubiertos',   sub: 'cobertura Perú',  color: C.accent    },
+  { value: '+2.5M', label: 'sismos catalogados',      sub: 'desde 1900',       color: C.primary   },
+  { value: '9.5',   label: 'magnitud máx registrada', sub: 'escala USGS',      color: C.secondary },
+  { value: '22',    label: 'zonas climáticas',         sub: 'SENAMHI/CHIRPS',  color: C.teal      },
+  { value: '25',    label: 'departamentos cubiertos',  sub: 'cobertura Perú',  color: C.accent    },
 ]
 
 const FEATURES = [
-  { icon: '◉', title: 'Mapa Sísmico Nacional',          color: C.primary,   border: '#a7f3d0', bg: 'linear-gradient(135deg,#f0fdf4,#ecfdf5)', desc: 'Catálogo USGS con +2.5M eventos desde 1900. Filtros GPU en tiempo real vía DataFilterExtension (deck.gl). Heatmap de densidad y ScatterplotLayer con profundidad.' },
-  { icon: '▦', title: 'Departamentos & Distritos',       color: '#7c3aed',   border: '#c4b5fd', bg: 'linear-gradient(135deg,#faf5ff,#f5f3ff)', desc: '25 departamentos con índice de riesgo departamental. 1,874 distritos con score compuesto: sismicidad histórica, fallas activas y vulnerabilidad INEI.' },
-  { icon: '≋', title: 'Zonas Tsunami & Inundación',      color: '#06b6d4',   border: '#a5f3fc', bg: 'linear-gradient(135deg,#ecfeff,#f0fdfa)', desc: 'Zonas de inundación ANA/CENEPRED y mapas tsunami PREDES/IGP. Altura de ola estimada, tiempo de arribo y períodos de retorno.' },
-  { icon: '◤', title: 'Deslizamientos & Huaycos',        color: C.brown,     border: '#fcd34d', bg: 'linear-gradient(135deg,#fffbeb,#fef3c7)', desc: 'Zonas de deslizamiento, huaycos, derrumbes y flujos detríticos CENEPRED/INGEMMET. Clasificación por tipo y nivel de actividad.' },
-  { icon: '⌗', title: 'Fallas Geológicas',               color: C.amber,     border: '#fde68a', bg: 'linear-gradient(135deg,#fffbeb,#fef3c7)', desc: '32 fallas neotectónicas verificadas: Subducción Nazca, Sistema Lima, Cordillera Blanca, Cusco-Vilcanota. Coordenadas Audin et al. 2008.' },
-  { icon: '⊕', title: 'Infraestructura Crítica',         color: '#6366f1',   border: '#c7d2fe', bg: 'linear-gradient(135deg,#eef2ff,#ede9fe)', desc: 'Hospitales, escuelas, aeropuertos, puertos, estaciones de poder y plantas de agua. Cobertura OSM + instalaciones verificadas.' },
-  { icon: '◎', title: 'Estaciones de Monitoreo',         color: '#10b981',   border: '#a7f3d0', bg: 'linear-gradient(135deg,#f0fdf4,#ecfeff)', desc: 'Red sísmica IGP nacional, estaciones SENAMHI y puntos hidrométricos ANA. Altitud, institución y estado operativo.' },
+  { icon: '◉', title: 'Mapa Sísmico Nacional',          color: C.primary,  border: '#a7f3d0', bg: 'linear-gradient(135deg,#f0fdf4,#ecfdf5)', desc: 'Catálogo USGS con +2.5M eventos desde 1900. Filtros GPU en tiempo real vía DataFilterExtension (deck.gl). Heatmap de densidad y ScatterplotLayer con profundidad.' },
+  { icon: '◈', title: 'Precipitaciones & FEN',          color: C.teal,     border: '#a5f3fc', bg: 'linear-gradient(135deg,#ecfeff,#f0fdfa)', desc: '22 zonas climáticas SENAMHI/CHIRPS 1981-2020. Índice FEN: multiplicador de precipitación durante El Niño. Costa norte Piura/Tumbes: ×4.5 durante FEN extraordinario.' },
+  { icon: '🌡', title: 'Catálogo ENSO Histórico',       color: '#f97316',  border: '#fed7aa', bg: 'linear-gradient(135deg,#fff7ed,#fef3c7)', desc: '23 eventos El Niño/La Niña 1957-2024 (NOAA-CPC ONI + ENFEN). Incluye los extraordinarios 1982/83 (ONI=2.2) y 1997/98 (ONI=2.4 — USD 3.5B en daños en Perú).' },
+  { icon: '▦', title: 'Departamentos & Distritos',      color: '#7c3aed',  border: '#c4b5fd', bg: 'linear-gradient(135deg,#faf5ff,#f5f3ff)', desc: '25 departamentos con zona sísmica NTE E.030-2018. 1,874 distritos con IRC amplificado por índice FEN (PI×FEN en mv_riesgo_construccion v8.0).' },
+  { icon: '⬡', title: 'IRC — Riesgo de Construcción',  color: C.amber,    border: '#fde68a', bg: 'linear-gradient(135deg,#fffbeb,#fef3c7)', desc: 'Índice CENEPRED 2014 + NTE E.030-2018 v8.0: 0.40×PS + 0.25×PI×FEN + 0.20×PD + 0.10×PT + 0.05×PF. El componente FEN amplifica el peligro inundación en zonas costeras.' },
+  { icon: '≋', title: 'Zonas Tsunami & Inundación',    color: '#06b6d4',  border: '#a5f3fc', bg: 'linear-gradient(135deg,#ecfeff,#f0fdfa)', desc: 'Zonas de inundación ANA/CENEPRED y mapas tsunami PREDES/IGP. Altura de ola, tiempo de arribo y períodos de retorno. Integración FEN para variación estacional.' },
+  { icon: '◤', title: 'Deslizamientos & Huaycos',      color: C.brown,    border: '#fcd34d', bg: 'linear-gradient(135deg,#fffbeb,#fef3c7)', desc: 'Zonas CENEPRED/INGEMMET. Clasificación por tipo y actividad. Correlación con precipitaciones extremas FEN para cálculo de riesgo compuesto.' },
+  { icon: '⊕', title: 'Infraestructura Crítica',       color: '#6366f1',  border: '#c7d2fe', bg: 'linear-gradient(135deg,#eef2ff,#ede9fe)', desc: 'Hospitales, escuelas, aeropuertos, puertos, centrales eléctricas. Fuente oficial (MINSA/MINEDU/MTC) distinguida de OSM. Zona sísmica asignada por punto.' },
 ]
 
 const ENDPOINTS = [
-  { method: 'GET', color: C.primary,   path: '/api/v1/sismos',                   desc: 'Catálogo sísmico — carga amplia (mag≥2.5) para filtrado GPU DataFilterExtension' },
-  { method: 'GET', color: C.secondary, path: '/api/v1/sismos/heatmap',           desc: 'Grid de densidad pre-calculado — vista materializada PostGIS < 40ms' },
-  { method: 'GET', color: '#7c3aed',   path: '/api/v1/departamentos',            desc: '25 departamentos con índice de riesgo y simplificación zoom-adaptativa' },
-  { method: 'GET', color: C.accent,    path: '/api/v1/fallas',                   desc: '32 fallas con tipo, mecanismo, magnitud máx y referencia científica' },
-  { method: 'GET', color: '#0284c7',   path: '/api/v1/inundaciones',             desc: 'Zonas ANA/CENEPRED con profundidad máx, cuenca y período retorno' },
-  { method: 'GET', color: '#0e7490',   path: '/api/v1/tsunamis',                 desc: 'Zonas costeras con altura ola, tiempo arribo y nivel de riesgo' },
-  { method: 'GET', color: C.brown,     path: '/api/v1/deslizamientos',           desc: 'Deslizamientos, huaycos y derrumbes CENEPRED/INGEMMET' },
-  { method: 'GET', color: C.amber,     path: '/api/v1/sismos/estadisticas',      desc: 'Estadísticas anuales M5+, M6+, M7+ desde vistas materializadas' },
-  { method: 'GET', color: '#6366f1',   path: '/api/v1/infraestructura',          desc: 'Infraestructura crítica con filtros por tipo, criticidad y región' },
-  { method: 'GET', color: '#10b981',   path: '/api/v1/estaciones',              desc: 'Estaciones sísmicas, meteorológicas e hidrométricas activas' },
-  { method: 'GET', color: C.primary,   path: '/api/v1/riesgo',                  desc: 'NUEVO v6.0 — f_riesgo_punto(lon,lat): score compuesto de riesgo para cualquier coordenada' },
-  { method: 'GET', color: C.secondary, path: '/api/v1/diagnostico/regiones',    desc: 'NUEVO v6.0 — Cobertura espacial por tabla: % con región asignada via ST_Covers + KNN' },
+  { method: 'GET', color: C.primary,   path: '/api/v1/sismos',                       desc: 'Catálogo sísmico — GPU DataFilterExtension (mag, año, prof)' },
+  { method: 'GET', color: C.secondary, path: '/api/v1/sismos/heatmap',               desc: 'Grid de densidad — vista materializada < 40ms' },
+  { method: 'GET', color: C.teal,      path: '/api/v1/precipitaciones',              desc: '22 zonas climáticas GeoJSON — coloreadas por indice_fen' },
+  { method: 'GET', color: C.teal,      path: '/api/v1/precipitaciones/cercanas',     desc: 'Zonas pluviométricas en radio KNN de un punto' },
+  { method: 'GET', color: '#f97316',   path: '/api/v1/fen',                          desc: 'Catálogo ENSO histórico (1957-2024) — NOAA-CPC ONI' },
+  { method: 'GET', color: '#f97316',   path: '/api/v1/fen/estadisticas',             desc: 'Distribución por intensidad + frecuencia decadal' },
+  { method: 'GET', color: C.amber,     path: '/api/v1/riesgo/lluvia',                desc: 'Índice pluvial compuesto: zona + FEN + inundación + desliz.' },
+  { method: 'GET', color: '#7c3aed',   path: '/api/v1/departamentos',                desc: '25 departamentos con zona sísmica NTE E.030-2018' },
+  { method: 'GET', color: C.primary,   path: '/api/v1/riesgo/construccion/ranking',  desc: 'Top distritos por IRC v8.0 (con amplificación FEN)' },
+  { method: 'GET', color: C.secondary, path: '/api/v1/riesgo/construccion/mapa',     desc: 'GeoJSON distritos coloreados por IRC v8.0' },
+  { method: 'GET', color: C.primary,   path: '/api/v1/riesgo',                       desc: 'f_riesgo_punto() — incluye zona climática + FEN reciente' },
+  { method: 'GET', color: C.accent,    path: '/api/v1/fallas',                       desc: '19 fallas activas con tipo, mecanismo y magnitud máx' },
+  { method: 'GET', color: '#0284c7',   path: '/api/v1/inundaciones',                 desc: 'Zonas ANA/CENEPRED con profundidad máx y período retorno' },
+  { method: 'GET', color: '#6366f1',   path: '/api/v1/infraestructura/cobertura',    desc: 'Diagnóstico oficial vs OSM por tipo y zona sísmica' },
 ]
 
 const FUENTES = [
-  { name: 'USGS',     desc: 'Catálogo sísmico global',   color: C.primary   },
-  { name: 'IGP',      desc: 'Red sísmica nacional',      color: C.secondary },
-  { name: 'INGEMMET', desc: 'Fallas neotectónicas',      color: C.amber     },
-  { name: 'INEI',     desc: 'Límites distritales',       color: C.accent    },
-  { name: 'GADM 4.1', desc: 'Fronteras departamentales', color: '#7c3aed'   },
-  { name: 'ANA',      desc: 'Zonas inundables',          color: '#0284c7'   },
-  { name: 'CENEPRED', desc: 'Riesgo de desastres',       color: '#0e7490'   },
-  { name: 'PREDES',   desc: 'Tsunamis costeros',         color: '#7c3aed'   },
-  { name: 'SENAMHI',  desc: 'Estaciones meteorológicas', color: '#f97316'   },
-  { name: 'OSM',      desc: 'Infraestructura crítica',   color: '#10b981'   },
+  { name: 'USGS',      desc: 'Catálogo sísmico global',     color: C.primary   },
+  { name: 'IGP',       desc: 'Red sísmica nacional',        color: C.secondary },
+  { name: 'SENAMHI',   desc: 'Atlas climático 22 zonas',    color: C.teal      },
+  { name: 'CHIRPS v2', desc: 'Climatología 1981-2020',      color: '#38bdf8'   },
+  { name: 'NOAA-CPC',  desc: 'ONI ENSO 1957-2024',          color: '#f97316'   },
+  { name: 'ENFEN',     desc: 'FEN Costero Perú',            color: '#f59e0b'   },
+  { name: 'INGEMMET',  desc: 'Fallas neotectónicas',        color: C.amber     },
+  { name: 'INEI/GADM', desc: 'Límites distritales',         color: C.accent    },
+  { name: 'ANA',       desc: 'Zonas inundables',            color: '#0284c7'   },
+  { name: 'CENEPRED',  desc: 'Riesgo de desastres',         color: '#0e7490'   },
+  { name: 'PREDES',    desc: 'Tsunamis costeros',           color: '#7c3aed'   },
+  { name: 'OSM',       desc: 'Infraestructura crítica',     color: '#10b981'   },
 ]
 
 function useVisible(threshold = 0.1) {
   const ref = useRef<HTMLDivElement>(null)
   const [vis, setVis] = useState(false)
   useEffect(() => {
-    const el = ref.current
-    if (!el) return
-    const obs = new IntersectionObserver(([e]) => {
-      if (e.isIntersecting) { setVis(true); obs.disconnect() }
-    }, { threshold })
+    const el = ref.current; if (!el) return
+    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setVis(true); obs.disconnect() } }, { threshold })
     obs.observe(el)
     return () => obs.disconnect()
   }, [threshold])
@@ -79,13 +83,9 @@ function Reveal({ children, delay = 0 }: { children: React.ReactNode; delay?: nu
   const { ref, vis } = useVisible()
   return (
     <div ref={ref} style={{
-      opacity:    vis ? 1 : 0,
-      transform:  vis ? 'translateY(0)' : 'translateY(22px)',
+      opacity: vis ? 1 : 0, transform: vis ? 'translateY(0)' : 'translateY(22px)',
       transition: `opacity 0.6s ease ${delay}ms, transform 0.65s cubic-bezier(.22,.68,0,1.2) ${delay}ms`,
-      willChange: 'opacity, transform',
-    }}>
-      {children}
-    </div>
+    }}>{children}</div>
   )
 }
 
@@ -94,8 +94,7 @@ function Wave({ color = C.primary, opacity = 0.15, delay = '0s', dur = '4s' }) {
     <svg viewBox="0 0 600 50" preserveAspectRatio="none" style={{ width: '100%', height: 44, display: 'block' }}>
       <polyline
         points="0,25 40,25 58,8 76,42 94,12 112,38 130,20 148,32 166,14 184,36 202,22 220,28 245,28 263,10 281,44 299,14 317,38 335,18 353,34 371,22 389,28 414,28 432,12 450,40 468,16 486,32 504,20 522,30 540,18 558,28 576,25 600,25"
-        fill="none" stroke={color} strokeWidth="1.6" strokeOpacity={opacity}
-        strokeDasharray="900"
+        fill="none" stroke={color} strokeWidth="1.6" strokeOpacity={opacity} strokeDasharray="900"
         style={{ animation: `swave ${dur} linear infinite`, animationDelay: delay }}
       />
     </svg>
@@ -105,8 +104,7 @@ function Wave({ color = C.primary, opacity = 0.15, delay = '0s', dur = '4s' }) {
 function Navbar({ onEnter, scrolled }: { onEnter: () => void; scrolled: boolean }) {
   return (
     <nav style={{
-      position: 'sticky', top: 0, zIndex: 100,
-      padding: '0 28px', height: 58,
+      position: 'sticky', top: 0, zIndex: 100, padding: '0 28px', height: 58,
       display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       background: scrolled ? 'rgba(255,255,255,0.94)' : 'transparent',
       backdropFilter: scrolled ? 'blur(16px)' : 'none',
@@ -118,7 +116,7 @@ function Navbar({ onEnter, scrolled }: { onEnter: () => void; scrolled: boolean 
         <div style={{ lineHeight: 1 }}>
           <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 14, fontWeight: 800, color: C.text, letterSpacing: '-0.02em' }}>GeoRiesgo</span>
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.primary, marginLeft: 5, letterSpacing: '0.05em' }}>PERÚ</span>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, marginLeft: 4 }}>v6.0</span>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, marginLeft: 4 }}>v8.0</span>
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 22 }}>
@@ -141,7 +139,7 @@ function Navbar({ onEnter, scrolled }: { onEnter: () => void; scrolled: boolean 
 interface Props { onEnter: () => void }
 
 export default function LandingPage({ onEnter }: Props) {
-  const wrapRef          = useRef<HTMLDivElement>(null)
+  const wrapRef = useRef<HTMLDivElement>(null)
   const [scrollY, setSY] = useState(0)
   const [mounted, setM]  = useState(false)
   const onScroll = useCallback(() => setSY(wrapRef.current?.scrollTop ?? 0), [])
@@ -176,7 +174,7 @@ export default function LandingPage({ onEnter }: Props) {
       <section style={{ minHeight: 'calc(100vh - 58px)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'hidden', paddingBottom: 90 }}>
         <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
           <div style={{ position: 'absolute', top: '-8%', left: '3%', width: 500, height: 500, background: `radial-gradient(circle,${C.primaryGlow} 0%,transparent 68%)`, transform: `translateY(${heroParallax * 0.3}px)` }} />
-          <div style={{ position: 'absolute', bottom: '-5%', right: '5%', width: 420, height: 420, background: 'radial-gradient(circle,rgba(14,165,233,0.08) 0%,transparent 68%)', transform: `translateY(${-heroParallax * 0.18}px)` }} />
+          <div style={{ position: 'absolute', bottom: '-5%', right: '5%', width: 420, height: 420, background: 'radial-gradient(circle,rgba(8,145,178,0.08) 0%,transparent 68%)', transform: `translateY(${-heroParallax * 0.18}px)` }} />
           <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0.028 }}>
             <defs><pattern id="g0" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0L0 0 0 40" fill="none" stroke={C.text} strokeWidth="1"/></pattern></defs>
             <rect width="100%" height="100%" fill="url(#g0)"/>
@@ -187,30 +185,31 @@ export default function LandingPage({ onEnter }: Props) {
           </div>
         </div>
 
-        <div style={{ position: 'relative', zIndex: 2, textAlign: 'center', padding: '0 24px', maxWidth: 860, opacity: mounted ? heroOpacity : 0, transform: `translateY(${mounted ? -heroParallax * 0.1 : 14}px)`, transition: mounted ? 'opacity 0.08s linear' : 'opacity 0.5s ease,transform 0.5s ease' }}>
+        <div style={{ position: 'relative', zIndex: 2, textAlign: 'center', padding: '0 24px', maxWidth: 900, opacity: mounted ? heroOpacity : 0, transform: `translateY(${mounted ? -heroParallax * 0.1 : 14}px)`, transition: mounted ? 'opacity 0.08s linear' : 'opacity 0.5s ease,transform 0.5s ease' }}>
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, background: C.bgSoft, border: `1px solid ${C.border}`, borderRadius: 40, padding: '6px 16px', marginBottom: 26, animation: 'fadeUp 0.6s ease both' }}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: C.primary, display: 'inline-block', animation: 'blink 1.8s ease-in-out infinite' }} />
             <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, letterSpacing: '0.14em', textTransform: 'uppercase' }}>
-              Monitoreo sísmico nacional · v6.0 · filtrado GPU · ST_Covers+KNN
+              Riesgo sísmico · precipitaciones · FEN · v8.0
             </span>
           </div>
 
           <h1 style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 'clamp(36px,6vw,76px)', fontWeight: 800, margin: '0 0 18px', lineHeight: 1.04, letterSpacing: '-0.035em', animation: 'fadeUp 0.6s ease 0.1s both' }}>
-            Riesgo Sísmico{' '}
+            GeoRiesgo{' '}
             <span style={{ background: `linear-gradient(135deg,${C.primary},${C.secondary})`, WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>Perú</span>
           </h1>
 
-          <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 'clamp(15px,2vw,18px)', color: C.textMuted, lineHeight: 1.68, maxWidth: 620, margin: '0 auto 36px', animation: 'fadeUp 0.6s ease 0.18s both' }}>
-            Plataforma geoespacial nacional: +2.5M sismos con filtrado GPU en tiempo real,
-            32 fallas activas, zonas tsunami, inundaciones, deslizamientos y 25 departamentos
-            sobre PostGIS + deck.gl DataFilterExtension.
+          <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 'clamp(15px,2vw,18px)', color: C.textMuted, lineHeight: 1.68, maxWidth: 660, margin: '0 auto 36px', animation: 'fadeUp 0.6s ease 0.18s both' }}>
+            Plataforma geoespacial nacional: +2.5M sismos con filtrado GPU, 22 zonas climáticas
+            SENAMHI/CHIRPS, 23 eventos FEN NOAA-CPC (1957–2024), IRC amplificado por El Niño y
+            25 departamentos sobre PostGIS + deck.gl DataFilterExtension.
           </p>
 
           <div style={{ display: 'flex', gap: 7, justifyContent: 'center', flexWrap: 'wrap', marginBottom: 24, animation: 'fadeUp 0.6s ease 0.22s both' }}>
             {[
-              { label: 'DataFilterExtension', color: C.primary,   bg: '#ecfdf5' },
-              { label: 'ST_Covers + KNN',     color: C.secondary, bg: '#f0f9ff' },
-              { label: 'v6.0 Backend',        color: '#7c3aed',   bg: '#f5f3ff' },
+              { label: 'Precipitaciones FEN',   color: C.teal,     bg: '#ecfeff' },
+              { label: 'DataFilterExtension',   color: C.primary,  bg: '#ecfdf5' },
+              { label: 'IRC×FEN v8.0',          color: C.amber,    bg: '#fffbeb' },
+              { label: 'NOAA-CPC ENSO',         color: '#f97316',  bg: '#fff7ed' },
             ].map(({ label, color, bg }) => (
               <span key={label} style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, fontWeight: 700, color, background: bg, border: `1px solid ${color}30`, padding: '3px 10px', borderRadius: 99, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
                 ✦ {label}
@@ -244,12 +243,12 @@ export default function LandingPage({ onEnter }: Props) {
       </section>
 
       {/* ═══ FUNCIONES ═══════════════════════════════════ */}
-      <section id="funciones" style={{ padding: '96px 24px', maxWidth: 1160, margin: '0 auto' }}>
+      <section id="funciones" style={{ padding: '96px 24px', maxWidth: 1200, margin: '0 auto' }}>
         <Reveal>
           <div style={{ textAlign: 'center', marginBottom: 52 }}>
             <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.primary, letterSpacing: '0.2em', textTransform: 'uppercase', marginBottom: 12 }}>Capacidades del sistema</div>
             <h2 style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 'clamp(26px,3.5vw,44px)', fontWeight: 800, color: C.text, margin: 0, letterSpacing: '-0.025em', lineHeight: 1.12 }}>
-              Análisis geoespacial de <span style={{ color: C.primary }}>riesgo sísmico</span>
+              Análisis geoespacial de <span style={{ color: C.primary }}>riesgo sísmico + climático</span>
             </h2>
           </div>
         </Reveal>
@@ -268,13 +267,13 @@ export default function LandingPage({ onEnter }: Props) {
 
       {/* ═══ API ═════════════════════════════════════════ */}
       <section id="api" style={{ padding: '80px 24px 96px', background: C.bgSoft, borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
-        <div style={{ maxWidth: 960, margin: '0 auto' }}>
+        <div style={{ maxWidth: 980, margin: '0 auto' }}>
           <Reveal>
             <div style={{ textAlign: 'center', marginBottom: 48 }}>
-              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.secondary, letterSpacing: '0.2em', textTransform: 'uppercase', marginBottom: 12 }}>Backend FastAPI v6.0</div>
+              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.secondary, letterSpacing: '0.2em', textTransform: 'uppercase', marginBottom: 12 }}>Backend FastAPI v8.0</div>
               <h2 style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 'clamp(24px,3vw,38px)', fontWeight: 800, color: C.text, margin: '0 0 12px', letterSpacing: '-0.02em' }}>Endpoints espaciales PostGIS</h2>
               <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 14, color: C.textMuted, maxWidth: 520, margin: '0 auto' }}>
-                ST_Covers + KNN fallback · ETags · vistas materializadas · orjson · GZip
+                ST_Covers + KNN fallback · ETags · vistas materializadas · CTE FEN · orjson · GZip
               </p>
             </div>
           </Reveal>
@@ -318,13 +317,13 @@ export default function LandingPage({ onEnter }: Props) {
 
         <Reveal delay={120}>
           <div style={{ background: 'linear-gradient(135deg,#f0fdf4,#f0f9ff)', border: `1px solid ${C.border}`, borderRadius: 22, padding: '32px 38px' }}>
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, letterSpacing: '0.16em', textTransform: 'uppercase', marginBottom: 22 }}>Stack tecnológico</div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(185px,1fr))', gap: 22 }}>
+            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, letterSpacing: '0.16em', textTransform: 'uppercase', marginBottom: 22 }}>Stack tecnológico v8.0</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))', gap: 22 }}>
               {[
-                { cat: 'Frontend',      color: C.primary,   items: ['React 18 + TypeScript', 'MapLibre GL + deck.gl', 'DataFilterExtension GPU', 'Cache ETag en memoria'] },
-                { cat: 'Backend',       color: C.secondary, items: ['FastAPI + asyncpg', 'orjson · GZip middleware', 'ETag / Cache-Control', 'f_riesgo_punto PL/pgSQL'] },
-                { cat: 'Base de datos', color: C.accent,    items: ['PostgreSQL 16 + PostGIS 3.4', 'ST_Covers + KNN fallback', 'Índices GiST + BRIN', 'Vistas materializadas'] },
-                { cat: 'ETL & Docker',  color: '#0284c7',   items: ['Python 3.12-slim (~180MB)', 'Shapely 2.0 (sin GDAL)', 'Tenacity retry exp.', '10-step pipeline paralelo'] },
+                { cat: 'Frontend',      color: C.primary,   items: ['React 18 + TypeScript', 'MapLibre GL + deck.gl', 'DataFilterExtension GPU', 'StatsChart: modo FEN '] },
+                { cat: 'Backend',       color: C.secondary, items: ['FastAPI + asyncpg', 'orjson · GZip middleware', 'ETag / Cache-Control', '5 endpoints FEN+Precip '] },
+                { cat: 'Base de datos', color: C.accent,    items: ['PostgreSQL 16 + PostGIS 3.4', 'CTE fen_por_distrito ', 'PI×indice_fen en IRC ', '14 tablas · 72 índices'] },
+                { cat: 'Datos v8.0',    color: C.teal,      items: ['SENAMHI 22 zonas climáticas', 'CHIRPS v2 1981-2020', 'NOAA-CPC ONI 1957-2024', 'ENFEN FEN Costero Perú'] },
               ].map((s, i) => (
                 <div key={i}>
                   <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 700, color: s.color, marginBottom: 11 }}>{s.cat}</div>
@@ -353,11 +352,11 @@ export default function LandingPage({ onEnter }: Props) {
         </div>
         <Reveal>
           <div style={{ position: 'relative', zIndex: 2 }}>
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'rgba(255,255,255,0.55)', letterSpacing: '0.2em', textTransform: 'uppercase', marginBottom: 16 }}>v6.0 · Listo para usar</div>
+            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'rgba(255,255,255,0.55)', letterSpacing: '0.2em', textTransform: 'uppercase', marginBottom: 16 }}>v8.0 · Precipitaciones + FEN · Listo para usar</div>
             <h2 style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 'clamp(28px,4.5vw,54px)', fontWeight: 800, color: 'white', margin: '0 0 16px', letterSpacing: '-0.025em', lineHeight: 1.08 }}>Explora el mapa ahora</h2>
-            <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 16, color: 'rgba(255,255,255,0.72)', maxWidth: 480, margin: '0 auto 34px', lineHeight: 1.65 }}>
-              Visualiza +2.5M sismos con filtrado GPU en tiempo real, 32 fallas activas,
-              deslizamientos, zonas tsunami e inundación, 25 departamentos e infraestructura crítica.
+            <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 16, color: 'rgba(255,255,255,0.72)', maxWidth: 520, margin: '0 auto 34px', lineHeight: 1.65 }}>
+              +2.5M sismos GPU · 22 zonas climáticas · 23 eventos FEN NOAA-CPC ·
+              IRC amplificado por El Niño · 25 departamentos · infraestructura crítica nacional.
             </p>
             <button onClick={onEnter}
               style={{ background: 'white', color: C.primary, border: 'none', padding: '15px 46px', borderRadius: 14, fontFamily: "'DM Sans',sans-serif", fontSize: 15, fontWeight: 800, cursor: 'pointer', boxShadow: '0 8px 32px rgba(0,0,0,0.17)', transition: 'all 0.22s ease' }}
@@ -371,9 +370,9 @@ export default function LandingPage({ onEnter }: Props) {
       <footer style={{ padding: '18px 28px', background: C.bgSoft, borderTop: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
           <div style={{ width: 22, height: 22, borderRadius: 7, background: `linear-gradient(135deg,${C.primary},${C.secondary})`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'white', fontWeight: 900 }}>G</div>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10.5, color: C.textMuted }}>GeoRiesgo Perú v6.0 · PostGIS · deck.gl · MapLibre GL · DataFilterExtension</span>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10.5, color: C.textMuted }}>GeoRiesgo Perú v8.0 · PostGIS · deck.gl · MapLibre GL · SENAMHI/CHIRPS · NOAA-CPC</span>
         </div>
-        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9.5, color: C.textMuted, letterSpacing: '0.04em' }}>USGS · IGP · INGEMMET · INEI · GADM · ANA · CENEPRED · PREDES · SENAMHI · OSM</span>
+        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9.5, color: C.textMuted, letterSpacing: '0.04em' }}>USGS · IGP · INGEMMET · INEI · ANA · CENEPRED · PREDES · SENAMHI · ENFEN · OSM</span>
       </footer>
     </div>
   )

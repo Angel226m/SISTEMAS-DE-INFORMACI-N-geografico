@@ -1,15 +1,11 @@
 ﻿// ══════════════════════════════════════════════════════════
-// MapView.tsx v8.0  — zona_sismica NTE E.030 + fuente_tipo
-//
-// MEJORAS v8.0:
-// 1. Departamentos coloreados por zona_sismica (Z1→Z4)
-//    → Verde (Z1) a Rojo (Z4) según NTE E.030-2018
-// 2. Infraestructura: marcadores distintos oficial vs OSM
-//    → Oficial: radio mayor + borde blanco más grueso
-//    → OSM: radio menor + borde punteado (visual)
-// 3. Nueva capa riesgo_construccion (IRC mapa distritos)
-//    → Escala divergente para IRC 1–5
-// 4. DataFilterExtension + updateTriggers (heredado v7.0)
+// MapView.tsx v8.0
+// 🆕 Capa precipitaciones: GeoJsonLayer coloreada por indice_fen
+//    indice_fen < 0.9  → teal/verde (sequía en FEN)
+//    indice_fen 0.9–2  → amarillo-naranja (amplificación mod.)
+//    indice_fen > 2    → naranja-rojo (amplificación alta/catastrófica)
+// 🆕 Props: precipitaciones FC + capas.precipitaciones
+// ✅ Todos los comportamientos v7.x mantenidos
 // ══════════════════════════════════════════════════════════
 
 import { useEffect, useRef, useCallback, useMemo } from 'react'
@@ -45,25 +41,20 @@ const profColor = (km: number): [number,number,number,number] =>
   km < 70  ? [249,115,22,200] :
              [14,165,233,185]
 
-// Escala secuencial perceptualmente uniforme (verde→rojo)
 const riskColor = (n: number): [number,number,number,number] => {
-  const C: [number,number,number,number][] = [
-    [5,150,105,90],    // 1 - Muy bajo
-    [16,185,129,110],  // 2 - Bajo
-    [245,158,11,130],  // 3 - Moderado
-    [249,115,22,155],  // 4 - Alto
-    [220,38,38,175],   // 5 - Muy alto
+  const cols: [number,number,number,number][] = [
+    [5,150,105,90], [16,185,129,110], [245,158,11,130],
+    [249,115,22,155], [220,38,38,175],
   ]
-  return C[Math.max(0, Math.min(4, n - 1))] ?? [148,163,184,80]
+  return cols[Math.max(0, Math.min(4, n - 1))] ?? [148,163,184,80]
 }
 
-// v8.0: Zona sísmica NTE E.030 → color con opacidad de relleno
 const zonaSismicaFillColor = (z: number | null): [number,number,number,number] => {
   switch (z) {
-    case 1: return [5,150,105,25]    // Z1 Muy bajo — verde esmeralda
-    case 2: return [245,158,11,30]   // Z2 Bajo — ámbar
-    case 3: return [249,115,22,38]   // Z3 Moderado — naranja
-    case 4: return [220,38,38,48]    // Z4 Alto — rojo
+    case 1: return [5,150,105,25]
+    case 2: return [245,158,11,30]
+    case 3: return [249,115,22,38]
+    case 4: return [220,38,38,48]
     default:return [148,163,184,15]
   }
 }
@@ -79,16 +70,15 @@ const zonaSismicaLineColor = (z: number | null): [number,number,number,number] =
 
 const deslizColor = (tipo: string | null): [number,number,number,number] => {
   const M: Record<string,[number,number,number,number]> = {
-    deslizamiento:   [146,64,14,160],
-    huayco:          [180,83,9,170],
-    derrumbe:        [217,119,6,160],
-    flujo_detritico: [245,158,11,150],
-    reptacion:       [161,98,7,140],
+    deslizamiento:    [146,64,14,160],
+    huayco:           [180,83,9,170],
+    derrumbe:         [217,119,6,160],
+    flujo_detritico:  [245,158,11,150],
+    reptacion:        [161,98,7,140],
   }
   return M[tipo ?? ''] ?? [146,64,14,140]
 }
 
-// v8.0: infraColor con distinción fuente_tipo
 const infraColor = (tipo: string): [number,number,number,number] => {
   const M: Record<string,[number,number,number,number]> = {
     hospital:          [239,68,68,230],
@@ -102,8 +92,35 @@ const infraColor = (tipo: string): [number,number,number,number] => {
     planta_agua:       [56,189,248,220],
     puente:            [156,163,175,210],
     albergue:          [167,139,250,220],
+    refugio:           [167,139,250,220],
   }
   return M[tipo] ?? [148,163,184,200]
+}
+
+/**
+ * 🆕 v8.0: Color de zona de precipitación según indice_fen.
+ * Escala divergente:
+ *   < 0.9  → teal (sequía en FEN)
+ *   0.9-1.3→ gris-azul (sin cambio)
+ *   1.3-2.0→ amarillo (amplificación moderada)
+ *   2.0-3.5→ naranja (amplificación alta)
+ *   > 3.5  → rojo (catastrófico)
+ */
+const precipFillColor = (fen: number | null): [number,number,number,number] => {
+  const f = fen ?? 1.0
+  if (f < 0.9)  return [8,145,178,50]    // teal — sequía
+  if (f < 1.3)  return [148,163,184,35]   // gris — neutral
+  if (f < 2.0)  return [245,158,11,50]    // amber
+  if (f < 3.5)  return [249,115,22,60]    // naranja
+  return               [220,38,38,70]     // rojo — catastrófico
+}
+const precipLineColor = (fen: number | null): [number,number,number,number] => {
+  const f = fen ?? 1.0
+  if (f < 0.9)  return [8,145,178,200]
+  if (f < 1.3)  return [148,163,184,150]
+  if (f < 2.0)  return [245,158,11,200]
+  if (f < 3.5)  return [249,115,22,210]
+  return               [220,38,38,220]
 }
 
 const get = <T,>(f: Feat, k: string): T | undefined =>
@@ -119,7 +136,9 @@ interface Props {
   deslizamientos:         FC | null
   infraestructura:        FC | null
   estaciones:             FC | null
-  riesgoConstruccionMapa: FC | null  // v8.0
+  riesgoConstruccionMapa: FC | null
+  /** 🆕 v8.0: zonas climáticas coloreadas por indice_fen */
+  precipitaciones:        FC | null
   capas:                  CapasActivas
   vista:                  TipoVista
   mapStyle?:              MapStyle
@@ -131,6 +150,7 @@ interface Props {
 export default function MapView({
   sismos, departamentos, distritos, fallas, inundaciones, tsunamis,
   deslizamientos, infraestructura, estaciones, riesgoConstruccionMapa,
+  precipitaciones,
   capas, vista, mapStyle = 'light',
   filtros, onClickFeature, onHoverFeature,
 }: Props) {
@@ -142,9 +162,6 @@ export default function MapView({
   clickRef.current = onClickFeature
   hoverRef.current = onHoverFeature
 
-  // Heatmap filtrado en CPU — plain objects (no GeoJSON Features)
-  // FIX v8.1: HeatmapLayer GPU-worker no sobrevive accessors sobre GeoJSON Features.
-  // Se pre-procesa a {position, weight} para evitar V.reduce TypeError.
   const heatmapData = useMemo((): { position: [number,number]; weight: number }[] => {
     if (!sismos?.features) return []
     return sismos.features
@@ -154,37 +171,28 @@ export default function MapView({
         const tipo = get<string>(f, 'tipo_profundidad') ?? null
         if (mag  < filtros.mag_min    || mag  > filtros.mag_max)  return false
         if (year < filtros.year_start || year > filtros.year_end) return false
-        if (filtros.profundidad && tipo !== filtros.profundidad)  return false
+        if (filtros.profundidad && tipo !== filtros.profundidad)   return false
         return true
       })
       .map(f => {
         const coords = (f as FPt).geometry?.coordinates
         const mag    = get<number>(f, 'magnitud') ?? 3
-        // Peso lineal normalizado — evita overflow GPU (no Math.pow(10, mag))
         const weight = Math.max(0.05, Math.min(1.0, (mag - 2) / 6))
         return { position: [coords?.[0] ?? 0, coords?.[1] ?? 0] as [number,number], weight }
       })
       .filter(d => d.position[0] !== 0 || d.position[1] !== 0)
   }, [sismos, filtros.mag_min, filtros.mag_max, filtros.year_start, filtros.year_end, filtros.profundidad])
 
-  // Init: MapLibre + MapboxOverlay
   useEffect(() => {
     if (!mapDiv.current || mapRef.current) return
-
     const map = new maplibregl.Map({
-      container: mapDiv.current,
-      style:     MAP_STYLES[mapStyle],
-      center:    ICA_CENTER,
-      zoom:      ICA_ZOOM,
+      container: mapDiv.current, style: MAP_STYLES[mapStyle],
+      center: ICA_CENTER, zoom: ICA_ZOOM,
       pitch: 0, bearing: 0, maxPitch: 70,
       attributionControl: false, scrollZoom: true,
     })
-
     map.scrollZoom.setWheelZoomRate(1 / 450)
-    map.addControl(
-      new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }),
-      'top-right'
-    )
+    map.addControl(new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }), 'top-right')
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right')
     mapRef.current = map
 
@@ -198,15 +206,10 @@ export default function MapView({
       onHover: (info) => {
         if (!hoverRef.current) return
         if (!info.object) { hoverRef.current(null); return }
-        hoverRef.current({
-          x: info.x, y: info.y,
-          object: info.object as Feat,
-          layer:  info.layer?.id ?? null,
-        })
+        hoverRef.current({ x: info.x, y: info.y, object: info.object as Feat, layer: info.layer?.id ?? null })
       },
       getTooltip: () => null,
     })
-
     map.addControl(overlay as unknown as maplibregl.IControl)
     overlayRef.current = overlay
 
@@ -235,15 +238,26 @@ export default function MapView({
   const buildLayers = useCallback(() => {
     const layers = []
 
-    // ── Departamentos — coloreados por zona_sismica v8.0 ──
+    // ── Departamentos — zona sísmica NTE E.030 ────────────
     if (capas.departamentos && departamentos)
       layers.push(new GeoJsonLayer({
         id: 'departamentos', data: departamentos,
         getFillColor: (f: Feat) => zonaSismicaFillColor(get<number>(f, 'zona_sismica') ?? null),
         getLineColor: (f: Feat) => zonaSismicaLineColor(get<number>(f, 'zona_sismica') ?? null),
         lineWidthMinPixels: 1.5, lineWidthMaxPixels: 3.5,
+        pickable: true, autoHighlight: true, highlightColor: [124,58,237,50],
+        updateTriggers: { getFillColor: [], getLineColor: [] },
+      }))
+
+    // ── 🆕 v8.0: Precipitaciones — coloreadas por indice_fen ─
+    if (capas.precipitaciones && precipitaciones)
+      layers.push(new GeoJsonLayer({
+        id: 'precipitaciones', data: precipitaciones,
+        getFillColor: (f: Feat) => precipFillColor(get<number>(f, 'indice_fen') ?? null),
+        getLineColor: (f: Feat) => precipLineColor(get<number>(f, 'indice_fen') ?? null),
+        lineWidthMinPixels: 1, lineWidthMaxPixels: 3,
         pickable: true, autoHighlight: true,
-        highlightColor: [124,58,237,50],
+        highlightColor: [8,145,178,80],
         updateTriggers: { getFillColor: [], getLineColor: [] },
       }))
 
@@ -254,23 +268,18 @@ export default function MapView({
         getFillColor: (f: Feat) => riskColor(get<number>(f, 'nivel_riesgo') ?? 3),
         getLineColor: [100,116,139,60] as [number,number,number,number],
         lineWidthMinPixels: 0.5, lineWidthMaxPixels: 2,
-        pickable: true, autoHighlight: true,
-        highlightColor: [255,255,255,40],
+        pickable: true, autoHighlight: true, highlightColor: [255,255,255,40],
         updateTriggers: { getFillColor: [] },
       }))
 
-    // ── IRC Mapa — distritos coloreados por IRC v8.0 ─────
+    // ── IRC Mapa — distritos por IRC ──────────────────────
     if (capas.riesgo_construccion && riesgoConstruccionMapa)
       layers.push(new GeoJsonLayer({
         id: 'riesgo_construccion', data: riesgoConstruccionMapa,
-        getFillColor: (f: Feat) => {
-          const irc = get<number>(f, 'indice_riesgo_construccion') ?? 3
-          return riskColor(Math.round(irc))
-        },
+        getFillColor: (f: Feat) => riskColor(Math.round(get<number>(f, 'indice_riesgo_construccion') ?? 3)),
         getLineColor: [245,158,11,120] as [number,number,number,number],
         lineWidthMinPixels: 0.8, lineWidthMaxPixels: 2,
-        pickable: true, autoHighlight: true,
-        highlightColor: [245,158,11,60],
+        pickable: true, autoHighlight: true, highlightColor: [245,158,11,60],
         updateTriggers: { getFillColor: [] },
       }))
 
@@ -284,8 +293,7 @@ export default function MapView({
         },
         getLineColor: [14,165,233,180] as [number,number,number,number],
         lineWidthMinPixels: 1.5, lineWidthMaxPixels: 4,
-        pickable: true, autoHighlight: true,
-        highlightColor: [14,165,233,60],
+        pickable: true, autoHighlight: true, highlightColor: [14,165,233,60],
         updateTriggers: { getFillColor: [] },
       }))
 
@@ -296,8 +304,7 @@ export default function MapView({
         getFillColor: [6,182,212,55] as [number,number,number,number],
         getLineColor: [6,182,212,200] as [number,number,number,number],
         lineWidthMinPixels: 2, lineWidthMaxPixels: 5,
-        pickable: true, autoHighlight: true,
-        highlightColor: [6,182,212,70],
+        pickable: true, autoHighlight: true, highlightColor: [6,182,212,70],
       }))
 
     // ── Deslizamientos ────────────────────────────────────
@@ -307,39 +314,28 @@ export default function MapView({
         getFillColor: (f: Feat) => deslizColor(get<string>(f, 'tipo') ?? null),
         getLineColor: [120,53,15,200] as [number,number,number,number],
         lineWidthMinPixels: 1, lineWidthMaxPixels: 3,
-        pickable: true, autoHighlight: true,
-        highlightColor: [234,179,8,60],
+        pickable: true, autoHighlight: true, highlightColor: [234,179,8,60],
         updateTriggers: { getFillColor: [] },
       }))
 
-    // ── Heatmap ───────────────────────────────────────────
+    // ── Heatmap (ScreenGrid) ───────────────────────────────
     if (capas.heatmap && heatmapData.length)
-      // FIX v8.1: HeatmapLayer GPU-worker es incompatible con esta versión de deck.gl
-      // → reemplazado por ScreenGridLayer (CPU-based, sin worker, sin k.reduce errors)
       layers.push(new ScreenGridLayer({
-        id: 'heatmap',
-        data: heatmapData,
-        getPosition:  (d: { position: [number,number]; weight: number }) => d.position,
-        getWeight:    (d: { position: [number,number]; weight: number }) => d.weight,
-        cellSizePixels: 20,
-        gpuAggregation: false,
+        id: 'heatmap', data: heatmapData,
+        getPosition: (d: { position: [number,number]; weight: number }) => d.position,
+        getWeight:   (d: { position: [number,number]; weight: number }) => d.weight,
+        cellSizePixels: 20, gpuAggregation: false,
         colorRange: [
-          [5,150,105,30],
-          [16,185,129,80],
-          [245,158,11,130],
-          [249,115,22,175],
-          [220,38,38,210],
-          [127,29,29,255],
+          [5,150,105,30],[16,185,129,80],[245,158,11,130],
+          [249,115,22,175],[220,38,38,210],[127,29,29,255],
         ] as [number,number,number,number][],
-        opacity: 0.75,
-        pickable: false,
+        opacity: 0.75, pickable: false,
       }))
 
     // ── Sismos — DataFilterExtension GPU ─────────────────
     if (capas.sismos && sismos?.features.length)
       layers.push(new ScatterplotLayer({
-        id: 'sismos',
-        data: sismos.features,
+        id: 'sismos', data: sismos.features,
         getPosition:  (f: FPt)  => f.geometry.coordinates as [number,number,number],
         getRadius:    (f: Feat) => Math.pow(1.8, get<number>(f, 'magnitud') ?? 3) * 800,
         getFillColor: (f: Feat) => profColor(get<number>(f, 'profundidad_km') ?? 30),
@@ -360,9 +356,7 @@ export default function MapView({
             : [0, 99],
         ] as [[number,number],[number,number],[number,number]],
         extensions: [new DataFilterExtension({ filterSize: 3 })],
-        updateTriggers: {
-          getFillColor: [], getFilterValue: [],
-        },
+        updateTriggers: { getFillColor: [], getFilterValue: [] },
       }))
 
     // ── Fallas geológicas ─────────────────────────────────
@@ -374,14 +368,12 @@ export default function MapView({
             ? [220,38,38,220] as [number,number,number,number]
             : [156,163,175,140] as [number,number,number,number],
         lineWidthMinPixels: 1.5, lineWidthMaxPixels: 5,
-        pickable: true, autoHighlight: true,
-        highlightColor: [255,200,0,60],
+        pickable: true, autoHighlight: true, highlightColor: [255,200,0,60],
         updateTriggers: { getLineColor: [] },
       }))
 
-    // ── Infraestructura — v8.0: distinción oficial/OSM ───
+    // ── Infraestructura — oficial vs OSM ─────────────────
     if (capas.infraestructura && infraestructura) {
-      // Capa 1: puntos de infraestructura oficial (radio mayor, borde blanco grueso)
       layers.push(new ScatterplotLayer({
         id: 'infraestructura-oficial',
         data: infraestructura.features.filter(f => get<string>(f, 'fuente_tipo') === 'oficial'),
@@ -391,11 +383,9 @@ export default function MapView({
         getLineColor: [255,255,255,255] as [number,number,number,number],
         radiusMinPixels: 6, radiusMaxPixels: 22,
         stroked: true, lineWidthMinPixels: 2,
-        pickable: true, autoHighlight: true,
-        highlightColor: [255,255,255,120],
+        pickable: true, autoHighlight: true, highlightColor: [255,255,255,120],
         updateTriggers: { getFillColor: [] },
       }))
-      // Capa 2: puntos OSM (radio menor, borde más fino)
       layers.push(new ScatterplotLayer({
         id: 'infraestructura-osm',
         data: infraestructura.features.filter(f => get<string>(f, 'fuente_tipo') !== 'oficial'),
@@ -408,8 +398,7 @@ export default function MapView({
         getLineColor: [255,255,255,160] as [number,number,number,number],
         radiusMinPixels: 4, radiusMaxPixels: 16,
         stroked: true, lineWidthMinPixels: 1,
-        pickable: true, autoHighlight: true,
-        highlightColor: [255,255,255,80],
+        pickable: true, autoHighlight: true, highlightColor: [255,255,255,80],
         updateTriggers: { getFillColor: [] },
       }))
     }
@@ -417,8 +406,7 @@ export default function MapView({
     // ── Estaciones de monitoreo ───────────────────────────
     if (capas.estaciones && estaciones)
       layers.push(new ScatterplotLayer({
-        id: 'estaciones',
-        data: estaciones.features,
+        id: 'estaciones', data: estaciones.features,
         getPosition:  (f: FPt)  => f.geometry.coordinates as [number,number],
         getRadius:    500, radiusUnits: 'meters',
         getFillColor: (f: Feat) =>
@@ -428,8 +416,7 @@ export default function MapView({
         getLineColor: [255,255,255,180] as [number,number,number,number],
         radiusMinPixels: 4, radiusMaxPixels: 14,
         stroked: true, lineWidthMinPixels: 1.5,
-        pickable: true, autoHighlight: true,
-        highlightColor: [255,255,255,80],
+        pickable: true, autoHighlight: true, highlightColor: [255,255,255,80],
         updateTriggers: { getFillColor: [] },
       }))
 
@@ -437,7 +424,7 @@ export default function MapView({
   }, [
     capas, sismos, heatmapData, departamentos, distritos, fallas,
     inundaciones, tsunamis, deslizamientos, infraestructura, estaciones,
-    riesgoConstruccionMapa,
+    riesgoConstruccionMapa, precipitaciones,
     filtros.mag_min, filtros.mag_max, filtros.year_start, filtros.year_end, filtros.profundidad,
   ])
 

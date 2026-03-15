@@ -1,8 +1,9 @@
 ﻿// ══════════════════════════════════════════════════════════
-// LayerPanel.tsx v7.5 ENTERPRISE
-// Nuevas leyendas: zona sísmica NTE E.030-2018 (25 depts),
-// clasificación suelo S1-S4 NTE E.031-2020, IRC CENEPRED,
-// fuente_tipo oficial vs OSM — alineado con backend v7.5
+// LayerPanel.tsx v8.0  ENTERPRISE
+// 🆕 Capa: precipitaciones (zonas climáticas · FEN index)
+// 🆕 Leyenda FEN: escala de multiplicador por zona
+// 🆕 Badge v8.0 en precipitaciones y IRC
+// ✅ Todas las leyendas v7.5 mantenidas
 // ══════════════════════════════════════════════════════════
 
 import type { CapasActivas } from '../types'
@@ -13,35 +14,37 @@ interface Props {
 }
 
 const C = {
-  text:     '#0f172a', textSec: '#475569', textMuted: '#94a3b8',
-  border:   '#e2e8f0', bg: '#ffffff', bgSoft: '#f8fafc', bgMuted: '#f1f5f9',
-  primary:  '#059669', primaryBg: '#ecfdf5',
-  amber:    '#f59e0b', orange: '#f97316', danger: '#dc2626',
+  text:    '#0f172a', textSec: '#475569', textMuted: '#94a3b8',
+  border:  '#e2e8f0', bg: '#ffffff', bgSoft: '#f8fafc', bgMuted: '#f1f5f9',
+  primary: '#059669', primaryBg: '#ecfdf5',
+  amber:   '#f59e0b', orange: '#f97316', danger: '#dc2626',
+  teal:    '#0891b2', cyan: '#06b6d4',
 }
 
 interface LayerDef {
-  key:   keyof CapasActivas
-  label: string
-  sub:   string
-  icon:  string
-  color: string
-  bg:    string
-  badge?: string   // badge opcional (Oficial / GPU / Nuevo)
+  key:    keyof CapasActivas
+  label:  string
+  sub:    string
+  icon:   string
+  color:  string
+  bg:     string
+  badge?: string
 }
 
 const LAYERS: LayerDef[] = [
-  { key: 'sismos',             label: 'Sismos',             sub: 'USGS 1900–hoy · GPU filter',   icon: '●', color: '#dc2626', bg: '#fef2f2', badge: 'GPU' },
-  { key: 'heatmap',            label: 'Densidad sísmica',   sub: 'Mapa de calor ponderado',       icon: '◉', color: '#f97316', bg: '#fff7ed' },
-  { key: 'departamentos',      label: 'Departamentos',      sub: 'Zona sísmica NTE E.030-2018',   icon: '▦', color: '#7c3aed', bg: '#f5f3ff', badge: 'v7.5' },
-  { key: 'riesgo_distritos',   label: 'Riesgo distritos',   sub: 'Índice multi-variable',         icon: '▧', color: '#059669', bg: '#ecfdf5' },
-  { key: 'riesgo_construccion',label: 'IRC — Construcción', sub: 'CENEPRED · NTE E.030/E.031',   icon: '⬡', color: '#f59e0b', bg: '#fffbeb', badge: 'v7.5' },
-  { key: 'fallas',             label: 'Fallas geológicas',  sub: 'Audin et al. 2008 + IGP 2021', icon: '⌗', color: '#f59e0b', bg: '#fffbeb' },
-  { key: 'inundaciones',       label: 'Inundaciones',       sub: 'ANA / CENEPRED',               icon: '◈', color: '#0ea5e9', bg: '#f0f9ff' },
-  { key: 'tsunamis',           label: 'Tsunamis',           sub: 'PREDES / IGP / INDECI',        icon: '≋', color: '#06b6d4', bg: '#ecfeff' },
-  { key: 'deslizamientos',     label: 'Deslizamientos',     sub: 'CENEPRED / INGEMMET',          icon: '◤', color: '#92400e', bg: '#fef3c7' },
-  { key: 'infraestructura',    label: 'Infraestructura',    sub: 'Oficial + OSM · 60k puntos',   icon: '⊕', color: '#6366f1', bg: '#eef2ff', badge: 'v7.5' },
-  { key: 'estaciones',         label: 'Estaciones',         sub: 'IGP / SENAMHI / ANA / DHN',    icon: '◎', color: '#10b981', bg: '#f0fdf4' },
-  { key: 'extrusion_3d',       label: 'Extrusión 3D',       sub: 'Modo 3D requerido',             icon: '⬡', color: '#ec4899', bg: '#fdf2f8' },
+  { key: 'sismos',             label: 'Sismos',             sub: 'USGS 1900–hoy · GPU filter',    icon: '●', color: '#dc2626', bg: '#fef2f2', badge: 'GPU' },
+  { key: 'heatmap',            label: 'Densidad sísmica',   sub: 'Mapa de calor ponderado',        icon: '◉', color: '#f97316', bg: '#fff7ed' },
+  { key: 'departamentos',      label: 'Departamentos',      sub: 'Zona sísmica NTE E.030-2018',    icon: '▦', color: '#7c3aed', bg: '#f5f3ff', badge: 'v7.5' },
+  { key: 'riesgo_distritos',   label: 'Riesgo distritos',   sub: 'Índice multi-variable',          icon: '▧', color: '#059669', bg: '#ecfdf5' },
+  { key: 'riesgo_construccion',label: 'IRC — Construcción', sub: 'CENEPRED · NTE E.030/E.031',    icon: '⬡', color: '#f59e0b', bg: '#fffbeb', badge: 'v8.0' },
+  { key: 'precipitaciones',    label: 'Precipitaciones',    sub: 'SENAMHI/CHIRPS · índice FEN',   icon: '◈', color: '#0891b2', bg: '#ecfeff', badge: 'v8.0' },
+  { key: 'fallas',             label: 'Fallas geológicas',  sub: 'Audin et al. 2008 + IGP 2021',  icon: '⌗', color: '#f59e0b', bg: '#fffbeb' },
+  { key: 'inundaciones',       label: 'Inundaciones',       sub: 'ANA / CENEPRED',                icon: '≈', color: '#0ea5e9', bg: '#f0f9ff' },
+  { key: 'tsunamis',           label: 'Tsunamis',           sub: 'PREDES / IGP / INDECI',         icon: '≋', color: '#06b6d4', bg: '#ecfeff' },
+  { key: 'deslizamientos',     label: 'Deslizamientos',     sub: 'CENEPRED / INGEMMET',           icon: '◤', color: '#92400e', bg: '#fef3c7' },
+  { key: 'infraestructura',    label: 'Infraestructura',    sub: 'Oficial + OSM · 60k puntos',    icon: '⊕', color: '#6366f1', bg: '#eef2ff', badge: 'v7.5' },
+  { key: 'estaciones',         label: 'Estaciones',         sub: 'IGP / SENAMHI / ANA / DHN',     icon: '◎', color: '#10b981', bg: '#f0fdf4' },
+  { key: 'extrusion_3d',       label: 'Extrusión 3D',       sub: 'Modo 3D requerido',              icon: '⬡', color: '#ec4899', bg: '#fdf2f8' },
 ]
 
 const ZONA_SISMICA = [
@@ -75,6 +78,23 @@ const TSUNAMI_SCALE = [
   { color: '#0e7490', label: '3–10 m', desc: 'Alto' },
   { color: '#164e63', label: '> 10 m', desc: 'Catastrófico' },
 ]
+
+/** Escala de índice FEN para coloreado de precipitaciones */
+const FEN_SCALE = [
+  { range: '< 0.9', label: 'Sequía en FEN',           color: '#4ade80', desc: 'Altiplano / Puna sur' },
+  { range: '0.9–1.3', label: 'Sin cambio',             color: '#94a3b8', desc: 'Amazonia / Sierra media' },
+  { range: '1.3–2.0', label: 'Amplificación moderada', color: '#f59e0b', desc: 'Ceja de selva / Sierra norte' },
+  { range: '2.0–3.5', label: 'Amplificación alta',     color: '#f97316', desc: 'Costa central / Lambayeque' },
+  { range: '> 3.5',   label: 'Catastrófico en FEN',    color: '#dc2626', desc: 'Costa norte: Piura / Tumbes' },
+]
+
+const TIPO_PRECIP_COLORS: Record<string, string> = {
+  muy_alta: '#0ea5e9',
+  alta:     '#38bdf8',
+  moderada: '#7dd3fc',
+  baja:     '#f59e0b',
+  muy_baja: '#f97316',
+}
 
 export default function LayerPanel({ capas, onChange }: Props) {
   const active = Object.values(capas).filter(Boolean).length
@@ -112,8 +132,7 @@ export default function LayerPanel({ capas, onChange }: Props) {
                 background: on ? bg : C.bgMuted,
                 border: `1px solid ${on ? color + '38' : C.border}`,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                fontSize: 13, color: on ? color : C.textMuted,
-                transition: 'all 0.18s',
+                fontSize: 13, color: on ? color : C.textMuted, transition: 'all 0.18s',
               }}>{icon}</div>
 
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -126,11 +145,10 @@ export default function LayerPanel({ capas, onChange }: Props) {
                   {badge && (
                     <span style={{
                       fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 700,
-                      color: badge === 'v7.5' ? C.amber : badge === 'GPU' ? '#6366f1' : C.textMuted,
-                      background: badge === 'v7.5' ? '#fffbeb' : badge === 'GPU' ? '#eef2ff' : C.bgMuted,
-                      border: `1px solid ${badge === 'v7.5' ? '#fde68a' : badge === 'GPU' ? '#c7d2fe' : C.border}`,
-                      padding: '1px 4px', borderRadius: 3, letterSpacing: '0.04em',
-                      flexShrink: 0,
+                      color:   badge === 'v8.0' ? C.teal   : badge === 'v7.5' ? C.amber : badge === 'GPU' ? '#6366f1' : C.textMuted,
+                      background: badge === 'v8.0' ? '#ecfeff' : badge === 'v7.5' ? '#fffbeb' : badge === 'GPU' ? '#eef2ff' : C.bgMuted,
+                      border: `1px solid ${badge === 'v8.0' ? '#a5f3fc' : badge === 'v7.5' ? '#fde68a' : badge === 'GPU' ? '#c7d2fe' : C.border}`,
+                      padding: '1px 4px', borderRadius: 3, letterSpacing: '0.04em', flexShrink: 0,
                     }}>{badge}</span>
                   )}
                 </div>
@@ -158,8 +176,59 @@ export default function LayerPanel({ capas, onChange }: Props) {
         })}
       </div>
 
-      {/* ── Leyenda: Zona Sísmica NTE E.030-2018 ────────── */}
+      {/* ── 🆕 v8.0: Leyenda Precipitaciones + FEN ───────── */}
       <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px solid ${C.border}` }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em' }}>
+            Precipitaciones · Índice FEN
+          </span>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 700, color: C.teal, background: '#ecfeff', border: '1px solid #a5f3fc', padding: '1px 4px', borderRadius: 3 }}>
+            SENAMHI/CHIRPS
+          </span>
+        </div>
+        {/* Escala indice_fen */}
+        {FEN_SCALE.map(({ range, label, color, desc }) => (
+          <div key={range} style={{ display: 'flex', gap: 8, marginBottom: 6, alignItems: 'flex-start' }}>
+            <div style={{
+              width: 28, height: 16, borderRadius: 4, flexShrink: 0, marginTop: 1,
+              background: color + '25', border: `2px solid ${color}80`,
+            }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10, fontWeight: 600, color: C.textSec }}>{label}</span>
+                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color }}>{range}</span>
+              </div>
+              <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 9, color: C.textMuted }}>{desc}</span>
+            </div>
+          </div>
+        ))}
+
+        {/* Tipo climático chips */}
+        <div style={{ marginTop: 8, fontFamily: "'DM Mono',monospace", fontSize: 8, color: C.textMuted, marginBottom: 4 }}>
+          Tipo climático
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+          {Object.entries(TIPO_PRECIP_COLORS).map(([tipo, color]) => (
+            <div key={tipo} style={{ display: 'flex', alignItems: 'center', gap: 3, padding: '2px 7px', background: color + '15', border: `1px solid ${color}40`, borderRadius: 99 }}>
+              <div style={{ width: 5, height: 5, borderRadius: '50%', background: color }} />
+              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 7.5, color: C.textSec }}>
+                {tipo.replace('_', ' ')}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* Nota FEN */}
+        <div style={{ marginTop: 8, padding: '5px 8px', background: '#fef3c7', border: '1px solid #fde68a', borderRadius: 6 }}>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 7.5, color: '#92400e', lineHeight: 1.5 }}>
+            FEN 1997/98 (ONI=2.4): Piura recibió<br />
+            3 500 mm en 3 meses (×4.5 la media)
+          </span>
+        </div>
+      </div>
+
+      {/* ── Leyenda: Zona Sísmica NTE E.030-2018 ────────── */}
+      <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em' }}>
             Zona Sísmica · NTE E.030
@@ -188,14 +257,14 @@ export default function LayerPanel({ capas, onChange }: Props) {
         ))}
       </div>
 
-      {/* ── Leyenda: IRC — Riesgo de Construcción ────────── */}
+      {/* ── Leyenda: IRC — Riesgo de Construcción v8.0 ────── */}
       <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
         <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: 6 }}>
           Índice Riesgo Construcción
         </div>
         <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 7, padding: '6px 8px', marginBottom: 8 }}>
           <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: '#92400e', lineHeight: 1.5 }}>
-            0.40×Sísmico + 0.25×Inundación<br />
+            0.40×Sísmico + 0.25×Inundación×<span style={{ color: C.teal }}>FEN</span><br />
             + 0.20×Desliz. + 0.10×Tsunami + 0.05×Fallas
           </div>
         </div>
@@ -252,21 +321,21 @@ export default function LayerPanel({ capas, onChange }: Props) {
         ))}
       </div>
 
-      {/* ── Leyenda: Infraestructura + fuente_tipo v7.0 ─── */}
+      {/* ── Leyenda: Infraestructura + fuente_tipo ───────── */}
       <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
         <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: 8 }}>
           Infraestructura crítica
         </div>
-        {/* Fuente_tipo badge */}
         <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: '#ecfdf5', border: '1px solid #a7f3d0', borderRadius: 6 }}>
-            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#059669', border: '2px solid white', boxShadow: '0 0 0 1.5px #059669' }} />
-            <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, fontWeight: 700, color: '#059669' }}>Oficial</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 6 }}>
-            <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#6366f1', opacity: 0.7, border: '1.5px solid white', boxShadow: '0 0 0 1px #6366f1' }} />
-            <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, fontWeight: 700, color: '#6366f1' }}>OSM</span>
-          </div>
+          {[
+            { label: 'Oficial', color: '#059669', bg: '#ecfdf5', border: '#a7f3d0', size: 9 },
+            { label: 'OSM',     color: '#6366f1', bg: '#f5f3ff', border: '#ddd6fe', size: 7 },
+          ].map(({ label, color, bg, border, size }) => (
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: bg, border: `1px solid ${border}`, borderRadius: 6 }}>
+              <div style={{ width: size, height: size, borderRadius: '50%', background: color, border: '2px solid white', boxShadow: `0 0 0 1.5px ${color}` }} />
+              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, fontWeight: 700, color }}>{label}</span>
+            </div>
+          ))}
         </div>
         {[
           { color: '#ef4444', label: 'Hospital / Clínica'    },
@@ -301,24 +370,6 @@ export default function LayerPanel({ capas, onChange }: Props) {
         </div>
       </div>
 
-      {/* ── Leyenda: Deslizamientos ──────────────────────── */}
-      <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
-        <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: 8 }}>
-          Deslizamientos
-        </div>
-        {[
-          { color: '#92400e', label: 'Deslizamiento' },
-          { color: '#b45309', label: 'Huayco'        },
-          { color: '#d97706', label: 'Derrumbe'      },
-          { color: '#f59e0b', label: 'Flujo detrítico'},
-        ].map(({ color, label }) => (
-          <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
-            <div style={{ width: 8, height: 8, borderRadius: 2, background: color, flexShrink: 0 }} />
-            <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: C.textSec }}>{label}</span>
-          </div>
-        ))}
-      </div>
-
       {/* ── Leyenda: Suelo NTE E.031-2020 ───────────────── */}
       <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
@@ -330,10 +381,10 @@ export default function LayerPanel({ capas, onChange }: Props) {
           </span>
         </div>
         {[
-          { code: 'S1', label: 'Roca / Suelo rígido',       sub: 'Vs30 > 500 m/s · Sierra/roca', color: '#059669' },
-          { code: 'S2', label: 'Suelo intermedio',           sub: 'Vs30 180–500 m/s · Valles',    color: '#f59e0b' },
-          { code: 'S3', label: 'Suelo blando',               sub: 'Vs30 < 180 m/s · Costa/llano', color: '#f97316' },
-          { code: 'S4', label: 'Condiciones especiales',     sub: 'Tsunami/licuefacción/relleno',  color: '#dc2626' },
+          { code: 'S1', label: 'Roca / Suelo rígido',   sub: 'Vs30 > 500 m/s',    color: '#059669' },
+          { code: 'S2', label: 'Suelo intermedio',       sub: 'Vs30 180–500 m/s',  color: '#f59e0b' },
+          { code: 'S3', label: 'Suelo blando',           sub: 'Vs30 < 180 m/s',    color: '#f97316' },
+          { code: 'S4', label: 'Condiciones especiales', sub: 'Tsunami/licuefacción',color: '#dc2626' },
         ].map(({ code, label, sub, color }) => (
           <div key={code} style={{ display: 'flex', gap: 8, marginBottom: 7, alignItems: 'flex-start' }}>
             <div style={{

@@ -1,7 +1,9 @@
 ﻿// ══════════════════════════════════════════════════════════
-// StatsChart.tsx v6.0
-// Nuevos modos: IRC ranking distritos + población por zona
-// React.memo evita re-renders innecesarios
+// StatsChart.tsx v8.0
+// 🆕 Modo 'fen': timeline de eventos El Niño/La Niña históricos
+//    BarChart horizontal con intensidad como color
+//    Tooltip con ONI peak, duración e impacto Perú
+// ✅ Modos cantidad, magnitud, profundidad, irc mantenidos
 // ══════════════════════════════════════════════════════════
 
 import { useState, memo } from 'react'
@@ -10,22 +12,30 @@ import {
   Tooltip, ResponsiveContainer, Cell, ReferenceLine,
   CartesianGrid,
 } from 'recharts'
-import type { EstadisticaAnual, RiesgoConstruccionRanking } from '../types'
+import type { EstadisticaAnual, RiesgoConstruccionRanking, EventoFENData } from '../types'
 
 const C = {
   primary: '#059669', danger: '#dc2626', warning: '#f59e0b',
   text: '#0f172a', textMuted: '#94a3b8', border: '#e2e8f0', bgMuted: '#f1f5f9',
-  orange: '#f97316', indigo: '#6366f1', amber: '#f59e0b',
+  orange: '#f97316', indigo: '#6366f1', amber: '#f59e0b', teal: '#0891b2',
 }
 
-const RISK_COLORS = [C.primary, '#10b981', C.warning, C.orange, C.danger]
+const RISK_COLORS  = [C.primary, '#10b981', C.warning, C.orange, C.danger]
+const FEN_COLORS: Record<string, string> = {
+  debil:          '#10b981',
+  moderado:       '#f59e0b',
+  fuerte:         '#f97316',
+  extraordinario: '#dc2626',
+  la_nina:        '#0ea5e9',
+}
 
-type Modo = 'cantidad' | 'magnitud' | 'profundidad' | 'irc'
+type Modo = 'cantidad' | 'magnitud' | 'profundidad' | 'irc' | 'fen'
 
 interface Props {
   estadisticas: EstadisticaAnual[]
-  loading: boolean
-  ircRanking?: RiesgoConstruccionRanking[]
+  loading:      boolean
+  ircRanking?:  RiesgoConstruccionRanking[]
+  eventosFen?:  EventoFENData[]          // 🆕 v8.0
 }
 
 function CustomTooltip({ active, payload, label }: {
@@ -35,26 +45,13 @@ function CustomTooltip({ active, payload, label }: {
   const d = payload[0]?.payload
   if (!d) return null
   return (
-    <div style={{
-      background: '#fff', border: `1px solid ${C.border}`, borderRadius: 10,
-      padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)', minWidth: 170,
-    }}>
-      <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>
-        {label}
-      </p>
-      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: C.primary, marginBottom: 3 }}>
-        {d.cantidad.toLocaleString('es-PE')} sismos
-      </p>
-      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.warning, marginBottom: 2 }}>
-        Máx: {d.magnitud_max} Mw
-      </p>
-      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-        Prom: {d.magnitud_prom?.toFixed(2)} Mw
-      </p>
+    <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)', minWidth: 170 }}>
+      <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>{label}</p>
+      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: C.primary, marginBottom: 3 }}>{d.cantidad.toLocaleString('es-PE')} sismos</p>
+      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.warning, marginBottom: 2 }}>Máx: {d.magnitud_max} Mw</p>
+      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, marginBottom: 6 }}>Prom: {d.magnitud_prom?.toFixed(2)} Mw</p>
       {(d.m6_plus > 0 || d.m7_plus > 0) && (
-        <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.danger, marginBottom: 4 }}>
-          M6+: {d.m6_plus}  M7+: {d.m7_plus}
-        </p>
+        <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.danger, marginBottom: 4 }}>M6+: {d.m6_plus}  M7+: {d.m7_plus}</p>
       )}
       <div style={{ height: 1, background: C.border, margin: '6px 0' }} />
       <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: '#dc2626' }}>Superf: {d.superficiales}</p>
@@ -70,27 +67,49 @@ function IRCTooltip({ active, payload }: { active?: boolean; payload?: Array<{ p
   if (!d) return null
   const nivel = Math.max(1, Math.min(5, Math.round(d.indice_riesgo_construccion)))
   return (
-    <div style={{
-      background: '#fff', border: `1px solid ${C.border}`, borderRadius: 10,
-      padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)', minWidth: 200,
-    }}>
-      <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 4 }}>
-        {d.distrito}
-      </p>
-      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-        {d.departamento}
-      </p>
+    <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)', minWidth: 200 }}>
+      <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 4 }}>{d.distrito}</p>
+      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, marginBottom: 6 }}>{d.departamento}</p>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
         <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted }}>IRC</span>
-        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 800, color: RISK_COLORS[nivel - 1] }}>
-          {d.indice_riesgo_construccion.toFixed(2)}
-        </span>
+        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 800, color: RISK_COLORS[nivel - 1] }}>{d.indice_riesgo_construccion.toFixed(2)}</span>
       </div>
       {d.zona_sismica && (
         <div style={{ display: 'flex', justifyContent: 'space-between' }}>
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted }}>Zona sísmica</span>
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, fontWeight: 700, color: C.danger }}>Z{d.zona_sismica} ({d.factor_z}g)</span>
         </div>
+      )}
+    </div>
+  )
+}
+
+// 🆕 v8.0: Tooltip para eventos FEN
+function FENTooltip({ active, payload }: { active?: boolean; payload?: Array<{ payload: EventoFENData & { label: string; oni_abs: number } }> }) {
+  if (!active || !payload?.length) return null
+  const d = payload[0]?.payload
+  if (!d) return null
+  const isElNino = d.tipo === 'el_nino'
+  const color    = isElNino ? (FEN_COLORS[d.intensidad ?? 'debil'] ?? C.orange) : C.teal
+  return (
+    <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 14px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)', maxWidth: 240 }}>
+      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 800, color, marginBottom: 4 }}>
+        {d.tipo === 'el_nino' ? '🌡 El Niño' : '❄ La Niña'} {d.año_inicio}/{(d.año_fin % 100).toString().padStart(2,'0')}
+      </p>
+      {d.intensidad && (
+        <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: C.textMuted, marginBottom: 4 }}>
+          {d.intensidad.charAt(0).toUpperCase() + d.intensidad.slice(1)} · ONI {d.oni_peak?.toFixed(2) ?? '-'}°C
+        </p>
+      )}
+      {d.duracion_meses && (
+        <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted, marginBottom: 6 }}>
+          Duración: {d.duracion_meses} meses
+        </p>
+      )}
+      {d.impacto_peru && (
+        <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: C.text, lineHeight: 1.4, borderTop: `1px solid ${C.border}`, paddingTop: 6 }}>
+          {d.impacto_peru.substring(0, 120)}{d.impacto_peru.length > 120 ? '…' : ''}
+        </p>
       )}
     </div>
   )
@@ -109,14 +128,14 @@ function Skeleton() {
   )
 }
 
-const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking = [] }: Props) {
+const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking = [], eventosFen = [] }: Props) {
   const [modo, setModo] = useState<Modo>('cantidad')
 
   if (loading) return <Skeleton />
-  if (!estadisticas.length && modo !== 'irc') {
+  if (!estadisticas.length && modo !== 'irc' && modo !== 'fen') {
     return (
       <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'DM Mono',monospace", fontSize: 11, color: C.textMuted }}>
-        Sin datos — API en línea?
+        Sin datos — ¿API en línea?
       </div>
     )
   }
@@ -131,12 +150,23 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking 
     { key: 'magnitud',    label: 'Magnitud',  color: C.warning },
     { key: 'profundidad', label: 'Profund.',  color: C.indigo  },
     { key: 'irc',         label: 'IRC ▸Top',  color: C.amber   },
+    { key: 'fen',         label: '🌡 FEN',    color: C.teal    },
   ]
 
-  // IRC ranking — top 15 distritos
+  // IRC top 15
   const ircTop = [...ircRanking]
     .sort((a, b) => b.indice_riesgo_construccion - a.indice_riesgo_construccion)
     .slice(0, 15)
+
+  // 🆕 v8.0: FEN data para gráfica — solo el_nino y la_nina, ordenados por año
+  const fenData = eventosFen
+    .filter(e => e.tipo !== 'neutro' && e.oni_peak !== null)
+    .sort((a, b) => a.año_inicio - b.año_inicio)
+    .map(e => ({
+      ...e,
+      label:   `${e.año_inicio}/${(e.año_fin % 100).toString().padStart(2,'0')}`,
+      oni_abs: Math.abs(e.oni_peak ?? 0),
+    }))
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -156,6 +186,8 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking 
         <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: C.textMuted }}>
           {modo === 'irc' ? (
             <span style={{ color: C.amber, fontWeight: 700 }}>{ircTop.length} distritos · IRC CENEPRED</span>
+          ) : modo === 'fen' ? (
+            <span style={{ color: C.teal, fontWeight: 700 }}>{fenData.length} eventos ENSO · NOAA-CPC</span>
           ) : (
             <>
               <span style={{ color: C.text, fontWeight: 700 }}>{total.toLocaleString('es-PE')}</span>
@@ -199,17 +231,9 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking 
               <Area dataKey="magnitud_prom" stroke={C.primary} strokeWidth={1}   fill="none" strokeDasharray="3 3" dot={false} />
             </AreaChart>
           ) : modo === 'irc' ? (
-            <BarChart
-              data={ircTop}
-              layout="vertical"
-              margin={{ top: 0, right: 10, left: 8, bottom: 0 }}
-            >
+            <BarChart data={ircTop} layout="vertical" margin={{ top: 0, right: 10, left: 8, bottom: 0 }}>
               <XAxis type="number" domain={[0, 5]} tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }} tickLine={false} axisLine={false} />
-              <YAxis
-                type="category" dataKey="distrito"
-                tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }}
-                tickLine={false} axisLine={false} width={70}
-              />
+              <YAxis type="category" dataKey="distrito" tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }} tickLine={false} axisLine={false} width={70} />
               <Tooltip content={<IRCTooltip />} cursor={{ fill: 'rgba(245,158,11,0.05)' }} />
               <Bar dataKey="indice_riesgo_construccion" radius={[0, 3, 3, 0]} maxBarSize={10}>
                 {ircTop.map((e, i) => {
@@ -218,7 +242,38 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking 
                 })}
               </Bar>
             </BarChart>
+
+          ) : modo === 'fen' ? (
+            // 🆕 v8.0: Timeline de eventos FEN — BarChart vertical por ONI abs
+            <BarChart data={fenData} margin={{ top: 2, right: 0, left: -30, bottom: 0 }}>
+              <XAxis
+                dataKey="label"
+                tick={{ fill: C.textMuted, fontSize: 7, fontFamily: 'DM Mono' }}
+                tickLine={false} axisLine={false}
+                interval="preserveStartEnd"
+              />
+              <YAxis
+                tick={{ fill: C.textMuted, fontSize: 8, fontFamily: 'DM Mono' }}
+                tickLine={false} axisLine={false}
+                domain={[0, 2.6]}
+                label={{ value: '|ONI| °C', angle: -90, position: 'insideLeft', fill: C.textMuted, fontSize: 7 }}
+              />
+              <Tooltip content={<FENTooltip />} cursor={{ fill: 'rgba(8,145,178,0.05)' }} />
+              <ReferenceLine y={0.5} stroke={C.teal} strokeDasharray="2 2" />
+              <ReferenceLine y={1.5} stroke={C.orange} strokeDasharray="2 2" />
+              <ReferenceLine y={2.0} stroke={C.danger} strokeDasharray="2 2" />
+              <Bar dataKey="oni_abs" radius={[2, 2, 0, 0]} maxBarSize={14}>
+                {fenData.map((e, i) => {
+                  const color = e.tipo === 'la_nina'
+                    ? C.teal
+                    : (FEN_COLORS[e.intensidad ?? 'debil'] ?? C.orange)
+                  return <Cell key={i} fill={color} />
+                })}
+              </Bar>
+            </BarChart>
+
           ) : (
+            // Profundidad
             <AreaChart data={estadisticas} margin={{ top: 2, right: 0, left: -30, bottom: 0 }}>
               <defs>
                 <linearGradient id="gS" x1="0" y1="0" x2="0" y2="1">
@@ -244,6 +299,27 @@ const StatsChart = memo(function StatsChart({ estadisticas, loading, ircRanking 
           )}
         </ResponsiveContainer>
       </div>
+
+      {/* 🆕 v8.0: Mini leyenda FEN */}
+      {modo === 'fen' && (
+        <div style={{ display: 'flex', gap: 8, marginTop: 4, flexShrink: 0, flexWrap: 'wrap' }}>
+          {[
+            { color: C.teal,    label: 'La Niña'       },
+            { color: '#10b981', label: 'El Niño débil'  },
+            { color: C.warning, label: 'Moderado'       },
+            { color: C.orange,  label: 'Fuerte'         },
+            { color: C.danger,  label: 'Extraordinario' },
+          ].map(({ color, label }) => (
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+              <div style={{ width: 8, height: 8, borderRadius: 2, background: color }} />
+              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 7.5, color: C.textMuted }}>{label}</span>
+            </div>
+          ))}
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, color: C.textMuted, marginLeft: 'auto' }}>
+            líneas: 0.5 | 1.5 | 2.0°C ONI
+          </span>
+        </div>
+      )}
     </div>
   )
 })
