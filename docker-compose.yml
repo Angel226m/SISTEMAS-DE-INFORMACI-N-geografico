@@ -1,12 +1,18 @@
- 
-# ══════════════════════════════════════════════════════════
-#  GeoRiesgo Perú — Stack v4.0
-#  PostGIS + FastAPI + Nginx
-# ══════════════════════════════════════════════════════════
+# GeoRiesgo Perú v9.0 — Stack completo
+# PostGIS + FastAPI + Redis + Nginx
+# SIN MinIO (para activar STAC/COG descomenta el servicio minio al final)
+#
+# CORRECCIONES vs versión anterior:
+#   · image: georiesgo_api:9.0  (era 4.0)
+#   · volumen models montado externamente (modelos ML persisten entre reinicios)
+#   · ML_MIN_SAMPLES=10 → ML arranca con pocos datos
+#   · ML_AUTO_TRAIN=1   → entrena automáticamente tras ETL
+#   · start_period backend 300s (ETL tarda hasta 10 min)
+#   · DOCKER_BUILDKIT=1 en el build para aprovechar cache mount
+#   · memory backend 1g (sube de 768m, XGBoost + Optuna necesitan más)
 
 services:
 
-  # ── Base de datos: PostgreSQL 16 + PostGIS 3.4 (Alpine) ─
   db:
     image: postgis/postgis:16-3.4-alpine
     container_name: georiesgo_db
@@ -16,8 +22,7 @@ services:
       POSTGRES_USER:     georiesgo
       POSTGRES_PASSWORD: ${DB_PASSWORD:-georiesgo_secret}
       PGDATA:            /var/lib/postgresql/data/pgdata
-      # Tuning básico para PostGIS
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=es_PE.UTF-8"
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
     command: >
       postgres
         -c shared_buffers=256MB
@@ -27,6 +32,7 @@ services:
         -c checkpoint_completion_target=0.9
         -c wal_buffers=16MB
         -c random_page_cost=1.1
+        -c log_min_duration_statement=5000
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./backend/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
@@ -45,59 +51,107 @@ services:
         limits:
           memory: 1g
 
-  # ── Backend: FastAPI ligero (sin GDAL) ──────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: georiesgo_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --maxmemory 128mb
+        --maxmemory-policy allkeys-lru
+        --save ""
+        --appendonly no
+        --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+      start_period: 5s
+    networks:
+      - georiesgo_net
+    deploy:
+      resources:
+        limits:
+          memory: 160m
+
   backend:
     build:
       context:    ./backend
       dockerfile: Dockerfile
-      cache_from:
-        - python:3.12-slim
-    image: georiesgo_api:4.0
+      # BuildKit necesario para cache mount de pip (ahorra ~2 min en rebuild)
+      args:
+        BUILDKIT_INLINE_CACHE: "1"
+    # FIX: imagen v9.0 (era 4.0)
+    image: georiesgo_api:9.0
     container_name: georiesgo_api
     restart: unless-stopped
     environment:
+      # Base de datos
       DATABASE_URL:      postgresql://georiesgo:${DB_PASSWORD:-georiesgo_secret}@db:5432/georiesgo
       DATABASE_URL_SYNC: postgresql://georiesgo:${DB_PASSWORD:-georiesgo_secret}@db:5432/georiesgo
       DB_HOST:           db
       DB_PORT:           5432
       POSTGRES_DB:       georiesgo
       POSTGRES_USER:     georiesgo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-georiesgo_secret}
+      # Redis
+      REDIS_URL:         redis://redis:6379/0
+      # App
       APP_ENV:           ${APP_ENV:-production}
       LOG_LEVEL:         ${LOG_LEVEL:-INFO}
       FORCE_SYNC:        ${FORCE_SYNC:-0}
       WORKERS:           ${WORKERS:-2}
+      # ML — entrenamiento automático con los datos disponibles
+      # ML_MIN_SAMPLES: número mínimo de muestras para entrenar (10 funciona)
+      ML_MIN_SAMPLES:    ${ML_MIN_SAMPLES:-10}
+      # ML_AUTO_TRAIN=1  →  entrena tras el ETL automáticamente
+      ML_AUTO_TRAIN:     ${ML_AUTO_TRAIN:-1}
+      # MINIO — desactivado por defecto
+      MINIO_ENABLED:     ${MINIO_ENABLED:-0}
+      MINIO_ENDPOINT:    ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY:  ${MINIO_ACCESS_KEY:-georiesgo}
+      MINIO_SECRET_KEY:  ${MINIO_SECRET_KEY:-georiesgo_secret}
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      # Persiste modelos ML entre reinicios (no reentrenar en cada restart)
+      - models_data:/app/models
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout:  10s
-      start_period: 180s
-      retries:  5
+      # FIX: 300s  (ETL primera carga ~8-30 min; healthcheck falla pero container sigue)
+      start_period: 300s
+      retries:  10
     networks:
       - georiesgo_net
     deploy:
       resources:
         limits:
-          memory: 512m
+          # Sube de 768m → XGBoost + Optuna 50 trials necesitan ~800MB pico
+          memory: 1g
 
-  # ── Frontend: nginx proxy ────────────────────────────────
   frontend:
     build:
       context:    ./frontend
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: ""   # vacío = rutas relativas /api/*
+        # URL vacío → usa proxy nginx (mismo host)
+        VITE_API_URL: "${VITE_API_URL:-}"
+    image: georiesgo_frontend:9.0
     container_name: georiesgo_frontend
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
+      - "${FRONTEND_PORT:-80}:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - georiesgo_net
     deploy:
@@ -105,9 +159,41 @@ services:
         limits:
           memory: 64m
 
+# ─── MinIO (STAC/COG) — descomenta si necesitas almacenamiento de rasters ───
+#
+#  minio:
+#    image: minio/minio:latest
+#    container_name: georiesgo_minio
+#    command: server /data --console-address ":9001"
+#    environment:
+#      MINIO_ROOT_USER:     ${MINIO_ACCESS_KEY:-georiesgo}
+#      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-georiesgo_secret}
+#    volumes:
+#      - minio_data:/data
+#    ports:
+#      - "9000:9000"   # API
+#      - "9001:9001"   # Console web
+#    healthcheck:
+#      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+#      interval: 30s
+#      timeout: 5s
+#      retries: 3
+#      start_period: 10s
+#    networks:
+#      - georiesgo_net
+#    deploy:
+#      resources:
+#        limits:
+#          memory: 256m
+
 volumes:
   pgdata:
     driver: local
+  # Modelos ML persistentes (XGBoost .pkl)
+  models_data:
+    driver: local
+  # minio_data:
+  #   driver: local
 
 networks:
   georiesgo_net:

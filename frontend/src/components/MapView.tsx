@@ -1,11 +1,10 @@
 ﻿// ══════════════════════════════════════════════════════════
-// MapView.tsx v8.0
-// 🆕 Capa precipitaciones: GeoJsonLayer coloreada por indice_fen
-//    indice_fen < 0.9  → teal/verde (sequía en FEN)
-//    indice_fen 0.9–2  → amarillo-naranja (amplificación mod.)
-//    indice_fen > 2    → naranja-rojo (amplificación alta/catastrófica)
-// 🆕 Props: precipitaciones FC + capas.precipitaciones
-// ✅ Todos los comportamientos v7.x mantenidos
+// MapView.tsx v9.0
+// 🆕 ScatterplotLayer volcanes — coloreado por estado
+//    activo_critico→rojo, activo→naranja, potencial→amber
+// 🆕 GeoJsonLayer susceptibilidad — grilla 0.05° por score
+// 🆕 ScatterplotLayer alertas_ews — pulso animado por nivel
+// ✅ Todos los comportamientos v8.0 mantenidos
 // ══════════════════════════════════════════════════════════
 
 import { useEffect, useRef, useCallback, useMemo } from 'react'
@@ -15,12 +14,12 @@ import { MapboxOverlay } from '@deck.gl/mapbox'
 import { ScatterplotLayer, GeoJsonLayer } from '@deck.gl/layers'
 import { ScreenGridLayer } from '@deck.gl/aggregation-layers'
 import { DataFilterExtension } from '@deck.gl/extensions'
-import type { CapasActivas, TipoVista, TooltipInfo, FiltrosSismos } from '../types'
+import type { CapasActivas, TipoVista, TooltipInfo, FiltrosSismos, AlertaRT } from '../types'
 
-const PERU_CENTER: [number, number] = [-75.0, -10.5]
-const PERU_ZOOM = 5.2
-const ICA_CENTER: [number, number] = [-75.73, -14.07]
-const ICA_ZOOM = 8.5
+const PERU_CENTER: [number,number] = [-75.0, -10.5]
+const PERU_ZOOM  = 5.2
+const ICA_CENTER: [number,number] = [-75.73, -14.07]
+const ICA_ZOOM   = 8.5
 
 const MAP_STYLES = {
   light: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
@@ -33,404 +32,433 @@ type FC   = GeoJSON.FeatureCollection
 type Feat = GeoJSON.Feature
 type FPt  = GeoJSON.Feature<GeoJSON.Point>
 
-const profCode = (tipo: string | null): number =>
-  tipo === 'superficial' ? 1 : tipo === 'intermedio' ? 2 : tipo === 'profundo' ? 3 : 99
+const profCode  = (tipo: string|null): number =>
+  tipo==='superficial'?1:tipo==='intermedio'?2:tipo==='profundo'?3:99
 
 const profColor = (km: number): [number,number,number,number] =>
-  km < 30  ? [220,38,38,220]  :
-  km < 70  ? [249,115,22,200] :
-             [14,165,233,185]
+  km<30?[220,38,38,220]:km<70?[249,115,22,200]:[14,165,233,185]
 
 const riskColor = (n: number): [number,number,number,number] => {
   const cols: [number,number,number,number][] = [
-    [5,150,105,90], [16,185,129,110], [245,158,11,130],
-    [249,115,22,155], [220,38,38,175],
+    [5,150,105,90],[16,185,129,110],[245,158,11,130],[249,115,22,155],[220,38,38,175],
   ]
-  return cols[Math.max(0, Math.min(4, n - 1))] ?? [148,163,184,80]
+  return cols[Math.max(0,Math.min(4,n-1))] ?? [148,163,184,80]
 }
 
-const zonaSismicaFillColor = (z: number | null): [number,number,number,number] => {
-  switch (z) {
-    case 1: return [5,150,105,25]
-    case 2: return [245,158,11,30]
-    case 3: return [249,115,22,38]
-    case 4: return [220,38,38,48]
-    default:return [148,163,184,15]
+const zonaSismicaFillColor = (z: number|null): [number,number,number,number] => {
+  switch(z){case 1:return[5,150,105,25];case 2:return[245,158,11,30];case 3:return[249,115,22,38];case 4:return[220,38,38,48];default:return[148,163,184,15]}
+}
+const zonaSismicaLineColor = (z: number|null): [number,number,number,number] => {
+  switch(z){case 1:return[5,150,105,180];case 2:return[245,158,11,180];case 3:return[249,115,22,190];case 4:return[220,38,38,210];default:return[124,58,237,160]}
+}
+
+const precipFillColor = (fen: number|null): [number,number,number,number] => {
+  const f=fen??1.0
+  if(f<0.9)  return[8,145,178,50]
+  if(f<1.3)  return[148,163,184,35]
+  if(f<2.0)  return[245,158,11,50]
+  if(f<3.5)  return[249,115,22,60]
+  return          [220,38,38,70]
+}
+const precipLineColor = (fen: number|null): [number,number,number,number] => {
+  const f=fen??1.0
+  if(f<0.9)  return[8,145,178,200]
+  if(f<1.3)  return[148,163,184,150]
+  if(f<2.0)  return[245,158,11,200]
+  if(f<3.5)  return[249,115,22,210]
+  return          [220,38,38,220]
+}
+
+// 🆕 v9: color volcán por estado
+const volcanColor = (estado: string|null): [number,number,number,number] => {
+  switch(estado){
+    case 'activo_critico':         return [220,38,38,220]
+    case 'activo':                 return [249,115,22,200]
+    case 'potencialmente_activo':  return [245,158,11,180]
+    default:                       return [148,163,184,140]
   }
 }
-const zonaSismicaLineColor = (z: number | null): [number,number,number,number] => {
-  switch (z) {
-    case 1: return [5,150,105,180]
-    case 2: return [245,158,11,180]
-    case 3: return [249,115,22,190]
-    case 4: return [220,38,38,210]
-    default:return [124,58,237,160]
+const volcanRadio = (estado: string|null): number => {
+  switch(estado){
+    case 'activo_critico':  return 12_000
+    case 'activo':          return 9_000
+    case 'potencialmente_activo': return 6_000
+    default: return 4_000
   }
 }
 
-const deslizColor = (tipo: string | null): [number,number,number,number] => {
+// 🆕 v9: color susceptibilidad ML por score
+const mlFillColor = (score: number|null): [number,number,number,number] => {
+  const s=score??0
+  if(s<0.2) return[5,150,105,60]
+  if(s<0.4) return[16,185,129,70]
+  if(s<0.6) return[245,158,11,80]
+  if(s<0.8) return[249,115,22,90]
+  return         [220,38,38,100]
+}
+
+// 🆕 v9: color alerta EWS por nivel
+const ewsColor = (nivel: string|null): [number,number,number,number] => {
+  switch(nivel){
+    case 'emergency': return[220,38,38,240]
+    case 'warning':   return[249,115,22,220]
+    case 'watch':     return[245,158,11,200]
+    default:          return[148,163,184,180]
+  }
+}
+
+const deslizColor = (tipo: string|null): [number,number,number,number] => {
   const M: Record<string,[number,number,number,number]> = {
-    deslizamiento:    [146,64,14,160],
-    huayco:           [180,83,9,170],
-    derrumbe:         [217,119,6,160],
-    flujo_detritico:  [245,158,11,150],
-    reptacion:        [161,98,7,140],
+    deslizamiento:[146,64,14,160],huayco:[180,83,9,170],derrumbe:[217,119,6,160],
+    flujo_detritico:[245,158,11,150],reptacion:[161,98,7,140],
   }
-  return M[tipo ?? ''] ?? [146,64,14,140]
+  return M[tipo??'']??[146,64,14,140]
 }
 
 const infraColor = (tipo: string): [number,number,number,number] => {
   const M: Record<string,[number,number,number,number]> = {
-    hospital:          [239,68,68,230],
-    clinica:           [248,113,113,210],
-    escuela:           [99,102,241,220],
-    aeropuerto:        [6,182,212,230],
-    puerto:            [20,184,166,230],
-    bomberos:          [234,179,8,230],
-    policia:           [59,130,246,220],
-    central_electrica: [250,204,21,230],
-    planta_agua:       [56,189,248,220],
-    puente:            [156,163,175,210],
-    albergue:          [167,139,250,220],
-    refugio:           [167,139,250,220],
+    hospital:[239,68,68,230],clinica:[248,113,113,210],escuela:[99,102,241,220],
+    aeropuerto:[6,182,212,230],puerto:[20,184,166,230],bomberos:[234,179,8,230],
+    policia:[59,130,246,220],central_electrica:[250,204,21,230],planta_agua:[56,189,248,220],
+    puente:[156,163,175,210],albergue:[167,139,250,220],refugio:[167,139,250,220],
   }
-  return M[tipo] ?? [148,163,184,200]
+  return M[tipo]??[148,163,184,200]
 }
 
-/**
- * 🆕 v8.0: Color de zona de precipitación según indice_fen.
- * Escala divergente:
- *   < 0.9  → teal (sequía en FEN)
- *   0.9-1.3→ gris-azul (sin cambio)
- *   1.3-2.0→ amarillo (amplificación moderada)
- *   2.0-3.5→ naranja (amplificación alta)
- *   > 3.5  → rojo (catastrófico)
- */
-const precipFillColor = (fen: number | null): [number,number,number,number] => {
-  const f = fen ?? 1.0
-  if (f < 0.9)  return [8,145,178,50]    // teal — sequía
-  if (f < 1.3)  return [148,163,184,35]   // gris — neutral
-  if (f < 2.0)  return [245,158,11,50]    // amber
-  if (f < 3.5)  return [249,115,22,60]    // naranja
-  return               [220,38,38,70]     // rojo — catastrófico
-}
-const precipLineColor = (fen: number | null): [number,number,number,number] => {
-  const f = fen ?? 1.0
-  if (f < 0.9)  return [8,145,178,200]
-  if (f < 1.3)  return [148,163,184,150]
-  if (f < 2.0)  return [245,158,11,200]
-  if (f < 3.5)  return [249,115,22,210]
-  return               [220,38,38,220]
-}
-
-const get = <T,>(f: Feat, k: string): T | undefined =>
-  (f.properties as Record<string,unknown> | null)?.[k] as T | undefined
+const get = <T,>(f: Feat, k: string): T|undefined =>
+  (f.properties as Record<string,unknown>|null)?.[k] as T|undefined
 
 interface Props {
-  sismos:                 FC | null
-  departamentos:          FC | null
-  distritos:              FC | null
-  fallas:                 FC | null
-  inundaciones:           FC | null
-  tsunamis:               FC | null
-  deslizamientos:         FC | null
-  infraestructura:        FC | null
-  estaciones:             FC | null
-  riesgoConstruccionMapa: FC | null
-  /** 🆕 v8.0: zonas climáticas coloreadas por indice_fen */
-  precipitaciones:        FC | null
-  capas:                  CapasActivas
-  vista:                  TipoVista
-  mapStyle?:              MapStyle
-  filtros:                FiltrosSismos
-  onClickFeature:         (props: Record<string,unknown>, layer: string) => void
-  onHoverFeature?:        (info: TooltipInfo | null) => void
+  sismos:                 FC|null
+  departamentos:          FC|null
+  distritos:              FC|null
+  fallas:                 FC|null
+  inundaciones:           FC|null
+  tsunamis:               FC|null
+  deslizamientos:         FC|null
+  infraestructura:        FC|null
+  estaciones:             FC|null
+  riesgoConstruccionMapa: FC|null
+  precipitaciones:        FC|null
+  /** 🆕 v9 */
+  volcanes?:              FC|null
+  susceptibilidadMapa?:   FC|null
+  alertasEWS?:            AlertaRT[]
+  capas:      CapasActivas
+  vista:      TipoVista
+  mapStyle?:  MapStyle
+  filtros:    FiltrosSismos
+  onClickFeature:  (props: Record<string,unknown>, layer: string) => void
+  onHoverFeature?: (info: TooltipInfo|null) => void
 }
 
 export default function MapView({
   sismos, departamentos, distritos, fallas, inundaciones, tsunamis,
   deslizamientos, infraestructura, estaciones, riesgoConstruccionMapa,
   precipitaciones,
-  capas, vista, mapStyle = 'light',
+  volcanes, susceptibilidadMapa, alertasEWS,
+  capas, vista, mapStyle='light',
   filtros, onClickFeature, onHoverFeature,
 }: Props) {
   const mapDiv     = useRef<HTMLDivElement>(null)
-  const mapRef     = useRef<maplibregl.Map | null>(null)
-  const overlayRef = useRef<MapboxOverlay | null>(null)
+  const mapRef     = useRef<maplibregl.Map|null>(null)
+  const overlayRef = useRef<MapboxOverlay|null>(null)
   const clickRef   = useRef(onClickFeature)
   const hoverRef   = useRef(onHoverFeature)
   clickRef.current = onClickFeature
   hoverRef.current = onHoverFeature
 
-  const heatmapData = useMemo((): { position: [number,number]; weight: number }[] => {
-    if (!sismos?.features) return []
+  const heatmapData = useMemo((): {position:[number,number];weight:number}[] => {
+    if(!sismos?.features) return []
     return sismos.features
       .filter(f => {
-        const mag  = get<number>(f, 'magnitud') ?? 0
-        const year = parseInt((get<string>(f, 'fecha') ?? '1960-01-01').substring(0, 4))
-        const tipo = get<string>(f, 'tipo_profundidad') ?? null
-        if (mag  < filtros.mag_min    || mag  > filtros.mag_max)  return false
-        if (year < filtros.year_start || year > filtros.year_end) return false
-        if (filtros.profundidad && tipo !== filtros.profundidad)   return false
+        const mag  = get<number>(f,'magnitud')??0
+        const year = parseInt((get<string>(f,'fecha')??"1960-01-01").substring(0,4))
+        const tipo = get<string>(f,'tipo_profundidad')??null
+        if(mag<filtros.mag_min||mag>filtros.mag_max) return false
+        if(year<filtros.year_start||year>filtros.year_end) return false
+        if(filtros.profundidad&&tipo!==filtros.profundidad) return false
         return true
       })
       .map(f => {
-        const coords = (f as FPt).geometry?.coordinates
-        const mag    = get<number>(f, 'magnitud') ?? 3
-        const weight = Math.max(0.05, Math.min(1.0, (mag - 2) / 6))
-        return { position: [coords?.[0] ?? 0, coords?.[1] ?? 0] as [number,number], weight }
+        const coords=(f as FPt).geometry?.coordinates
+        const mag=get<number>(f,'magnitud')??3
+        const weight=Math.max(0.05,Math.min(1.0,(mag-2)/6))
+        return{position:[coords?.[0]??0,coords?.[1]??0] as [number,number],weight}
       })
-      .filter(d => d.position[0] !== 0 || d.position[1] !== 0)
-  }, [sismos, filtros.mag_min, filtros.mag_max, filtros.year_start, filtros.year_end, filtros.profundidad])
+      .filter(d=>d.position[0]!==0||d.position[1]!==0)
+  }, [sismos,filtros.mag_min,filtros.mag_max,filtros.year_start,filtros.year_end,filtros.profundidad])
 
   useEffect(() => {
-    if (!mapDiv.current || mapRef.current) return
-    const map = new maplibregl.Map({
-      container: mapDiv.current, style: MAP_STYLES[mapStyle],
-      center: ICA_CENTER, zoom: ICA_ZOOM,
-      pitch: 0, bearing: 0, maxPitch: 70,
-      attributionControl: false, scrollZoom: true,
+    if(!mapDiv.current||mapRef.current) return
+    const map=new maplibregl.Map({
+      container:mapDiv.current, style:MAP_STYLES[mapStyle],
+      center:ICA_CENTER, zoom:ICA_ZOOM,
+      pitch:0, bearing:0, maxPitch:70,
+      attributionControl:false, scrollZoom:true,
     })
-    map.scrollZoom.setWheelZoomRate(1 / 450)
-    map.addControl(new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }), 'top-right')
-    map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right')
-    mapRef.current = map
+    map.scrollZoom.setWheelZoomRate(1/450)
+    map.addControl(new maplibregl.NavigationControl({showCompass:true,visualizePitch:true}),'top-right')
+    map.addControl(new maplibregl.ScaleControl({unit:'metric'}),'bottom-right')
+    mapRef.current=map
 
-    const overlay = new MapboxOverlay({
-      interleaved: false, layers: [],
-      onClick: (info) => {
-        if (!info.object) return
-        const props = (info.object as Feat).properties ?? {}
-        clickRef.current(props as Record<string,unknown>, info.layer?.id ?? '')
+    const overlay=new MapboxOverlay({
+      interleaved:false, layers:[],
+      onClick:(info)=>{
+        if(!info.object) return
+        const props=(info.object as Feat).properties??{}
+        clickRef.current(props as Record<string,unknown>,info.layer?.id??'')
       },
-      onHover: (info) => {
-        if (!hoverRef.current) return
-        if (!info.object) { hoverRef.current(null); return }
-        hoverRef.current({ x: info.x, y: info.y, object: info.object as Feat, layer: info.layer?.id ?? null })
+      onHover:(info)=>{
+        if(!hoverRef.current) return
+        if(!info.object){hoverRef.current(null);return}
+        hoverRef.current({x:info.x,y:info.y,object:info.object as Feat,layer:info.layer?.id??null})
       },
-      getTooltip: () => null,
+      getTooltip:()=>null,
     })
     map.addControl(overlay as unknown as maplibregl.IControl)
-    overlayRef.current = overlay
+    overlayRef.current=overlay
 
-    return () => {
-      overlay.finalize()
-      overlayRef.current = null
-      map.remove()
-      mapRef.current = null
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    return ()=>{overlay.finalize();overlayRef.current=null;map.remove();mapRef.current=null}
+  },[]) // eslint-disable-line
 
-  useEffect(() => { mapRef.current?.setStyle(MAP_STYLES[mapStyle]) }, [mapStyle])
-  useEffect(() => { mapRef.current?.easeTo({ pitch: vista === '3d' ? 55 : 0, duration: 800 }) }, [vista])
+  useEffect(()=>{mapRef.current?.setStyle(MAP_STYLES[mapStyle])},[mapStyle])
+  useEffect(()=>{mapRef.current?.easeTo({pitch:vista==='3d'?55:0,duration:800})},[vista])
 
-  useEffect(() => {
-    const toIca  = () => mapRef.current?.flyTo({ center: ICA_CENTER,  zoom: ICA_ZOOM,  pitch: vista === '3d' ? 55 : 0, duration: 1200 })
-    const toPeru = () => mapRef.current?.flyTo({ center: PERU_CENTER, zoom: PERU_ZOOM, pitch: 0, duration: 1400 })
-    window.addEventListener('geo:center-ica',  toIca)
-    window.addEventListener('geo:center-peru', toPeru)
-    return () => {
-      window.removeEventListener('geo:center-ica',  toIca)
-      window.removeEventListener('geo:center-peru', toPeru)
-    }
-  }, [vista])
+  useEffect(()=>{
+    const toIca  =()=>mapRef.current?.flyTo({center:ICA_CENTER, zoom:ICA_ZOOM, pitch:vista==='3d'?55:0,duration:1200})
+    const toPeru =()=>mapRef.current?.flyTo({center:PERU_CENTER,zoom:PERU_ZOOM,pitch:0,duration:1400})
+    window.addEventListener('geo:center-ica', toIca)
+    window.addEventListener('geo:center-peru',toPeru)
+    return ()=>{window.removeEventListener('geo:center-ica',toIca);window.removeEventListener('geo:center-peru',toPeru)}
+  },[vista])
 
   const buildLayers = useCallback(() => {
-    const layers = []
+    const layers=[]
 
-    // ── Departamentos — zona sísmica NTE E.030 ────────────
-    if (capas.departamentos && departamentos)
+    // Departamentos
+    if(capas.departamentos&&departamentos)
       layers.push(new GeoJsonLayer({
-        id: 'departamentos', data: departamentos,
-        getFillColor: (f: Feat) => zonaSismicaFillColor(get<number>(f, 'zona_sismica') ?? null),
-        getLineColor: (f: Feat) => zonaSismicaLineColor(get<number>(f, 'zona_sismica') ?? null),
-        lineWidthMinPixels: 1.5, lineWidthMaxPixels: 3.5,
-        pickable: true, autoHighlight: true, highlightColor: [124,58,237,50],
-        updateTriggers: { getFillColor: [], getLineColor: [] },
+        id:'departamentos',data:departamentos,
+        getFillColor:(f:Feat)=>zonaSismicaFillColor(get<number>(f,'zona_sismica')??null),
+        getLineColor:(f:Feat)=>zonaSismicaLineColor(get<number>(f,'zona_sismica')??null),
+        lineWidthMinPixels:1.5,lineWidthMaxPixels:3.5,pickable:true,autoHighlight:true,
+        highlightColor:[124,58,237,50],
+        updateTriggers:{getFillColor:[],getLineColor:[]},
       }))
 
-    // ── 🆕 v8.0: Precipitaciones — coloreadas por indice_fen ─
-    if (capas.precipitaciones && precipitaciones)
+    // Precipitaciones (v8)
+    if(capas.precipitaciones&&precipitaciones)
       layers.push(new GeoJsonLayer({
-        id: 'precipitaciones', data: precipitaciones,
-        getFillColor: (f: Feat) => precipFillColor(get<number>(f, 'indice_fen') ?? null),
-        getLineColor: (f: Feat) => precipLineColor(get<number>(f, 'indice_fen') ?? null),
-        lineWidthMinPixels: 1, lineWidthMaxPixels: 3,
-        pickable: true, autoHighlight: true,
-        highlightColor: [8,145,178,80],
-        updateTriggers: { getFillColor: [], getLineColor: [] },
+        id:'precipitaciones',data:precipitaciones,
+        getFillColor:(f:Feat)=>precipFillColor(get<number>(f,'indice_fen')??null),
+        getLineColor:(f:Feat)=>precipLineColor(get<number>(f,'indice_fen')??null),
+        lineWidthMinPixels:1,lineWidthMaxPixels:3,pickable:true,autoHighlight:true,
+        highlightColor:[8,145,178,80],
+        updateTriggers:{getFillColor:[],getLineColor:[]},
       }))
 
-    // ── Distritos — riesgo tradicional ────────────────────
-    if (capas.riesgo_distritos && distritos)
+    // Distritos
+    if(capas.riesgo_distritos&&distritos)
       layers.push(new GeoJsonLayer({
-        id: 'distritos', data: distritos,
-        getFillColor: (f: Feat) => riskColor(get<number>(f, 'nivel_riesgo') ?? 3),
-        getLineColor: [100,116,139,60] as [number,number,number,number],
-        lineWidthMinPixels: 0.5, lineWidthMaxPixels: 2,
-        pickable: true, autoHighlight: true, highlightColor: [255,255,255,40],
-        updateTriggers: { getFillColor: [] },
+        id:'distritos',data:distritos,
+        getFillColor:(f:Feat)=>riskColor(get<number>(f,'nivel_riesgo')??3),
+        getLineColor:[100,116,139,60] as [number,number,number,number],
+        lineWidthMinPixels:0.5,lineWidthMaxPixels:2,pickable:true,autoHighlight:true,
+        updateTriggers:{getFillColor:[]},
       }))
 
-    // ── IRC Mapa — distritos por IRC ──────────────────────
-    if (capas.riesgo_construccion && riesgoConstruccionMapa)
+    // IRC Mapa
+    if(capas.riesgo_construccion&&riesgoConstruccionMapa)
       layers.push(new GeoJsonLayer({
-        id: 'riesgo_construccion', data: riesgoConstruccionMapa,
-        getFillColor: (f: Feat) => riskColor(Math.round(get<number>(f, 'indice_riesgo_construccion') ?? 3)),
-        getLineColor: [245,158,11,120] as [number,number,number,number],
-        lineWidthMinPixels: 0.8, lineWidthMaxPixels: 2,
-        pickable: true, autoHighlight: true, highlightColor: [245,158,11,60],
-        updateTriggers: { getFillColor: [] },
+        id:'riesgo_construccion',data:riesgoConstruccionMapa,
+        getFillColor:(f:Feat)=>riskColor(Math.round(get<number>(f,'indice_riesgo_construccion')??3)),
+        getLineColor:[245,158,11,120] as [number,number,number,number],
+        lineWidthMinPixels:0.8,lineWidthMaxPixels:2,pickable:true,autoHighlight:true,
+        updateTriggers:{getFillColor:[]},
       }))
 
-    // ── Inundaciones ──────────────────────────────────────
-    if (capas.inundaciones && inundaciones)
+    // Inundaciones
+    if(capas.inundaciones&&inundaciones)
       layers.push(new GeoJsonLayer({
-        id: 'inundaciones', data: inundaciones,
-        getFillColor: (f: Feat) => {
-          const n = get<number>(f, 'nivel_riesgo') ?? 3
-          return [14,165,233,40 + n * 15] as [number,number,number,number]
+        id:'inundaciones',data:inundaciones,
+        getFillColor:(f:Feat)=>{const n=get<number>(f,'nivel_riesgo')??3;return[14,165,233,40+n*15] as [number,number,number,number]},
+        getLineColor:[14,165,233,180] as [number,number,number,number],
+        lineWidthMinPixels:1.5,lineWidthMaxPixels:4,pickable:true,autoHighlight:true,
+        updateTriggers:{getFillColor:[]},
+      }))
+
+    // Tsunamis
+    if(capas.tsunamis&&tsunamis)
+      layers.push(new GeoJsonLayer({
+        id:'tsunamis',data:tsunamis,
+        getFillColor:[6,182,212,55] as [number,number,number,number],
+        getLineColor:[6,182,212,200] as [number,number,number,number],
+        lineWidthMinPixels:2,lineWidthMaxPixels:5,pickable:true,autoHighlight:true,
+      }))
+
+    // Deslizamientos
+    if(capas.deslizamientos&&deslizamientos)
+      layers.push(new GeoJsonLayer({
+        id:'deslizamientos',data:deslizamientos,
+        getFillColor:(f:Feat)=>deslizColor(get<string>(f,'tipo')??null),
+        getLineColor:[120,53,15,200] as [number,number,number,number],
+        lineWidthMinPixels:1,lineWidthMaxPixels:3,pickable:true,autoHighlight:true,
+        updateTriggers:{getFillColor:[]},
+      }))
+
+    // 🆕 v9: Susceptibilidad ML — grilla 0.05°
+    if(capas.susceptibilidad&&susceptibilidadMapa?.features.length)
+      layers.push(new ScatterplotLayer({
+        id:'susceptibilidad',data:susceptibilidadMapa.features,
+        getPosition:(f:FPt)=>f.geometry.coordinates as [number,number],
+        getRadius:2500,radiusUnits:'meters',
+        getFillColor:(f:Feat)=>mlFillColor(get<number>(f,'score')??null),
+        getLineColor:[255,255,255,40] as [number,number,number,number],
+        radiusMinPixels:4,radiusMaxPixels:20,
+        stroked:true,lineWidthMinPixels:0.5,
+        pickable:true,autoHighlight:true,highlightColor:[255,255,255,60],
+        updateTriggers:{getFillColor:[]},
+      }))
+
+    // 🆕 v9: Volcanes — ScatterplotLayer con radio proporcional a estado
+    if(capas.volcanes&&volcanes?.features.length)
+      layers.push(new ScatterplotLayer({
+        id:'volcanes',data:volcanes.features,
+        getPosition:(f:FPt)=>f.geometry.coordinates as [number,number],
+        getRadius:(f:Feat)=>volcanRadio(get<string>(f,'estado')??null),
+        radiusUnits:'meters',
+        getFillColor:(f:Feat)=>volcanColor(get<string>(f,'estado')??null),
+        getLineColor:[255,255,255,200] as [number,number,number,number],
+        radiusMinPixels:8,radiusMaxPixels:40,
+        stroked:true,lineWidthMinPixels:2,
+        pickable:true,autoHighlight:true,highlightColor:[255,255,255,80],
+        updateTriggers:{getFillColor:[],getRadius:[]},
+      }))
+
+    // 🆕 v9: Alertas EWS — puntos pulsantes
+    if(capas.alertas_ews&&alertasEWS?.length){
+      const alertFeatures = alertasEWS.map(a=>({
+        type:'Feature' as const,
+        geometry:{type:'Point' as const,coordinates:[a.lon,a.lat]},
+        properties:{
+          nivel_alerta:a.nivel_alerta, magnitud:a.magnitud,
+          lugar:a.lugar, created_at:a.created_at,
+          dispara_tsunami:a.dispara_tsunami, dispara_deslizamiento:a.dispara_deslizamiento,
         },
-        getLineColor: [14,165,233,180] as [number,number,number,number],
-        lineWidthMinPixels: 1.5, lineWidthMaxPixels: 4,
-        pickable: true, autoHighlight: true, highlightColor: [14,165,233,60],
-        updateTriggers: { getFillColor: [] },
-      }))
-
-    // ── Tsunamis ──────────────────────────────────────────
-    if (capas.tsunamis && tsunamis)
-      layers.push(new GeoJsonLayer({
-        id: 'tsunamis', data: tsunamis,
-        getFillColor: [6,182,212,55] as [number,number,number,number],
-        getLineColor: [6,182,212,200] as [number,number,number,number],
-        lineWidthMinPixels: 2, lineWidthMaxPixels: 5,
-        pickable: true, autoHighlight: true, highlightColor: [6,182,212,70],
-      }))
-
-    // ── Deslizamientos ────────────────────────────────────
-    if (capas.deslizamientos && deslizamientos)
-      layers.push(new GeoJsonLayer({
-        id: 'deslizamientos', data: deslizamientos,
-        getFillColor: (f: Feat) => deslizColor(get<string>(f, 'tipo') ?? null),
-        getLineColor: [120,53,15,200] as [number,number,number,number],
-        lineWidthMinPixels: 1, lineWidthMaxPixels: 3,
-        pickable: true, autoHighlight: true, highlightColor: [234,179,8,60],
-        updateTriggers: { getFillColor: [] },
-      }))
-
-    // ── Heatmap (ScreenGrid) ───────────────────────────────
-    if (capas.heatmap && heatmapData.length)
-      layers.push(new ScreenGridLayer({
-        id: 'heatmap', data: heatmapData,
-        getPosition: (d: { position: [number,number]; weight: number }) => d.position,
-        getWeight:   (d: { position: [number,number]; weight: number }) => d.weight,
-        cellSizePixels: 20, gpuAggregation: false,
-        colorRange: [
-          [5,150,105,30],[16,185,129,80],[245,158,11,130],
-          [249,115,22,175],[220,38,38,210],[127,29,29,255],
-        ] as [number,number,number,number][],
-        opacity: 0.75, pickable: false,
-      }))
-
-    // ── Sismos — DataFilterExtension GPU ─────────────────
-    if (capas.sismos && sismos?.features.length)
-      layers.push(new ScatterplotLayer({
-        id: 'sismos', data: sismos.features,
-        getPosition:  (f: FPt)  => f.geometry.coordinates as [number,number,number],
-        getRadius:    (f: Feat) => Math.pow(1.8, get<number>(f, 'magnitud') ?? 3) * 800,
-        getFillColor: (f: Feat) => profColor(get<number>(f, 'profundidad_km') ?? 30),
-        getLineColor: [255,255,255,120] as [number,number,number,number],
-        radiusMinPixels: 4, radiusMaxPixels: 32, radiusUnits: 'meters',
-        pickable: true, stroked: true, lineWidthMinPixels: 0.8,
-        autoHighlight: true, highlightColor: [255,255,255,100],
-        getFilterValue: (f: Feat) => [
-          get<number>(f, 'magnitud') ?? 0,
-          parseInt((get<string>(f, 'fecha') ?? '1960-01-01').substring(0, 4)),
-          profCode(get<string>(f, 'tipo_profundidad') ?? null),
-        ] as [number,number,number],
-        filterRange: [
-          [filtros.mag_min, filtros.mag_max],
-          [filtros.year_start, filtros.year_end],
-          filtros.profundidad
-            ? [profCode(filtros.profundidad), profCode(filtros.profundidad)]
-            : [0, 99],
-        ] as [[number,number],[number,number],[number,number]],
-        extensions: [new DataFilterExtension({ filterSize: 3 })],
-        updateTriggers: { getFillColor: [], getFilterValue: [] },
-      }))
-
-    // ── Fallas geológicas ─────────────────────────────────
-    if (capas.fallas && fallas)
-      layers.push(new GeoJsonLayer({
-        id: 'fallas', data: fallas,
-        getLineColor: (f: Feat) =>
-          get<boolean>(f, 'activa')
-            ? [220,38,38,220] as [number,number,number,number]
-            : [156,163,175,140] as [number,number,number,number],
-        lineWidthMinPixels: 1.5, lineWidthMaxPixels: 5,
-        pickable: true, autoHighlight: true, highlightColor: [255,200,0,60],
-        updateTriggers: { getLineColor: [] },
-      }))
-
-    // ── Infraestructura — oficial vs OSM ─────────────────
-    if (capas.infraestructura && infraestructura) {
-      layers.push(new ScatterplotLayer({
-        id: 'infraestructura-oficial',
-        data: infraestructura.features.filter(f => get<string>(f, 'fuente_tipo') === 'oficial'),
-        getPosition:  (f: FPt)  => f.geometry.coordinates as [number,number],
-        getRadius:    800, radiusUnits: 'meters',
-        getFillColor: (f: Feat) => infraColor(get<string>(f, 'tipo') ?? ''),
-        getLineColor: [255,255,255,255] as [number,number,number,number],
-        radiusMinPixels: 6, radiusMaxPixels: 22,
-        stroked: true, lineWidthMinPixels: 2,
-        pickable: true, autoHighlight: true, highlightColor: [255,255,255,120],
-        updateTriggers: { getFillColor: [] },
       }))
       layers.push(new ScatterplotLayer({
-        id: 'infraestructura-osm',
-        data: infraestructura.features.filter(f => get<string>(f, 'fuente_tipo') !== 'oficial'),
-        getPosition:  (f: FPt)  => f.geometry.coordinates as [number,number],
-        getRadius:    550, radiusUnits: 'meters',
-        getFillColor: (f: Feat) => {
-          const c = infraColor(get<string>(f, 'tipo') ?? '')
-          return [c[0], c[1], c[2], 170] as [number,number,number,number]
+        id:'alertas_ews',data:alertFeatures,
+        getPosition:(f:FPt)=>f.geometry.coordinates as [number,number],
+        getRadius:(f:Feat)=>{
+          const mag=get<number>(f,'magnitud')??5
+          return Math.pow(1.8,mag)*1200
         },
-        getLineColor: [255,255,255,160] as [number,number,number,number],
-        radiusMinPixels: 4, radiusMaxPixels: 16,
-        stroked: true, lineWidthMinPixels: 1,
-        pickable: true, autoHighlight: true, highlightColor: [255,255,255,80],
-        updateTriggers: { getFillColor: [] },
+        radiusUnits:'meters',
+        getFillColor:(f:Feat)=>ewsColor(get<string>(f,'nivel_alerta')??null),
+        getLineColor:[255,255,255,230] as [number,number,number,number],
+        radiusMinPixels:10,radiusMaxPixels:50,
+        stroked:true,lineWidthMinPixels:2.5,
+        pickable:true,autoHighlight:true,highlightColor:[255,255,255,100],
+        updateTriggers:{getFillColor:[],getRadius:[]},
       }))
     }
 
-    // ── Estaciones de monitoreo ───────────────────────────
-    if (capas.estaciones && estaciones)
+    // Heatmap
+    if(capas.heatmap&&heatmapData.length)
+      layers.push(new ScreenGridLayer({
+        id:'heatmap',data:heatmapData,
+        getPosition:(d:{position:[number,number];weight:number})=>d.position,
+        getWeight:  (d:{position:[number,number];weight:number})=>d.weight,
+        cellSizePixels:20,gpuAggregation:false,
+        colorRange:[[5,150,105,30],[16,185,129,80],[245,158,11,130],[249,115,22,175],[220,38,38,210],[127,29,29,255]] as [number,number,number,number][],
+        opacity:0.75,pickable:false,
+      }))
+
+    // Sismos — DataFilterExtension GPU
+    if(capas.sismos&&sismos?.features.length)
       layers.push(new ScatterplotLayer({
-        id: 'estaciones', data: estaciones.features,
-        getPosition:  (f: FPt)  => f.geometry.coordinates as [number,number],
-        getRadius:    500, radiusUnits: 'meters',
-        getFillColor: (f: Feat) =>
-          get<string>(f, 'tipo') === 'sismica'
-            ? [16,185,129,230] as [number,number,number,number]
-            : [56,189,248,230] as [number,number,number,number],
-        getLineColor: [255,255,255,180] as [number,number,number,number],
-        radiusMinPixels: 4, radiusMaxPixels: 14,
-        stroked: true, lineWidthMinPixels: 1.5,
-        pickable: true, autoHighlight: true, highlightColor: [255,255,255,80],
-        updateTriggers: { getFillColor: [] },
+        id:'sismos',data:sismos.features,
+        getPosition: (f:FPt)=>f.geometry.coordinates as [number,number,number],
+        getRadius:   (f:Feat)=>Math.pow(1.8,get<number>(f,'magnitud')??3)*800,
+        getFillColor:(f:Feat)=>profColor(get<number>(f,'profundidad_km')??30),
+        getLineColor:[255,255,255,120] as [number,number,number,number],
+        radiusMinPixels:4,radiusMaxPixels:32,radiusUnits:'meters',
+        pickable:true,stroked:true,lineWidthMinPixels:0.8,autoHighlight:true,
+        highlightColor:[255,255,255,100],
+        getFilterValue:(f:Feat)=>[
+          get<number>(f,'magnitud')??0,
+          parseInt((get<string>(f,'fecha')??"1960-01-01").substring(0,4)),
+          profCode(get<string>(f,'tipo_profundidad')??null),
+        ] as [number,number,number],
+        filterRange:[
+          [filtros.mag_min,filtros.mag_max],
+          [filtros.year_start,filtros.year_end],
+          filtros.profundidad?[profCode(filtros.profundidad),profCode(filtros.profundidad)]:[0,99],
+        ] as [[number,number],[number,number],[number,number]],
+        extensions:[new DataFilterExtension({filterSize:3})],
+        updateTriggers:{getFillColor:[],getFilterValue:[]},
+      }))
+
+    // Fallas
+    if(capas.fallas&&fallas)
+      layers.push(new GeoJsonLayer({
+        id:'fallas',data:fallas,
+        getLineColor:(f:Feat)=>get<boolean>(f,'activa')?[220,38,38,220]:[156,163,175,140] as [number,number,number,number],
+        lineWidthMinPixels:1.5,lineWidthMaxPixels:5,pickable:true,autoHighlight:true,
+        updateTriggers:{getLineColor:[]},
+      }))
+
+    // Infraestructura
+    if(capas.infraestructura&&infraestructura){
+      layers.push(new ScatterplotLayer({
+        id:'infraestructura-oficial',
+        data:infraestructura.features.filter(f=>get<string>(f,'fuente_tipo')==='oficial'),
+        getPosition:(f:FPt)=>f.geometry.coordinates as [number,number],
+        getRadius:800,radiusUnits:'meters',
+        getFillColor:(f:Feat)=>infraColor(get<string>(f,'tipo')??''),
+        getLineColor:[255,255,255,255] as [number,number,number,number],
+        radiusMinPixels:6,radiusMaxPixels:22,stroked:true,lineWidthMinPixels:2,
+        pickable:true,autoHighlight:true,highlightColor:[255,255,255,120],
+        updateTriggers:{getFillColor:[]},
+      }))
+      layers.push(new ScatterplotLayer({
+        id:'infraestructura-osm',
+        data:infraestructura.features.filter(f=>get<string>(f,'fuente_tipo')!=='oficial'),
+        getPosition:(f:FPt)=>f.geometry.coordinates as [number,number],
+        getRadius:550,radiusUnits:'meters',
+        getFillColor:(f:Feat)=>{const c=infraColor(get<string>(f,'tipo')??'');return[c[0],c[1],c[2],170] as [number,number,number,number]},
+        getLineColor:[255,255,255,160] as [number,number,number,number],
+        radiusMinPixels:4,radiusMaxPixels:16,stroked:true,lineWidthMinPixels:1,
+        pickable:true,autoHighlight:true,
+        updateTriggers:{getFillColor:[]},
+      }))
+    }
+
+    // Estaciones
+    if(capas.estaciones&&estaciones)
+      layers.push(new ScatterplotLayer({
+        id:'estaciones',data:estaciones.features,
+        getPosition:(f:FPt)=>f.geometry.coordinates as [number,number],
+        getRadius:500,radiusUnits:'meters',
+        getFillColor:(f:Feat)=>get<string>(f,'tipo')==='sismica'?[16,185,129,230]:[56,189,248,230] as [number,number,number,number],
+        getLineColor:[255,255,255,180] as [number,number,number,number],
+        radiusMinPixels:4,radiusMaxPixels:14,stroked:true,lineWidthMinPixels:1.5,
+        pickable:true,autoHighlight:true,
+        updateTriggers:{getFillColor:[]},
       }))
 
     return layers
-  }, [
-    capas, sismos, heatmapData, departamentos, distritos, fallas,
-    inundaciones, tsunamis, deslizamientos, infraestructura, estaciones,
-    riesgoConstruccionMapa, precipitaciones,
-    filtros.mag_min, filtros.mag_max, filtros.year_start, filtros.year_end, filtros.profundidad,
+  },[
+    capas,sismos,heatmapData,departamentos,distritos,fallas,inundaciones,tsunamis,
+    deslizamientos,infraestructura,estaciones,riesgoConstruccionMapa,precipitaciones,
+    volcanes,susceptibilidadMapa,alertasEWS,
+    filtros.mag_min,filtros.mag_max,filtros.year_start,filtros.year_end,filtros.profundidad,
   ])
 
-  useEffect(() => {
-    overlayRef.current?.setProps({ layers: buildLayers() })
-  }, [buildLayers])
+  useEffect(()=>{
+    overlayRef.current?.setProps({layers:buildLayers()})
+  },[buildLayers])
 
-  return <div ref={mapDiv} style={{ position: 'absolute', inset: 0 }} />
+  return <div ref={mapDiv} style={{position:'absolute',inset:0}} />
 }

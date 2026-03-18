@@ -1,0 +1,69 @@
+# GeoRiesgo Perú — .dockerignore backend
+# Reduce el build context de ~varios GB a sólo el código fuente
+
+# Control de versiones
+.git
+.gitignore
+.gitattributes
+
+# Modelos ML entrenados (se persisten en volumen externo /app/models)
+models/
+*.pkl
+*.joblib
+*.onnx
+
+# Entornos Python locales
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Archivos de desarrollo y testing
+tests/
+test_*.py
+*_test.py
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Datos locales / caché de desarrollo
+*.csv
+*.parquet
+*.geojson
+data/
+cache/
+tmp/
+temp/
+
+# Documentación
+docs/
+*.md
+*.rst
+README*
+CHANGELOG*
+
+# Docker artifacts del host (no copiar al contenedor)
+docker-compose*.yml
+*.dockerfile
+Dockerfile*
+
+# Secrets y configuración local
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
