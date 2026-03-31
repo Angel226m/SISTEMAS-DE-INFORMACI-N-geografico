@@ -11,7 +11,7 @@ import { useEffect, useRef, useCallback, useMemo } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { MapboxOverlay } from '@deck.gl/mapbox'
-import { ScatterplotLayer, GeoJsonLayer } from '@deck.gl/layers'
+import { ScatterplotLayer, GeoJsonLayer, ColumnLayer } from '@deck.gl/layers'
 import { ScreenGridLayer } from '@deck.gl/aggregation-layers'
 import { DataFilterExtension } from '@deck.gl/extensions'
 import type { CapasActivas, TipoVista, TooltipInfo, FiltrosSismos, AlertaRT } from '../types'
@@ -128,6 +128,14 @@ const infraColor = (tipo: string): [number,number,number,number] => {
 const get = <T,>(f: Feat, k: string): T|undefined =>
   (f.properties as Record<string,unknown>|null)?.[k] as T|undefined
 
+// 3D extrusion: elevation by risk level (meters)
+const extrusionElevation = (nivel: number|null): number => {
+  switch(nivel){case 1:return 500;case 2:return 2000;case 3:return 5000;case 4:return 10000;case 5:return 18000;default:return 1000}
+}
+const extrusionColor = (nivel: number|null): [number,number,number,number] => {
+  switch(nivel){case 1:return[5,150,105,200];case 2:return[16,185,129,210];case 3:return[245,158,11,220];case 4:return[249,115,22,230];case 5:return[220,38,38,240];default:return[148,163,184,180]}
+}
+
 interface Props {
   sismos:                 FC|null
   departamentos:          FC|null
@@ -223,7 +231,7 @@ export default function MapView({
   },[]) // eslint-disable-line
 
   useEffect(()=>{mapRef.current?.setStyle(MAP_STYLES[mapStyle])},[mapStyle])
-  useEffect(()=>{mapRef.current?.easeTo({pitch:vista==='3d'?55:0,duration:800})},[vista])
+  useEffect(()=>{mapRef.current?.easeTo({pitch:vista==='3d'||capas.extrusion_3d?55:0,duration:800})},[vista,capas.extrusion_3d])
 
   useEffect(()=>{
     const toIca  =()=>mapRef.current?.flyTo({center:ICA_CENTER, zoom:ICA_ZOOM, pitch:vista==='3d'?55:0,duration:1200})
@@ -447,6 +455,42 @@ export default function MapView({
         pickable:true,autoHighlight:true,
         updateTriggers:{getFillColor:[]},
       }))
+
+    // 🆕 v9: 3D Extrusion — ColumnLayer from distrito centroids
+    if(capas.extrusion_3d&&distritos?.features.length){
+      const centroidData = distritos.features
+        .filter(f=>f.geometry?.type==='Polygon'||f.geometry?.type==='MultiPolygon')
+        .map(f=>{
+          // Approximate centroid from first coordinate ring
+          const coords = f.geometry.type==='Polygon'
+            ? (f.geometry as GeoJSON.Polygon).coordinates[0]
+            : (f.geometry as GeoJSON.MultiPolygon).coordinates[0][0]
+          if(!coords||!coords.length) return null
+          const n=coords.length
+          const lon=coords.reduce((s,c)=>s+c[0],0)/n
+          const lat=coords.reduce((s,c)=>s+c[1],0)/n
+          return{position:[lon,lat] as [number,number],properties:f.properties}
+        })
+        .filter((d): d is {position:[number,number];properties:GeoJSON.GeoJsonProperties}=>d!==null)
+
+      layers.push(new ColumnLayer({
+        id:'extrusion_3d',
+        data:centroidData,
+        diskResolution:6,
+        radius:2500,
+        extruded:true,
+        elevationScale:1,
+        getPosition:(d:{position:[number,number]})=>d.position,
+        getElevation:(d:{properties:GeoJSON.GeoJsonProperties})=>
+          extrusionElevation((d.properties as Record<string,unknown>)?.['nivel_riesgo'] as number|null),
+        getFillColor:(d:{properties:GeoJSON.GeoJsonProperties})=>
+          extrusionColor((d.properties as Record<string,unknown>)?.['nivel_riesgo'] as number|null),
+        pickable:true,
+        autoHighlight:true,
+        highlightColor:[255,255,255,80],
+        updateTriggers:{getElevation:[],getFillColor:[]},
+      }))
+    }
 
     return layers
   },[

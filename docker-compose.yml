@@ -14,7 +14,7 @@
 services:
 
   db:
-    image: postgis/postgis:16-3.4-alpine
+    image: postgis/postgis:17-3.6-alpine
     container_name: georiesgo_db
     restart: unless-stopped
     environment:
