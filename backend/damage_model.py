@@ -218,6 +218,10 @@ def scenario_losses(
     valor_usd: float = 1_000_000.0,
     taxonomy: str = "DEFAULT",
     pga_override: float | None = None,
+    # v9.0: nuevos parámetros para escenario multi-taxonomía
+    n_viviendas: int | None = None,
+    mix_construccion: dict[str, float] | None = None,
+    hora_del_dia: str = "dia",
 ) -> dict[str, Any]:
     """
     Calcula pérdidas sísmicas para un escenario dado.
@@ -238,23 +242,45 @@ def scenario_losses(
     valor_usd        : valor del parque edificatorio USD
     taxonomy         : taxonomía predominante  (ADOBE|URM|CM|RC|WOOD|DEFAULT)
     pga_override     : si se provee, sobreescribe el cálculo de atenuación
+    n_viviendas      : número total de viviendas (alternativa a exposure.n_buildings)
+    mix_construccion : dict con porcentajes por tipo {"adobe":0.3, "ladrillo_conf":0.4, ...}
+    hora_del_dia     : 'dia' | 'noche' — ajusta mortalidad (noche ×1.4 Coburn et al. 1992)
 
     Returns
     -------
     dict con:
       pga_g, intensity_label, damage_states (probs), expected_loss_usd,
       expected_loss_ratio, fatalities_estimate, ds_counts (si n_buildings dado),
-      zona_sismica, mechanism
+      zona_sismica, mechanism, por_tipo (si mix_construccion dado)
     """
+
+    # ── Validación de entradas ─────────────────────────────────────────────
+    if not (-90 <= lat_eq <= 90) or not (-180 <= lon_eq <= 180):
+        raise ValueError(f"Coordenadas del epicentro fuera de rango: lat={lat_eq}, lon={lon_eq}")
+    if not (0.0 < magnitude <= 10.0):
+        raise ValueError(f"Magnitud fuera de rango razonable: {magnitude}")
+    if depth_km < 0:
+        raise ValueError(f"Profundidad negativa: {depth_km}")
+    if mechanism not in ("interface", "intraslab"):
+        raise ValueError(f"Mecanismo no válido: {mechanism!r}")
+    if hora_del_dia not in ("dia", "noche"):
+        raise ValueError(f"hora_del_dia no válida: {hora_del_dia!r}")
 
     # ── Defaults de exposición ──────────────────────────────────────────────
     if exposure is None:
         exposure = {}
 
-    n_buildings: int = exposure.get("n_buildings", 100)
+    n_buildings: int = n_viviendas or exposure.get("n_buildings", 100)
     pct_adobe: float = exposure.get("pct_adobe", 0.30)
     pop: int = int(exposure.get("n_pop", n_pop))
     val_usd: float = float(exposure.get("valor_usd", valor_usd))
+
+    # Mortalidad nocturna: factor ×1.4 (Coburn et al. 1992 — más personas en edificios)
+    mortality_factor = 1.4 if hora_del_dia == "noche" else 1.0
+
+    # Determinar mecanismo automáticamente si no se especificó explícitamente
+    if mechanism == "interface" and depth_km > 70:
+        mechanism = "intraslab"
 
     # Taxonomía basada en porcentaje adobe si no se especifica
     if taxonomy == "DEFAULT" and pct_adobe > 0.5:
@@ -316,11 +342,11 @@ def scenario_losses(
     )
     expected_loss_usd = val_usd * expected_loss_ratio
 
-    # ── Estimación de fatalidades ─────────────────────────────────────────────
+    # ── Estimación de fatalidades (con factor nocturno) ─────────────────────
     fatalities = sum(
         probs.get(ds, 0.0) * MORTALITY_DS[ds] * pop
         for ds in DS
-    )
+    ) * mortality_factor
     fatalities_estimate = int(round(fatalities))
 
     # ── Conteo de edificios por estado de daño ────────────────────────────────
@@ -330,8 +356,42 @@ def scenario_losses(
     for ds in DS:
         ds_counts[ds] = max(0, int(round(probs.get(ds, 0.0) * n_buildings)))
 
+    # ── Desglose multi-taxonomía (v9.0) ──────────────────────────────────────
+    # mix_construccion: {"adobe": 0.30, "ladrillo_conf": 0.40, "concreto_armado": 0.25, ...}
+    _MIX_TO_TAXONOMY = {
+        "adobe": "ADOBE", "tapial": "ADOBE",
+        "ladrillo": "URM", "ladrillo_conf": "CM", "albanileria": "CM",
+        "concreto": "RC", "concreto_armado": "RC",
+        "madera": "WOOD", "quincha": "WOOD",
+    }
+    por_tipo: dict[str, Any] | None = None
+    if mix_construccion:
+        por_tipo = {}
+        total_loss = 0.0
+        total_fatalities = 0.0
+        for tipo_key, pct in mix_construccion.items():
+            tax = _MIX_TO_TAXONOMY.get(tipo_key.lower(), "DEFAULT")
+            tp = fragility_probability(pga_g, tax)
+            lr = sum(tp.get(d, 0.0) * LOSS_RATIO[d] for d in DS)
+            ft = sum(tp.get(d, 0.0) * MORTALITY_DS[d] * pop * pct for d in DS) * mortality_factor
+            loss_usd = val_usd * pct * lr
+            total_loss += loss_usd
+            total_fatalities += ft
+            por_tipo[tipo_key] = {
+                "taxonomy": tax,
+                "pct": round(pct, 4),
+                "loss_ratio": round(lr, 4),
+                "loss_usd": round(loss_usd, 2),
+                "fatalities": int(round(ft)),
+                "damage_probabilities": {k: round(v, 4) for k, v in tp.items()},
+            }
+        # Sobre-escribir totales con el desglose ponderado
+        expected_loss_usd = round(total_loss, 2)
+        expected_loss_ratio = round(total_loss / val_usd, 4) if val_usd > 0 else 0.0
+        fatalities_estimate = int(round(total_fatalities))
+
     # ── Resultado ─────────────────────────────────────────────────────────────
-    return {
+    result: dict[str, Any] = {
         "pga_g": round(pga_g, 4),
         "intensity_label": intensity_label,
         "taxonomy": taxonomy,
@@ -345,11 +405,15 @@ def scenario_losses(
         "n_buildings": n_buildings,
         "n_pop": pop,
         "exposure_value_usd": val_usd,
+        "hora_del_dia": hora_del_dia,
         "inputs": {
             "lat_eq": lat_eq, "lon_eq": lon_eq,
             "magnitude": magnitude, "depth_km": depth_km,
         },
     }
+    if por_tipo is not None:
+        result["por_tipo"] = por_tipo
+    return result
 
 
 # ─── Función auxiliar: escenario rápido desde ID de sismo ───────────────────

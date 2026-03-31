@@ -116,7 +116,15 @@ async function apiFetch<T>(
           CACHE.set(cacheKey!, { ...cached, ts: Date.now() })
           return (cached as CacheEntry<T>).data
         }
-        if (!res.ok) throw new Error(`HTTP ${res.status} — ${path}`)
+        if (!res.ok) {
+          // Try to parse API error detail for better user messages
+          let detail = ''
+          try {
+            const body = await res.json()
+            detail = body?.detail?.mensaje ?? body?.detail ?? body?.error ?? ''
+          } catch { /* ignore parse errors */ }
+          throw new Error(detail || `HTTP ${res.status} — ${path}`)
+        }
         const data = await res.json() as T
         if (cacheKey)
           CACHE.set(cacheKey, { data, ts: Date.now(), etag: res.headers.get('ETag') ?? undefined })

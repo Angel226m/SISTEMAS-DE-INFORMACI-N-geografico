@@ -24,6 +24,7 @@ import type { Toast }     from './components/ToastList'
 import { HoverTooltip }   from './components/HoverTooltip'
 import { InfoPopup }      from './components/InfoPopup'
 import { RiesgoPanel }    from './components/RiesgoPanel'
+import { ErrorBoundary }  from './components/ErrorBoundary'
 import type { FuenteTipo } from './types'
 
 const CAPAS_INIT: CapasActivas = {
@@ -115,7 +116,7 @@ export default function App(){
       {!showLanding&&(<>
         {isInitial&&<Loader pct={loadPct}/>}
         <ToastList toasts={toasts} remove={id=>setToasts(p=>p.filter(t=>t.id!==id))}/>
-        <header style={{flexShrink:0,height:52,display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 14px',background:C.bg,borderBottom:`1px solid ${C.border}`,zIndex:20}}>
+        <header role="banner" aria-label="GeoRiesgo Perú — panel de control" style={{flexShrink:0,height:52,display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 14px',background:C.bg,borderBottom:`1px solid ${C.border}`,zIndex:20}}>
           <div style={{display:'flex',alignItems:'center',gap:10}}>
             <Btn active={sidebar} onClick={()=>setSidebar(p=>!p)} title="Sidebar [L]"><Icons.Menu/></Btn>
             <div style={{display:'flex',alignItems:'center',gap:9}}>
@@ -159,7 +160,7 @@ export default function App(){
           </div>
         </header>
         <div style={{flex:1,display:'flex',overflow:'hidden',position:'relative'}}>
-          <aside style={{flexShrink:0,width:sidebarW,overflow:'hidden',transition:'width 0.26s cubic-bezier(0.4,0,0.2,1)',background:C.bg,borderRight:`1px solid ${C.border}`,display:'flex',flexDirection:'column',zIndex:10}}>
+          <aside role="complementary" aria-label="Panel de capas y filtros" style={{flexShrink:0,width:sidebarW,overflow:'hidden',transition:'width 0.26s cubic-bezier(0.4,0,0.2,1)',background:C.bg,borderRight:`1px solid ${C.border}`,display:'flex',flexDirection:'column',zIndex:10}}>
             <div style={{width:268,height:'100%',display:'flex',flexDirection:'column',padding:'12px 12px 0'}}>
               <div style={{display:'flex',gap:3,background:C.bgMuted,borderRadius:10,padding:3,marginBottom:16,flexShrink:0}}>
                 {(['capas','filtros'] as const).map(t=>(
@@ -206,17 +207,19 @@ export default function App(){
           </aside>
           <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',position:'relative'}}>
             <div style={{flex:1,position:'relative'}}>
-              <MapView
-                sismos={data.sismos} departamentos={data.departamentos} distritos={data.distritos}
-                fallas={data.fallas} inundaciones={data.inundaciones} tsunamis={data.tsunamis}
-                deslizamientos={data.deslizamientos} infraestructura={data.infraestructura}
-                estaciones={data.estaciones} riesgoConstruccionMapa={data.riesgoConstruccionMapa}
-                precipitaciones={data.precipitaciones} volcanes={data.volcanes}
-                susceptibilidadMapa={data.susceptibilidadMapa}
-                alertasEWS={capas.alertas_ews?alertasEWS:[]}
-                capas={capas} vista={vista} mapStyle={mapStyle} filtros={filtros}
-                onClickFeature={handleClick} onHoverFeature={setTooltip}
-              />
+              <ErrorBoundary>
+                <MapView
+                  sismos={data.sismos} departamentos={data.departamentos} distritos={data.distritos}
+                  fallas={data.fallas} inundaciones={data.inundaciones} tsunamis={data.tsunamis}
+                  deslizamientos={data.deslizamientos} infraestructura={data.infraestructura}
+                  estaciones={data.estaciones} riesgoConstruccionMapa={data.riesgoConstruccionMapa}
+                  precipitaciones={data.precipitaciones} volcanes={data.volcanes}
+                  susceptibilidadMapa={data.susceptibilidadMapa}
+                  alertasEWS={capas.alertas_ews?alertasEWS:[]}
+                  capas={capas} vista={vista} mapStyle={mapStyle} filtros={filtros}
+                  onClickFeature={handleClick} onHoverFeature={setTooltip}
+                />
+              </ErrorBoundary>
               {tooltip&&!popup&&<HoverTooltip info={tooltip}/>}
               {popup&&<InfoPopup props={popup.props} layer={popup.layer} onClose={()=>setPopup(null)}/>}
               {showRiesgo&&<RiesgoPanel riesgo={riesgo} loading={riesgoLoading} irc={riesgoConstruccionPunto} ircLoading={riesgoConstruccionLoading} lluvia={riesgoLluvia} lluviaLoading={riesgoLluviaLoading} onClose={()=>setShowRiesgo(false)}/>}
@@ -273,7 +276,9 @@ export default function App(){
             </div>
             <div style={{flexShrink:0,height:chart?154:0,overflow:'hidden',transition:'height 0.26s cubic-bezier(0.4,0,0.2,1)',background:C.bg,borderTop:`1px solid ${C.border}`}}>
               <div style={{height:154,padding:'10px 18px'}}>
-                <StatsChart estadisticas={data.estadisticas} loading={loading.estadisticas} ircRanking={iRCRanking} eventosFen={eventosFen} escenario={riesgoEscenario} sendai={sendaiReport}/>
+                <ErrorBoundary>
+                  <StatsChart estadisticas={data.estadisticas} loading={loading.estadisticas} ircRanking={iRCRanking} eventosFen={eventosFen} escenario={riesgoEscenario} sendai={sendaiReport}/>
+                </ErrorBoundary>
               </div>
             </div>
             <div style={{position:'absolute',bottom:0,left:0,right:0,height:22,background:C.bgSoft,borderTop:`1px solid ${C.border}`,display:'flex',alignItems:'center',padding:'0 12px',gap:10,zIndex:40,fontFamily:"'DM Mono',monospace",fontSize:9,color:C.textMuted}}>

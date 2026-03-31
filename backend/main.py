@@ -243,16 +243,49 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    """Captura errores no manejados y devuelve un JSON estructurado."""
+    logger.error("Unhandled error on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "detail": "Error interno del servidor. Contacte al administrador.",
+            "path": str(request.url.path),
+        },
+    )
+
+
+# CORS — orígenes permitidos desde variable de entorno o localhost por defecto
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,http://localhost").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "If-None-Match"],
     expose_headers=["X-Total-Count", "X-Cache", "ETag", "X-RateLimit-Limit",
-                    "X-RateLimit-Remaining", "Retry-After"],
+                    "X-RateLimit-Remaining", "Retry-After", "X-Cache-TTL"],
     max_age=3600,
 )
 app.add_middleware(GZipMiddleware, minimum_size=512)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Añade cabeceras de seguridad a todas las respuestas."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -299,7 +332,7 @@ def geojson_response(
         },
     }
     content = orjson.dumps(fc, option=orjson.OPT_NON_STR_KEYS)
-    etag = f'"{hashlib.md5(content).hexdigest()[:12]}"'  # noqa: S324
+    etag = f'"{hashlib.sha256(content).hexdigest()[:16]}"'
     return Response(
         content=content,
         media_type="application/geo+json",
@@ -439,17 +472,30 @@ async def root():
 
 @app.get("/health", summary="Healthcheck Docker/k8s", tags=["Sistema"])
 async def health():
-    pool = await db()
-    await pool.fetchval("SELECT 1")
-    ews_stats = getattr(app.state, "ews", None)
-    return {
-        "status": "ok",
-        "ts": time.time(),
-        "version": "9.0",
-        "db": "ok",
-        "redis": "ok" if geo_cache.available else "degraded",
-        "ews": ews_stats.stats if ews_stats else {},
-    }
+    checks: dict[str, str] = {"version": "9.0", "ts": str(time.time())}
+    overall = "ok"
+
+    # DB check
+    try:
+        pool = await db()
+        await pool.fetchval("SELECT 1")
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        overall = "degraded"
+
+    # Redis check
+    checks["redis"] = "ok" if geo_cache.available else "degraded"
+    if not geo_cache.available:
+        overall = "degraded"
+
+    # EWS check
+    ews_inst = getattr(app.state, "ews", None)
+    checks["ews"] = ews_inst.stats if ews_inst else {}
+
+    checks["status"] = overall
+    status_code = 200 if overall == "ok" else 503
+    return JSONResponse(content=checks, status_code=status_code)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -458,17 +504,18 @@ async def health():
 
 @app.get("/api/v1/diagnostico/regiones", tags=["Sistema"])
 async def diagnostico_regiones():
+    _TABLAS_DIAGNOSTICO = frozenset({"sismos", "infraestructura", "estaciones", "fallas", "volcanes"})
     pool = await db()
     resultado = {}
-    for tabla in ["sismos", "infraestructura", "estaciones", "fallas", "volcanes"]:
+    for tabla in _TABLAS_DIAGNOSTICO:
         try:
-            row = await pool.fetchrow(f"""
-                SELECT COUNT(*) AS total,
-                       COUNT(*) FILTER (WHERE region IS NOT NULL) AS con_region,
-                       COUNT(*) FILTER (WHERE region IS NULL)     AS sin_region,
-                       COUNT(DISTINCT region)                     AS regiones_distintas
-                FROM {tabla}
-            """)
+            row = await pool.fetchrow(
+                "SELECT COUNT(*) AS total,"
+                "       COUNT(*) FILTER (WHERE region IS NOT NULL) AS con_region,"
+                "       COUNT(*) FILTER (WHERE region IS NULL)     AS sin_region,"
+                "       COUNT(DISTINCT region)                     AS regiones_distintas "
+                f"FROM {tabla}"  # safe: tabla is from a hardcoded frozenset
+            )
             resultado[tabla] = _serialize_row(row)
         except Exception:
             resultado[tabla] = {"error": "tabla no disponible"}
@@ -1373,11 +1420,11 @@ async def get_riesgo_escenario(
         pass
 
     result = scenario_losses(
-        lon=lon, lat=lat,
+        lat_eq=lat, lon_eq=lon,
         magnitude=magnitud,
+        depth_km=profundidad_km,
         n_viviendas=n_viviendas,
         mix_construccion=mix_construccion,
-        profundidad_km=profundidad_km,
         hora_del_dia=hora_del_dia,
     )
 
@@ -1452,7 +1499,8 @@ async def get_sendai_report(
 )
 async def get_sendai_mapa(
     target: str = Query("b",
-                        description="a | b | c | d | g — Target Sendai"),
+                        description="a | b | c | d | g — Target Sendai",
+                        pattern="^[a-gA-G]$"),
     zoom:   Optional[int] = Query(None, ge=1, le=20),
 ):
     """
@@ -2438,23 +2486,7 @@ async def get_riesgo_punto(
     return row["resultado"]
 
 
-@app.get("/api/v1/diagnostico/regiones", tags=["Sistema"])
-async def diagnostico_regiones_v2():
-    pool = await db()
-    resultado = {}
-    for tabla in ["sismos","infraestructura","estaciones","fallas","volcanes"]:
-        try:
-            row = await pool.fetchrow(f"""
-                SELECT COUNT(*) AS total,
-                       COUNT(*) FILTER (WHERE region IS NOT NULL) AS con_region,
-                       COUNT(*) FILTER (WHERE region IS NULL) AS sin_region,
-                       COUNT(DISTINCT region) AS regiones_distintas
-                FROM {tabla}
-            """)
-            resultado[tabla] = _serialize_row(row)
-        except Exception:
-            resultado[tabla] = {"error": "tabla no disponible"}
-    return resultado
+# Duplicate diagnostico_regiones endpoint removed (already defined above)
 
 
 @app.get("/api/v1/sync/log", tags=["Sistema"])

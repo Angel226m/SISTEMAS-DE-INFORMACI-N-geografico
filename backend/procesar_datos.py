@@ -361,8 +361,9 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
 def exec_sql(conn: Any, sql: str, params: tuple | None = None) -> int:
     with conn.cursor() as cur:
         cur.execute(sql, params)
+        rowcount = cur.rowcount
     conn.commit()
-    return cur.rowcount
+    return rowcount
 
 
 def fetch_one(conn: Any, sql: str, params: tuple | None = None) -> tuple | None:
@@ -387,6 +388,8 @@ class CopyBuffer:
         self._columns = columns; self._sep = sep
         self._buf = io.StringIO(); self._count = 0
 
+    _FLUSH_THRESHOLD: int = 10_000
+
     def add_row(self, values: tuple) -> None:
         line = self._sep.join(
             "\\N" if v is None else str(v).replace(self._sep, " ")
@@ -394,6 +397,8 @@ class CopyBuffer:
         )
         self._buf.write(line + "\n")
         self._count += 1
+        if self._count >= self._FLUSH_THRESHOLD:
+            self.flush()
 
     def flush(self) -> int:
         if self._count == 0:
@@ -573,12 +578,20 @@ def overpass_query(tags: str, cfg: ETLConfig | None = None) -> str:
 #  MATERIALIZED VIEW REFRESH
 # ══════════════════════════════════════════════════════════════════
 
+_ALLOWED_MATVIEWS: frozenset[str] = frozenset({
+    "mv_heatmap_sismos", "mv_riesgo_construccion", "riesgo_percentiles",
+})
+
+
 def refresh_matview(conn: Any, view_name: str, timeout_ms: int = 600_000) -> None:
+    if view_name not in _ALLOWED_MATVIEWS:
+        raise ValueError(f"Materialized view no permitida: {view_name}")
     slog = step_log("matview")
     slog.info("Refreshing %s ...", view_name)
     t0 = time.perf_counter()
     with conn.cursor() as cur:
-        cur.execute(f"SET statement_timeout = {timeout_ms}")
+        cur.execute("SET statement_timeout = %s", (timeout_ms,))
+        # view_name is validated against allowlist above — safe to interpolate
         cur.execute(f"REFRESH MATERIALIZED VIEW {view_name}")
     conn.commit()
     slog.info("%s refrescado en %.1fs", view_name, time.perf_counter() - t0)
@@ -1471,6 +1484,8 @@ def _feature_to_sismo(feat: dict) -> Sismo | None:
     if len(coords) < 3:
         return None
     lon, lat, depth = coords[0], coords[1], coords[2] or 0.0
+    if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+        return None
     mag = props.get("mag")
     if not mag or mag < 0:
         return None
@@ -2909,13 +2924,17 @@ def main() -> int:
         pasos_a_ejecutar = [p for p in _ORDEN if p not in (args.skip or [])]
         log.info("Ejecutando %d/%d pasos", len(pasos_a_ejecutar), len(_ORDEN))
 
+    total_pasos = len(pasos_a_ejecutar)
     for i, nombre in enumerate(pasos_a_ejecutar):
         fn, desc, _ = _PASOS[nombre]
-        log.info("── PASO %02d/%02d: %-25s %s",
-                 i + 1, len(pasos_a_ejecutar), nombre.upper(), desc)
+        pct = (i / total_pasos) * 100
+        log.info("── PASO %02d/%02d (%.0f%%): %-25s %s",
+                 i + 1, total_pasos, pct, nombre.upper(), desc)
         result = _run_step(nombre, fn, args.dry_run)
         resultados.append(result)
         log.info("   %s", result)
+        if not result.ok:
+            log.warning("   ⚠️  Paso '%s' tuvo %d errores — continuando", nombre, result.errores)
 
     elapsed = time.perf_counter() - t_total
 

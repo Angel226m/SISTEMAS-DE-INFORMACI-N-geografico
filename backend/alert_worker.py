@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 import xml.etree.ElementTree as ET
@@ -85,10 +86,36 @@ class EWSWorker:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool:       asyncpg.Pool          = pool
         self._seen_ids:   set[str]              = set()
+        self._max_seen:   int                   = 10_000
         self._sse_clients: list[asyncio.Queue]  = []
         self._ws_clients:  list[WebSocket]      = []
         self._running:    bool                  = False
         self._http_client: httpx.AsyncClient | None = None
+        self._polls_ok:   int                   = 0
+        self._polls_err:  int                   = 0
+        self._alerts_sent: int                  = 0
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "running": self._running,
+            "polls_ok": self._polls_ok,
+            "polls_err": self._polls_err,
+            "alerts_sent": self._alerts_sent,
+            "sse_clients": len(self._sse_clients),
+            "ws_clients": len(self._ws_clients),
+            "seen_ids": len(self._seen_ids),
+        }
+
+    def _prune_seen_ids(self) -> None:
+        """Evita crecimiento ilimitado del set de IDs vistos."""
+        if len(self._seen_ids) > self._max_seen:
+            # Descarta la mitad más antigua (sets no tienen orden,
+            # pero reducir tamaño evita leaks en producción)
+            excess = len(self._seen_ids) - self._max_seen // 2
+            it = iter(self._seen_ids)
+            for _ in range(excess):
+                self._seen_ids.discard(next(it))
 
     # ── Ciclo principal ───────────────────────────────────────────────────
 
@@ -128,8 +155,11 @@ class EWSWorker:
         while self._running:
             try:
                 await self.poll()
+                self._polls_ok += 1
             except Exception as exc:
+                self._polls_err += 1
                 logger.error("EWSWorker._poll_loop: excepción no capturada — %s", exc)
+            self._prune_seen_ids()
             await asyncio.sleep(POLL_INTERVAL)
 
     async def poll(self) -> None:
@@ -456,13 +486,13 @@ class EWSWorker:
                 alerta["lugar"],
                 lon,
                 lat,
-                __import__("json").dumps(infra_afectada),
+                json.dumps(infra_afectada),
                 poblacion_expuesta,
                 False,
                 False,
                 alerta["cap_identifier"],
                 alerta["cap_xml"],
-                __import__("json").dumps(alerta["pilares_ew4all"]),
+                json.dumps(alerta["pilares_ew4all"]),
                 [],
             )
         except Exception as exc:
@@ -578,6 +608,7 @@ class EWSWorker:
         if alerta["dispara_tsunami"] or alerta["dispara_deslizamiento"]:
             try:
                 id_field = "usgs_id" if alerta.get("usgs_id") else "igp_id"
+                assert id_field in ("usgs_id", "igp_id"), "id_field inesperado"
                 id_val   = alerta.get("usgs_id") or alerta.get("igp_id")
                 if id_val:
                     await conn.execute(
@@ -590,7 +621,7 @@ class EWSWorker:
                         """,
                         alerta["dispara_tsunami"],
                         alerta["dispara_deslizamiento"],
-                        __import__("json").dumps(alerta["infraestructura_afectada"]),
+                        json.dumps(alerta["infraestructura_afectada"]),
                         id_val,
                     )
             except Exception as exc:
@@ -734,7 +765,6 @@ class EWSWorker:
             "ts": datetime.now(timezone.utc).isoformat(),
         }
 
-        import json
         payload_str = json.dumps(payload, ensure_ascii=False)
 
         # ── SSE ───────────────────────────────────────────────────────────
@@ -766,6 +796,7 @@ class EWSWorker:
             self._ws_clients.remove(ws)
 
         if alerta["canales_enviados"]:
+            self._alerts_sent += 1
             logger.info(
                 "EWSWorker.broadcast: alerta %s M%.1f enviada a %d SSE + %d WS",
                 alerta["nivel_alerta"],
