@@ -65,9 +65,9 @@ const DATA0: MapData = {
   volcanes:null,susceptibilidadMapa:null,
 }
 const LOAD0: Loading = {
-  sismos:true,departamentos:true,distritos:true,fallas:true,
-  inundaciones:true,tsunamis:true,deslizamientos:true,
-  infraestructura:true,estaciones:true,estadisticas:true,
+  sismos:true,departamentos:false,distritos:true,fallas:true,
+  inundaciones:false,tsunamis:false,deslizamientos:false,
+  infraestructura:false,estaciones:false,estadisticas:true,
   riesgoConstruccionMapa:false,precipitaciones:false,
   volcanes:false,susceptibilidadMapa:false,
 }
@@ -107,18 +107,25 @@ export interface UseMapDataReturn {
   sendaiReport:              SendaiReport | null
   sendaiLoading:             boolean
   mlEntrenando:              boolean
-  // Acciones
+  // Acciones — siempre presentes
   recargarSismos:            (filtros: Partial<FiltrosSismos>) => void
   buscarRiesgo:              (lon: number, lat: number) => void
   buscarIRC:                 (lon: number, lat: number) => void
   buscarRiesgoLluvia:        (lon: number, lat: number) => void
-  buscarExposicion:          (ubigeo: string) => void           // 🆕
-  calcularEscenario:         (lon:number, lat:number, mag:number, prof:number, nViv:number) => void // 🆕
-  cargarSendai:              (año?: number) => void             // 🆕
-  cargarSusceptibilidad:     (amenaza: AmenazaML, depto: string) => void // 🆕
+  buscarExposicion:          (ubigeo: string) => void
+  calcularEscenario:         (lon:number, lat:number, mag:number, prof:number, nViv:number) => void
+  cargarSendai:              (año?: number) => void
+  cargarSusceptibilidad:     (amenaza: AmenazaML, depto: string) => void
   recargarTodo:              () => void
   cargarIRCMapa:             () => void
   cargarPrecipitaciones:     (filtros?: Partial<FiltrosPrecipitacion>) => void
+  // 🆕 v9.1 — lazy loaders por capa (sólo fetcha si no hay datos aún)
+  cargarInundaciones:        () => void
+  cargarTsunamis:            () => void
+  cargarDeslizamientos:      () => void
+  cargarInfraestructura:     () => void
+  cargarEstaciones:          () => void
+  cargarDepartamentos:       () => void
 }
 
 export function useMapData(): UseMapDataReturn {
@@ -185,16 +192,19 @@ export function useMapData(): UseMapDataReturn {
   },[set,setErr])
 
   const cargarEstaticos = useCallback(()=>{
-    void cargar('departamentos', ()=>getDepartamentos(7))
-    void cargar('distritos',     ()=>getDistritos(9))
-    void cargar('fallas',        getFallas)
-    void cargar('inundaciones',  ()=>getInundaciones(1,9))
-    void cargar('tsunamis',      ()=>getTsunamis(9))
-    void cargar('deslizamientos',()=>getDeslizamientos(1,9))
-    void cargar('infraestructura',getInfraestructura)
-    void cargar('estaciones',    getEstaciones)
-    void cargar('estadisticas',  ()=>getEstadisticas(1900,2030))
+    // CORE (always load — minimal set for meaningful initial render)
+    void cargar('distritos',    ()=>getDistritos(9))
+    void cargar('fallas',       getFallas)
+    void cargar('estadisticas', ()=>getEstadisticas(1900,2030))
   },[cargar])
+
+  // LAZY — only fetch when the corresponding capa is activated
+  const cargarDepartamentos  = useCallback(()=>{ void cargar('departamentos', ()=>getDepartamentos(7)) },[cargar])
+  const cargarInundaciones   = useCallback(()=>{ void cargar('inundaciones', ()=>getInundaciones(1,9)) },[cargar])
+  const cargarTsunamis       = useCallback(()=>{ void cargar('tsunamis', ()=>getTsunamis(9)) },[cargar])
+  const cargarDeslizamientos = useCallback(()=>{ void cargar('deslizamientos', ()=>getDeslizamientos(1,9)) },[cargar])
+  const cargarInfraestructura= useCallback(()=>{ void cargar('infraestructura', getInfraestructura) },[cargar])
+  const cargarEstaciones     = useCallback(()=>{ void cargar('estaciones', getEstaciones) },[cargar])
 
   const cargarSismos = useCallback((f:Partial<FiltrosSismos>={})=>{
     void cargar('sismos',()=>getSismos({mag_min:2.5,mag_max:9.9,year_start:1900,year_end:2030,profundidad:f.profundidad,region:f.region}))
@@ -444,5 +454,8 @@ export function useMapData(): UseMapDataReturn {
     recargarSismos,buscarRiesgo,buscarIRC,buscarRiesgoLluvia,
     buscarExposicion,calcularEscenario,cargarSendai,cargarSusceptibilidad,
     recargarTodo,cargarIRCMapa,cargarPrecipitaciones,
+    // v9.1 lazy loaders
+    cargarInundaciones,cargarTsunamis,cargarDeslizamientos,
+    cargarInfraestructura,cargarEstaciones,cargarDepartamentos,
   }
 }

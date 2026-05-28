@@ -1373,9 +1373,16 @@ CREATE INDEX IF NOT EXISTS idx_mv_heatmap_cantidad      ON mv_heatmap_sismos(can
 
 
 -- ══════════════════════════════════════════════════════════════════════════
---  VISTA MATERIALIZADA: mv_riesgo_construccion — v8.0 (IRC con FEN)
---  Ponderación: 40%PS + 25%PI_fen + 20%PD + 10%PT + 5%PF
---  Fuente: CENEPRED Manual 2014 + NTE E.030-2018 + SENAMHI/NOAA v8.0
+--  VISTA MATERIALIZADA: mv_riesgo_construccion — v9.1 (IRC con suelo E.031)
+--  Ponderación: 40%PS×Fs + 25%PI_fen + 20%PD + 10%PT + 5%PF
+--  Fuente: CENEPRED 2014 + NTE E.030-2018 + NTE E.031-2020 + SENAMHI/NOAA
+--
+--  NUEVO v9.1:
+--   · Clasificación suelo NTE E.031-2020 multi-criterio (geología+hidrología)
+--   · Factor de amplificación sísmica Fs por perfil de suelo (E.031 §3.4)
+--   · Períodos Tp y TL por perfil de suelo
+--   · Intensidad MMI estimada (Wald et al. 1999) en sismo más fuerte cercano
+--   · factor_suelo_amplif incorporado al IRC
 -- ══════════════════════════════════════════════════════════════════════════
 DROP MATERIALIZED VIEW IF EXISTS mv_riesgo_construccion;
 CREATE MATERIALIZED VIEW mv_riesgo_construccion AS
@@ -1395,6 +1402,138 @@ fen_por_distrito AS (
     LEFT JOIN LATERAL (
         SELECT indice_fen FROM zonas_precipitacion ORDER BY geom <-> ST_Centroid(d.geom) LIMIT 1
     ) zp ON TRUE
+),
+-- ═══ NTE E.031-2020: Clasificación de suelo multi-criterio ═══
+-- Criterios jerárquicos:
+--   S4 (condiciones excepcionales): zona tsunami alta, suelos licuefactibles, rellenos
+--   S3 (suelos blandos): zona inundable alta, selva baja, cuenca aluvial amazónica
+--   S2 (suelos intermedios): costa Z4 con depósitos profundos, valles interandinos
+--   S1 (roca/suelo muy rígido): sierra alta, zona volcánica rígida, afloramientos
+--   S0 (roca dura): base rocosa andina >3500m sin cobertura aluvial
+suelo_distrito AS (
+    SELECT d.id,
+        CASE
+            -- S4: condiciones excepcionales (licuefacción, tsunami alto, rellenos)
+            WHEN EXISTS(SELECT 1 FROM zonas_tsunami zt
+                        WHERE zt.nivel_riesgo >= 4 AND ST_Intersects(zt.geom, d.geom))
+            THEN 'S4'
+            WHEN EXISTS(SELECT 1 FROM zonas_tsunami zt WHERE zt.nivel_riesgo >= 3
+                        AND ST_Intersects(zt.geom, d.geom))
+                 AND EXISTS(SELECT 1 FROM zonas_inundables zi WHERE zi.nivel_riesgo >= 3
+                            AND ST_Intersects(zi.geom, d.geom))
+            THEN 'S4'
+
+            -- S3: suelos blandos — selva baja aluvial, llanuras inundables
+            WHEN EXISTS(SELECT 1 FROM zonas_inundables zi
+                        WHERE zi.nivel_riesgo >= 4 AND ST_Intersects(zi.geom, d.geom))
+            THEN 'S3'
+            WHEN d.departamento ILIKE ANY(ARRAY[
+                '%loreto%','%ucayali%','%madre de dios%'
+            ]) AND ST_Y(ST_Centroid(d.geom)) > -12.0
+            THEN 'S3'
+            WHEN d.departamento ILIKE ANY(ARRAY[
+                '%amazonas%','%san mart%','%huanuco%','%huánuco%'
+            ]) AND EXISTS(SELECT 1 FROM zonas_inundables zi
+                          WHERE zi.nivel_riesgo >= 2 AND ST_Intersects(zi.geom, d.geom))
+            THEN 'S3'
+
+            -- S2: suelos intermedios — costa profunda, valles interandinos
+            WHEN ze.zona_sismica_eff = 4 AND NOT EXISTS(
+                SELECT 1 FROM deslizamientos dl
+                WHERE dl.activo AND dl.nivel_riesgo >= 3 AND ST_Intersects(dl.geom, d.geom))
+            THEN 'S2'
+            WHEN ze.zona_sismica_eff = 3 AND d.departamento ILIKE ANY(ARRAY[
+                '%cajamarca%','%junin%','%junín%','%huancavelica%','%cusco%'
+            ])
+            THEN 'S2'
+
+            -- S0: roca dura — afloramientos andinos alta montaña (>3500m proxy)
+            WHEN ze.zona_sismica_eff IN (1,2)
+                 AND NOT EXISTS(SELECT 1 FROM zonas_inundables zi
+                                WHERE ST_Intersects(zi.geom, d.geom))
+                 AND NOT EXISTS(SELECT 1 FROM deslizamientos dl
+                                WHERE dl.activo AND ST_Intersects(dl.geom, d.geom))
+                 AND d.departamento ILIKE ANY(ARRAY[
+                    '%puno%','%apurímac%','%apurimac%','%ayacucho%'
+                 ])
+            THEN 'S0'
+
+            -- S1: roca/suelo rígido (default)
+            ELSE 'S1'
+        END AS clasificacion_suelo,
+        -- Factor de amplificación sísmica Fs (NTE E.031-2020 Tabla 3)
+        -- Depende de perfil de suelo y zona sísmica
+        CASE
+            WHEN EXISTS(SELECT 1 FROM zonas_tsunami zt WHERE zt.nivel_riesgo >= 4
+                        AND ST_Intersects(zt.geom, d.geom))
+            THEN -- S4: requiere estudio especial, usar factor conservador
+                CASE ze.zona_sismica_eff WHEN 4 THEN 3.00 WHEN 3 THEN 3.00
+                     WHEN 2 THEN 2.80 ELSE 2.40 END
+            WHEN EXISTS(SELECT 1 FROM zonas_inundables zi WHERE zi.nivel_riesgo >= 4
+                        AND ST_Intersects(zi.geom, d.geom))
+                 OR (d.departamento ILIKE ANY(ARRAY['%loreto%','%ucayali%','%madre de dios%'])
+                     AND ST_Y(ST_Centroid(d.geom)) > -12.0)
+            THEN -- S3
+                CASE ze.zona_sismica_eff WHEN 4 THEN 1.10 WHEN 3 THEN 1.20
+                     WHEN 2 THEN 1.50 ELSE 1.60 END
+            WHEN ze.zona_sismica_eff = 4 THEN 1.05  -- S2 Z4
+            WHEN ze.zona_sismica_eff = 3 THEN 1.15  -- S2 Z3
+            WHEN ze.zona_sismica_eff IN (1,2) AND NOT EXISTS(
+                SELECT 1 FROM zonas_inundables zi WHERE ST_Intersects(zi.geom, d.geom))
+                 AND d.departamento ILIKE ANY(ARRAY[
+                    '%puno%','%apurímac%','%apurimac%','%ayacucho%'])
+            THEN 0.80  -- S0
+            ELSE 1.00  -- S1
+        END AS factor_suelo_s,
+        -- Período predominante Tp (s) — NTE E.031-2020 Tabla 4
+        CASE
+            WHEN EXISTS(SELECT 1 FROM zonas_tsunami zt WHERE zt.nivel_riesgo >= 4
+                        AND ST_Intersects(zt.geom, d.geom)) THEN 1.00  -- S4
+            WHEN EXISTS(SELECT 1 FROM zonas_inundables zi WHERE zi.nivel_riesgo >= 4
+                        AND ST_Intersects(zi.geom, d.geom)) THEN 1.00  -- S3
+            WHEN ze.zona_sismica_eff = 4 THEN 0.60  -- S2
+            WHEN ze.zona_sismica_eff IN (1,2) AND d.departamento ILIKE ANY(ARRAY[
+                '%puno%','%apurímac%','%apurimac%','%ayacucho%']) THEN 0.30  -- S0
+            ELSE 0.40  -- S1
+        END AS tp_suelo,
+        -- Período largo TL (s) — NTE E.031-2020 Tabla 4
+        CASE
+            WHEN EXISTS(SELECT 1 FROM zonas_tsunami zt WHERE zt.nivel_riesgo >= 4
+                        AND ST_Intersects(zt.geom, d.geom)) THEN 1.60  -- S4
+            WHEN EXISTS(SELECT 1 FROM zonas_inundables zi WHERE zi.nivel_riesgo >= 4
+                        AND ST_Intersects(zi.geom, d.geom)) THEN 1.60  -- S3
+            WHEN ze.zona_sismica_eff = 4 THEN 2.00  -- S2
+            WHEN ze.zona_sismica_eff IN (1,2) AND d.departamento ILIKE ANY(ARRAY[
+                '%puno%','%apurímac%','%apurimac%','%ayacucho%']) THEN 3.00  -- S0
+            ELSE 2.50  -- S1
+        END AS tl_suelo
+    FROM distritos d
+    JOIN zona_efectiva ze ON d.id = ze.id
+),
+-- Sismo más fuerte cercano en 50km últimos 30 años (para intensidad MMI)
+sismo_max_cercano AS (
+    SELECT DISTINCT ON (d.id)
+        d.id,
+        s.magnitud AS mag_max_cercana,
+        ROUND((ST_Distance(s.geom::geography, ST_Centroid(d.geom)::geography) / 1000)::NUMERIC, 1)
+            AS dist_epicentro_km,
+        -- Intensidad MMI estimada (Wald et al. 1999 simplificado)
+        -- MMI ≈ 1.0 + 1.47×M - 0.0031×R² (válido para R<200km)
+        LEAST(12.0, GREATEST(1.0, ROUND((
+            1.0 + 1.47 * s.magnitud
+            - 0.0031 * POWER(
+                LEAST(200.0, ST_Distance(s.geom::geography, ST_Centroid(d.geom)::geography) / 1000),
+                2)
+        )::NUMERIC, 1))) AS mmi_estimada
+    FROM distritos d
+    CROSS JOIN LATERAL (
+        SELECT magnitud, geom FROM sismos
+        WHERE magnitud >= 4.0
+          AND fecha >= CURRENT_DATE - INTERVAL '30 years'
+          AND ST_DWithin(geom::geography, ST_Centroid(d.geom)::geography, 50000)
+        ORDER BY magnitud DESC
+        LIMIT 1
+    ) s
 )
 SELECT
     d.id, d.ubigeo,
@@ -1403,17 +1542,12 @@ SELECT
     ze.zona_sismica_eff AS zona_sismica,
     ze.factor_z_eff     AS factor_z,
     d.poblacion, d.area_km2,
-    -- Clasificación suelo NTE E.031-2020 (proxy geográfico)
-    CASE
-        WHEN EXISTS(SELECT 1 FROM zonas_tsunami zt WHERE zt.nivel_riesgo >= 3 AND ST_Intersects(zt.geom, d.geom)) THEN 'S4'
-        WHEN EXISTS(SELECT 1 FROM zonas_inundables zi WHERE zi.nivel_riesgo >= 4 AND ST_Intersects(zi.geom, d.geom)) THEN 'S3'
-        WHEN ze.zona_sismica_eff IN (1,2) AND d.departamento ILIKE ANY(ARRAY[
-            '%loreto%','%ucayali%','%madre%','%amazonas%','%san mart%',
-            '%huanuco%','%huánuco%','%pasco%','%junin%','%junín%'
-        ]) THEN 'S3'
-        WHEN ze.zona_sismica_eff = 4 THEN 'S2'
-        ELSE 'S1'
-    END AS clasificacion_suelo,
+    -- Clasificación suelo NTE E.031-2020 (multi-criterio)
+    sd.clasificacion_suelo,
+    sd.factor_suelo_s,
+    sd.tp_suelo,
+    sd.tl_suelo,
+    -- Peligros individuales
     CASE ze.zona_sismica_eff WHEN 4 THEN 5 WHEN 3 THEN 4 WHEN 2 THEN 3 WHEN 1 THEN 2 ELSE 3 END AS peligro_sismico,
     COALESCE((SELECT MAX(zi.nivel_riesgo) FROM zonas_inundables zi WHERE ST_Intersects(zi.geom, d.geom)), 1) AS peligro_inundacion,
     LEAST(5.0, COALESCE((SELECT MAX(zi.nivel_riesgo) FROM zonas_inundables zi WHERE ST_Intersects(zi.geom, d.geom)), 1) * fp.indice_fen) AS peligro_inundacion_fen,
@@ -1425,8 +1559,14 @@ SELECT
     (SELECT COUNT(*)::INTEGER FROM sismos s WHERE s.magnitud >= 4.0
      AND s.fecha >= CURRENT_DATE - INTERVAL '30 years'
      AND ST_DWithin(s.geom::geography, ST_Centroid(d.geom)::geography, 50000)) AS sismos_m4_30a_50km,
+    -- Intensidad MMI del sismo más fuerte cercano
+    COALESCE(smc.mag_max_cercana, 0) AS mag_max_cercana_50km,
+    COALESCE(smc.dist_epicentro_km, 0) AS dist_epicentro_km,
+    COALESCE(smc.mmi_estimada, 1.0) AS mmi_estimada,
+    -- IRC v8 con amplificación de suelo E.031
     LEAST(5.0, GREATEST(1.0, ROUND((
         0.40 * CASE ze.zona_sismica_eff WHEN 4 THEN 5 WHEN 3 THEN 4 WHEN 2 THEN 3 WHEN 1 THEN 2 ELSE 3 END
+             * LEAST(1.5, sd.factor_suelo_s / 1.0)  -- amplificación suelo normalizada
       + 0.25 * LEAST(5.0, COALESCE((SELECT MAX(zi.nivel_riesgo) FROM zonas_inundables zi WHERE ST_Intersects(zi.geom, d.geom)), 1) * fp.indice_fen)
       + 0.20 * COALESCE((SELECT MAX(dl.nivel_riesgo) FROM deslizamientos dl WHERE ST_Intersects(dl.geom, d.geom) AND dl.activo = TRUE), 1)
       + 0.10 * COALESCE((SELECT MAX(zt.nivel_riesgo) FROM zonas_tsunami zt WHERE ST_Intersects(zt.geom, d.geom)), 1)
@@ -1436,7 +1576,9 @@ SELECT
     ST_AsText(ST_Centroid(d.geom)) AS centroide_wkt
 FROM distritos d
 JOIN zona_efectiva ze ON d.id = ze.id
-JOIN fen_por_distrito fp ON d.id = fp.id;
+JOIN fen_por_distrito fp ON d.id = fp.id
+JOIN suelo_distrito sd ON d.id = sd.id
+LEFT JOIN sismo_max_cercano smc ON d.id = smc.id;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_riesgo_id     ON mv_riesgo_construccion(id);
 CREATE INDEX IF NOT EXISTS idx_mv_riesgo_indice        ON mv_riesgo_construccion(indice_riesgo_construccion DESC);
@@ -1444,6 +1586,7 @@ CREATE INDEX IF NOT EXISTS idx_mv_riesgo_depto         ON mv_riesgo_construccion
 CREATE INDEX IF NOT EXISTS idx_mv_riesgo_zona          ON mv_riesgo_construccion(zona_sismica DESC, indice_riesgo_construccion DESC);
 CREATE INDEX IF NOT EXISTS idx_mv_riesgo_suelo         ON mv_riesgo_construccion(clasificacion_suelo);
 CREATE INDEX IF NOT EXISTS idx_mv_riesgo_fen           ON mv_riesgo_construccion(indice_fen DESC, indice_riesgo_construccion DESC);
+CREATE INDEX IF NOT EXISTS idx_mv_riesgo_mmi           ON mv_riesgo_construccion(mmi_estimada DESC);
 
 
 -- ══════════════════════════════════════════════════════════════════════════

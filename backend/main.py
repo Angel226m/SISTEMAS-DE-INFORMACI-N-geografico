@@ -189,6 +189,66 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 logger.warning("main: modelo '%s' no cargado (%s)", amenaza, exc)
 
+    # ── Cache warming — pre-populate high-traffic keys ────────────
+    async def _warm_cache():
+        try:
+            await asyncio.sleep(5)  # let DB settle
+            _pool = app.state.pool
+            items: list[tuple[str, bytes, int]] = []
+
+            # 1. Volcanes (24h TTL — casi inmutable)
+            rows_v = await _pool.fetch("""
+                SELECT ST_AsGeoJSON(geom,6)::TEXT AS geom_json,
+                       id, nombre, estado, altitud_m, region,
+                       tipo_erupcion, ultima_erupcion
+                FROM volcanes ORDER BY nombre
+            """)
+            features_v = [row_to_feature(r, ["id","nombre","estado","altitud_m",
+                                             "region","tipo_erupcion","ultima_erupcion"])
+                          for r in rows_v]
+            features_v = [f for f in features_v if f]
+            body_v = orjson.dumps({
+                "type": "FeatureCollection", "features": features_v,
+                "metadata": {"total": len(features_v), "cache": "warm",
+                             "api": "GeoRiesgo Perú v9.1"},
+            }, option=orjson.OPT_NON_STR_KEYS)
+            items.append((_cache_key("/api/v1/volcanes"), body_v, CACHE_VOLCANES))
+
+            # 2. IRC mapa (30 min TTL — hot path)
+            rows_m = await _pool.fetch("""
+                SELECT ST_AsGeoJSON(d.geom,5)::TEXT AS geom_json,
+                       mv.id, mv.ubigeo, mv.distrito, mv.provincia, mv.departamento,
+                       mv.zona_sismica,
+                       ROUND(mv.indice_riesgo_construccion::NUMERIC,2) AS indice_riesgo_construccion,
+                       CASE WHEN mv.indice_riesgo_construccion>=4.5 THEN '#b71c1c'
+                            WHEN mv.indice_riesgo_construccion>=3.5 THEN '#e53935'
+                            WHEN mv.indice_riesgo_construccion>=2.5 THEN '#fb8c00'
+                            WHEN mv.indice_riesgo_construccion>=1.5 THEN '#fdd835'
+                            ELSE '#43a047' END AS color
+                FROM mv_riesgo_construccion mv JOIN distritos d ON mv.id=d.id
+                WHERE d.geom IS NOT NULL
+                ORDER BY mv.indice_riesgo_construccion DESC LIMIT 500
+            """)
+            features_m = rows_to_features(rows_m, ["id","ubigeo","distrito","provincia",
+                                                    "departamento","zona_sismica",
+                                                    "indice_riesgo_construccion","color"])
+            body_m = orjson.dumps({
+                "type": "FeatureCollection", "features": features_m,
+                "metadata": {"total": len(features_m), "cache": "warm",
+                             "api": "GeoRiesgo Perú v9.1"},
+            }, option=orjson.OPT_NON_STR_KEYS)
+            items.append((_cache_key("/api/v1/riesgo/construccion/mapa",
+                                     indice_min=1.0, limit=500), body_m, CACHE_IRC_MAPA))
+
+            if items:
+                await geo_cache.mset_pipeline(items)
+                logger.info("main: cache warming completado (%d keys)", len(items))
+        except Exception as exc:
+            logger.warning("main: cache warming falló (%s) — continuando", exc)
+
+    if geo_cache.available:
+        asyncio.ensure_future(_warm_cache())
+
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────
@@ -205,7 +265,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="GeoRiesgo Perú API",
     description="""
-## API de Riesgo Geoespacial — Perú v9.0  ENTERPRISE
+## API de Riesgo Geoespacial — Perú v9.1  ENTERPRISE
 
 ### 🆕 Nuevos endpoints v9.0
 | Endpoint | Descripción |
@@ -235,7 +295,7 @@ app = FastAPI(
 | EWS | INDECI 2020 + EW4All UNDRR 2022 |
 | GEM taxonomy | Yepes-Estrada et al. 2023 Earthquake Spectra |
     """,
-    version="9.0.0",
+    version="9.1.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -704,7 +764,15 @@ async def get_riesgo_construccion_ranking(
             d.irc_v9_p90,
             COALESCE(d.peligro_volcan, 1)        AS peligro_volcan,
             COALESCE(d.peligro_sequia, 1)        AS peligro_sequia,
-            COALESCE(d.factor_cascada, 1.0)      AS factor_cascada
+            COALESCE(d.factor_cascada, 1.0)      AS factor_cascada,
+            -- v9.1: suelo NTE E.031-2020 + intensidad MMI
+            mv.clasificacion_suelo,
+            COALESCE(mv.factor_suelo_s, 1.0)     AS factor_suelo_s,
+            COALESCE(mv.tp_suelo, 0.4)           AS tp_suelo,
+            COALESCE(mv.tl_suelo, 2.5)           AS tl_suelo,
+            COALESCE(mv.mmi_estimada, 1.0)       AS mmi_estimada,
+            COALESCE(mv.mag_max_cercana_50km, 0)  AS mag_max_cercana_50km,
+            COALESCE(mv.dist_epicentro_km, 0)     AS dist_epicentro_km
             {ivs_cols}
         FROM mv_riesgo_construccion mv
         JOIN distritos d ON mv.id = d.id
@@ -719,8 +787,10 @@ async def get_riesgo_construccion_ranking(
     result = {
         "ranking": [_serialize_row(r) for r in rows],
         "total": len(rows),
-        "metodologia_v8": "CENEPRED 2014 + NTE E.030-2018 (40%S+25%I+20%D+10%T+5%F)",
+        "metodologia_v8": "CENEPRED 2014 + NTE E.030-2018 (40%S×Fs+25%I+20%D+10%T+5%F)",
         "metodologia_v9": "CENEPRED 2014 + 7 amenazas (35%S+20%I+18%D+10%T+8%V+5%Q+4%F × cascada)",
+        "suelo_e031": "NTE E.031-2020 — clasificación S0-S4 multi-criterio con Fs, Tp, TL",
+        "intensidad": "MMI estimada vía Wald et al. 1999 (sismo M4+ más fuerte en 50km/30a)",
         "filtros": {
             "departamento": departamento, "zona_sismica": zona_sismica,
             "indice_min": indice_min, "order": order, "limit": limit,
@@ -939,6 +1009,7 @@ async def get_modelo_info(
     "/api/v1/susceptibilidad/modelo/entrenar",
     summary="Entrena el modelo ML para una amenaza (background, hasta 120s)",
     tags=["Susceptibilidad ML"],
+    response_class=JSONResponse,
 )
 @limiter.limit("1/hour")
 async def entrenar_modelo(
@@ -1976,7 +2047,8 @@ async def get_departamentos(
 # ── Sismos ────────────────────────────────────────────────────────
 
 _SISMOS_PROPS = ["usgs_id","magnitud","profundidad_km","tipo_profundidad",
-                 "fecha","lugar","region","tipo_magnitud","estado"]
+                 "fecha","lugar","region","tipo_magnitud","estado",
+                 "energia_j","radio_sentido_km","mmi_epicentro","intensidad_desc"]
 
 
 @app.get("/api/v1/sismos", tags=["Sismos"], response_class=Response)
@@ -1998,7 +2070,24 @@ async def get_sismos(
                usgs_id, magnitud, profundidad_km, tipo_profundidad,
                fecha::TEXT AS fecha, lugar,
                COALESCE(region, f_asignar_region(ST_X(geom),ST_Y(geom))) AS region,
-               tipo_magnitud, estado
+               tipo_magnitud, estado,
+               -- Energía sísmica (Gutenberg-Richter): log10(E) = 1.5*M + 4.8 (julios)
+               ROUND(POWER(10, 1.5 * magnitud + 4.8)::NUMERIC, 0) AS energia_j,
+               -- Radio de percepción estimado (km) — Toppozada 1975 simplificado
+               ROUND(POWER(10, 0.5 * magnitud - 0.8)::NUMERIC, 0) AS radio_sentido_km,
+               -- MMI en epicentro (Wald et al. 1999): MMI ≈ 1.0 + 1.47*M - 0.0031*depth²
+               LEAST(12, GREATEST(1, ROUND((
+                   1.0 + 1.47 * magnitud - 0.0031 * POWER(LEAST(profundidad_km, 200), 2)
+               )::NUMERIC, 1))) AS mmi_epicentro,
+               -- Descripción intensidad Mercalli
+               CASE
+                   WHEN (1.0 + 1.47 * magnitud - 0.0031 * POWER(LEAST(profundidad_km, 200), 2)) >= 10 THEN 'Extremo'
+                   WHEN (1.0 + 1.47 * magnitud - 0.0031 * POWER(LEAST(profundidad_km, 200), 2)) >= 8  THEN 'Destructivo'
+                   WHEN (1.0 + 1.47 * magnitud - 0.0031 * POWER(LEAST(profundidad_km, 200), 2)) >= 6  THEN 'Fuerte'
+                   WHEN (1.0 + 1.47 * magnitud - 0.0031 * POWER(LEAST(profundidad_km, 200), 2)) >= 4  THEN 'Ligero'
+                   WHEN (1.0 + 1.47 * magnitud - 0.0031 * POWER(LEAST(profundidad_km, 200), 2)) >= 2  THEN 'Débil'
+                   ELSE 'No sentido'
+               END AS intensidad_desc
         FROM sismos
         WHERE magnitud BETWEEN $1 AND $2
           AND EXTRACT(YEAR FROM fecha) BETWEEN $3 AND $4
@@ -2509,3 +2598,45 @@ async def get_sync_status():
         FROM sync_log WHERE fin IS NOT NULL ORDER BY tabla, fin DESC
     """)
     return [_serialize_row(r) for r in rows]
+
+
+# ── Cache stats ───────────────────────────────────────────────────
+
+@app.get("/api/v1/cache/stats", tags=["Sistema"])
+async def get_cache_stats():
+    """
+    Estadísticas de Redis: memoria, hit-rate, distribución de keys por endpoint.
+    Útil para diagnóstico y tuning de TTLs.
+    """
+    cache: GeoCache = getattr(app.state, "cache", None)
+    if cache is None:
+        return {"available": False, "message": "cache no inicializado"}
+    return await cache.stats()
+
+
+@app.delete("/api/v1/cache/flush", tags=["Sistema"])
+async def flush_cache_prefix(
+    prefix: str = Query(
+        "gr:",
+        description="Prefijo de keys a eliminar. Default: todas las keys GeoRiesgo.",
+    ),
+):
+    """
+    Invalida keys de caché por prefijo. Útil post-ETL o post-deploy.
+    Solo elimina keys con prefijo `gr:` por defecto (no afecta otros datos Redis).
+    """
+    if not prefix.startswith("gr:"):
+        raise HTTPException(400, detail={
+            "error": "prefijo_invalido",
+            "mensaje": "Solo se permiten prefijos que empiecen con 'gr:'",
+        })
+    cache: GeoCache = getattr(app.state, "cache", None)
+    if cache is None or not cache.available:
+        return {"flushed": 0, "message": "cache no disponible"}
+    await cache.invalidate_prefix(prefix)
+    keys_restantes = await cache.keys_count()
+    return {
+        "flushed": True,
+        "prefix": prefix,
+        "keys_restantes": keys_restantes,
+    }

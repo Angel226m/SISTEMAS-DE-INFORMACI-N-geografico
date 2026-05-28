@@ -56,11 +56,13 @@ export default function App(){
 
   const{data,loading,errors,riesgo,riesgoLoading,riesgoConstruccionPunto,riesgoConstruccionLoading,
     iRCRanking,coberturaTipos,eventosFen,fenEstadisticas:_fen,fenLoading:_fl,
-    riesgoLluvia,riesgoLluviaLoading,alertasEWS,ewsPingTs,
+    riesgoLluvia,riesgoLluviaLoading,alertasEWS,ewsPingTs:_ewsPing,
     riesgoEscenario,sendaiReport,mlEntrenando,
     recargarSismos,buscarRiesgo,buscarIRC,buscarRiesgoLluvia,
     calcularEscenario,cargarSendai,cargarSusceptibilidad,
     recargarTodo,cargarIRCMapa,cargarPrecipitaciones,
+    cargarInundaciones,cargarTsunamis,cargarDeslizamientos,
+    cargarInfraestructura,cargarEstaciones,cargarDepartamentos,
   }=useMapData()
 
   const filtrosRef=useRef(filtros)
@@ -84,6 +86,13 @@ export default function App(){
   useEffect(()=>{if(capas.riesgo_construccion&&!data.riesgoConstruccionMapa) cargarIRCMapa()},[capas.riesgo_construccion]) // eslint-disable-line
   useEffect(()=>{if(capas.precipitaciones) cargarPrecipitaciones(filtrosPrecip)},[filtrosPrecip,capas.precipitaciones]) // eslint-disable-line
   useEffect(()=>{if(capas.susceptibilidad&&filtrosV9.amenazaML) cargarSusceptibilidad(filtrosV9.amenazaML,'Ica')},[filtrosV9.amenazaML,capas.susceptibilidad]) // eslint-disable-line
+  // 🆕 v9.1 — lazy loaders for secondary layers
+  useEffect(()=>{if(capas.departamentos&&!data.departamentos) cargarDepartamentos()},[capas.departamentos]) // eslint-disable-line
+  useEffect(()=>{if(capas.inundaciones&&!data.inundaciones) cargarInundaciones()},[capas.inundaciones]) // eslint-disable-line
+  useEffect(()=>{if(capas.tsunamis&&!data.tsunamis) cargarTsunamis()},[capas.tsunamis]) // eslint-disable-line
+  useEffect(()=>{if(capas.deslizamientos&&!data.deslizamientos) cargarDeslizamientos()},[capas.deslizamientos]) // eslint-disable-line
+  useEffect(()=>{if(capas.infraestructura&&!data.infraestructura) cargarInfraestructura()},[capas.infraestructura]) // eslint-disable-line
+  useEffect(()=>{if(capas.estaciones&&!data.estaciones) cargarEstaciones()},[capas.estaciones]) // eslint-disable-line
 
   useEffect(()=>{
     const h=(e:KeyboardEvent)=>{
@@ -123,7 +132,7 @@ export default function App(){
               <div style={{width:32,height:32,borderRadius:9,background:`linear-gradient(135deg,${C.primary},${C.secondary})`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,color:'white',fontWeight:800}}>G</div>
               <div>
                 <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:800,color:C.text,letterSpacing:'-0.02em',lineHeight:1.1}}>GeoRiesgo <span style={{color:C.primary}}>Perú</span></div>
-                <div style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:C.textMuted,letterSpacing:'0.1em',textTransform:'uppercase'}}>Multi-hazard · ML · EWS · v9.0</div>
+                <div style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:C.textMuted,letterSpacing:'0.1em',textTransform:'uppercase'}}>Multi-hazard · ML · EWS · v9.1</div>
               </div>
             </div>
           </div>
@@ -267,10 +276,10 @@ export default function App(){
                   <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:C.primary}}>Actualizando</span>
                 </div>
               )}
-              {ewsPingTs&&(
+              {_ewsPing&&(
                 <div style={{position:'absolute',bottom:28,right:14,zIndex:10,display:'flex',alignItems:'center',gap:5,padding:'3px 8px',background:'rgba(255,255,255,0.85)',backdropFilter:'blur(8px)',border:`1px solid ${C.border}`,borderRadius:99}}>
                   <div style={{width:5,height:5,borderRadius:'50%',background:C.primary}}/>
-                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:7.5,color:C.textMuted}}>EWS live · {new Date(ewsPingTs).toLocaleTimeString('es-PE')}</span>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:7.5,color:C.textMuted}}>EWS live · {new Date(_ewsPing).toLocaleTimeString('es-PE')}</span>
                 </div>
               )}
             </div>

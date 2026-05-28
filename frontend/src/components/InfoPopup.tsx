@@ -30,14 +30,38 @@ export function InfoPopup({props:p,layer:_l,onClose}:{props:Record<string,unknow
           {isSismo&&!isEWS&&(()=>{
             const mag=Number(p.magnitud??0),prof=Number(p.profundidad_km??0)
             const mc=mag>=7?C.danger:mag>=6?'#f97316':mag>=5?C.warning:C.primary
+            const mmi=p.mmi_epicentro ? Number(p.mmi_epicentro) : null
+            const energia=p.energia_j ? Number(p.energia_j) : null
+            const radio=p.radio_sentido_km ? Number(p.radio_sentido_km) : null
+            const intensidad=p.intensidad_desc ? String(p.intensidad_desc) : null
+            const mmiColor = mmi ? (mmi >= 8 ? C.danger : mmi >= 6 ? C.orange : mmi >= 4 ? C.warning : C.primary) : C.textMuted
             return(<>
               <div style={{display:'flex',alignItems:'baseline',gap:6,marginBottom:12,paddingBottom:10,borderBottom:`1px solid ${C.border}`}}>
                 <span style={{fontFamily:"'DM Mono',monospace",fontSize:40,fontWeight:800,color:mc,lineHeight:1}}>{mag.toFixed(1)}</span>
                 <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:C.textMuted}}>Mw</span>
+                {intensidad&&<span style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:mc,marginLeft:'auto',fontWeight:600}}>{intensidad}</span>}
               </div>
               <Row label="Fecha" value={String(p.fecha??'')}/>
               <Row label="Profundidad" value={`${prof} km`} color={prof<30?C.danger:prof<70?'#f97316':'#0ea5e9'}/>
+              {p.tipo_profundidad&&<Row label="Tipo" value={String(p.tipo_profundidad)}/>}
               {p.region&&<Row label="Región" value={String(p.region)}/>}
+              {(mmi!==null||energia!==null||radio!==null)&&(
+                <div style={{marginTop:8,padding:'7px 10px',background:C.bgSoft,border:`1px solid ${C.border}`,borderRadius:8}}>
+                  {mmi!==null&&<div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:C.textMuted}}>MMI epicentro</span>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:800,color:mmiColor}}>{mmi.toFixed(1)}/12</span>
+                  </div>}
+                  {energia!==null&&<div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:C.textMuted}}>Energía</span>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:C.text}}>{energia.toExponential(2)} J</span>
+                  </div>}
+                  {radio!==null&&<div style={{display:'flex',justifyContent:'space-between'}}>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:C.textMuted}}>Radio percepción</span>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:C.text}}>~{radio.toLocaleString('es-PE')} km</span>
+                  </div>}
+                  <div style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:C.textMuted,marginTop:4}}>Wald et al. 1999 · Toppozada 1975 · G-R</div>
+                </div>
+              )}
               <div style={{marginTop:7,padding:'7px 10px',background:C.bgSoft,borderRadius:8,fontFamily:"'DM Sans',sans-serif",fontSize:11,color:C.textSec,lineHeight:1.4}}>{String(p.lugar??'')}</div>
             </>)
           })()}
@@ -119,16 +143,25 @@ export function InfoPopup({props:p,layer:_l,onClose}:{props:Record<string,unknow
             const irc=p.indice_riesgo_construccion?Number(p.indice_riesgo_construccion):null
             const ircV9=p.indice_riesgo_v9?Number(p.indice_riesgo_v9):null
             const factorCascada=p.factor_cascada?Number(p.factor_cascada as unknown as number):null
+            const suelo=p.clasificacion_suelo ? String(p.clasificacion_suelo) : null
+            const factorS=p.factor_suelo_s ? Number(p.factor_suelo_s) : null
+            const mmi=p.mmi_estimada ? Number(p.mmi_estimada) : null
+            const mmiColor = mmi ? (mmi >= 8 ? C.danger : mmi >= 6 ? C.orange : mmi >= 4 ? C.warning : C.primary) : C.textMuted
+            const SUELO_LABELS: Record<string,string> = {
+              S0:'Roca dura (VS30>1500 m/s)',S1:'Roca blanda (760-1500 m/s)',
+              S2:'Suelo rígido (360-760 m/s)',S3:'Suelo blando (180-360 m/s)',
+              S4:'Suelo muy blando (<180 m/s)',
+            }
             return(<>
               <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:16,fontWeight:700,color:C.text,marginBottom:8}}>{String(p.nombre??'')}</p>
               <ZonaBadge zona={p.zona_sismica as number} factor={p.factor_z as number}/>
               {p.provincia&&<Row label="Provincia" value={String(p.provincia)}/>}
               {p.departamento&&<Row label="Departamento" value={String(p.departamento)}/>}
-              {irc!==null&&(
+              {(irc!==null||ircV9!==null)&&(
                 <div style={{marginTop:8,padding:'8px 10px',background:'#fffbeb',border:'1px solid #fde68a',borderRadius:8}}>
                   <div style={{display:'flex',justifyContent:'space-between',marginBottom:ircV9?4:0}}>
                     <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:'#92400e'}}>IRC v8</span>
-                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:15,fontWeight:800,color:RISK_COLORS[Math.max(0,Math.min(4,Math.round(irc)-1))]}}>{irc.toFixed(2)}</span>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:15,fontWeight:800,color:RISK_COLORS[Math.max(0,Math.min(4,Math.round((irc??1))-1))]}}>{(irc??0).toFixed(2)}</span>
                   </div>
                   {ircV9&&(
                     <div style={{display:'flex',justifyContent:'space-between'}}>
@@ -138,13 +171,28 @@ export function InfoPopup({props:p,layer:_l,onClose}:{props:Record<string,unknow
                   )}
                   {factorCascada&&factorCascada>1.01 && (
                     <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:C.teal,marginTop:4}}>
-                      Cascada ×{factorCascada.toFixed(3)}
+                      Cascada ×{factorCascada.toFixed(3)} · Gill &amp; Malamud 2014
                     </div>
                   )}
                 </div>
               )}
+              {suelo&&(
+                <div style={{marginTop:6,padding:'7px 10px',background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:3}}>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:'#15803d',fontWeight:700}}>Suelo {suelo} — NTE E.031-2020</span>
+                    {factorS&&<span style={{fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:800,color:'#15803d'}}>Fs={factorS.toFixed(2)}</span>}
+                  </div>
+                  <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,color:'#166534',lineHeight:1.3}}>{SUELO_LABELS[suelo]??''}</div>
+                </div>
+              )}
+              {mmi!==null&&mmi>1&&(
+                <div style={{marginTop:6,padding:'6px 10px',background:'#fff7ed',border:`1px solid ${C.orange}30`,borderRadius:8,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:'#7c3aed'}}>MMI estimada (Wald 1999)</span>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:13,fontWeight:800,color:mmiColor}}>{mmi.toFixed(1)}</span>
+                </div>
+              )}
               <div style={{display:'flex',gap:3,marginTop:8}}>
-                {RISK_LABELS.map((_,i)=><div key={i} style={{flex:1,height:5,borderRadius:3,background:i<nivel?RISK_COLORS[i]:C.bgMuted}}/>)}
+                {RISK_LABELS.map((_,i)=><div key={i} style={{flex:1,height:5,borderRadius:3,background:i<Math.max(1,Math.min(5,Number(p.nivel_riesgo??1)))?RISK_COLORS[i]:C.bgMuted}}/>)}
               </div>
             </>)
           })()}

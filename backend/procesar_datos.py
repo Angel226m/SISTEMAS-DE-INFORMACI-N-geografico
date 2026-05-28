@@ -2837,8 +2837,9 @@ def print_banner(dry_run: bool = False) -> None:
     modo = "  ⚠️  DRY-RUN — sin escrituras a BD" if dry_run else ""
     print("""
   ╔══════════════════════════════════════════════════════════════╗
-  ║  GeoRiesgo Perú — ETL v9.0 ENTERPRISE                      ║
+  ║  GeoRiesgo Perú — ETL v9.1 ENTERPRISE                      ║
   ║  ✅ Pasos 0-10 v8.0 conservados intactos                   ║
+  ║  🆕 Suelo NTE E.031-2020 multi-criterio (S0-S4 + Fs)      ║
   ║  🆕 PASO: Volcanes (INGEMMET/OVI-IGP 2021 — 20 volcanes)  ║
   ║  🆕 PASO: Sequía SPI-12 (McKee 1993 / CHIRPS 1981-2020)   ║
   ║  🆕 PASO: Cascada sismo→desl (Gill & Malamud 2014)        ║
@@ -2867,9 +2868,30 @@ def _run_step(nombre: str, fn: Any, dry_run: bool) -> StepResult:
         return StepResult(nombre, 0, 0, 1, 0.0, f"ERROR: {exc}")
 
 
+def _validate_data_integrity() -> dict[str, int]:
+    """Post-ETL validation: row counts and basic integrity checks."""
+    checks: dict[str, int] = {}
+    try:
+        with get_conn() as conn:
+            for tabla in ["sismos", "departamentos", "distritos", "fallas",
+                          "zonas_inundables", "deslizamientos", "infraestructura",
+                          "volcanes", "zonas_precipitacion", "eventos_fen"]:
+                row = fetch_one(conn, f"SELECT COUNT(*) FROM {tabla}")  # noqa: S608 — safe: hardcoded
+                checks[tabla] = row[0] if row else 0
+            # IRC v9 coverage
+            row = fetch_one(conn, "SELECT COUNT(*) FROM distritos WHERE indice_riesgo_v9 IS NOT NULL")
+            checks["distritos_con_irc_v9"] = row[0] if row else 0
+            # orphan check
+            row = fetch_one(conn, "SELECT COUNT(*) FROM distritos WHERE zona_sismica IS NULL")
+            checks["distritos_sin_zona"] = row[0] if row else 0
+    except Exception as exc:
+        log.warning("Validación de integridad falló: %s", exc)
+    return checks
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="GeoRiesgo Perú ETL v9.0 ENTERPRISE",
+        description="GeoRiesgo Perú ETL v9.1 ENTERPRISE",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="\n".join(
             f"  {k:<25} {desc}"
@@ -2889,6 +2911,8 @@ def main() -> int:
                         help="Iteraciones bootstrap IRC v9 (default: 500)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simular sin escribir a BD")
+    parser.add_argument("--validate", action="store_true",
+                        help="Ejecutar validación de integridad post-ETL")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Log level DEBUG")
     args = parser.parse_args()
@@ -2928,8 +2952,10 @@ def main() -> int:
     for i, nombre in enumerate(pasos_a_ejecutar):
         fn, desc, _ = _PASOS[nombre]
         pct = (i / total_pasos) * 100
-        log.info("── PASO %02d/%02d (%.0f%%): %-25s %s",
-                 i + 1, total_pasos, pct, nombre.upper(), desc)
+        log.info("── PASO %02d/%02d (%.0f%%) ▐%s▌ %-25s %s",
+                 i + 1, total_pasos, pct,
+                 "█" * int(pct / 5) + "░" * (20 - int(pct / 5)),
+                 nombre.upper(), desc)
         result = _run_step(nombre, fn, args.dry_run)
         resultados.append(result)
         log.info("   %s", result)
@@ -2938,15 +2964,35 @@ def main() -> int:
 
     elapsed = time.perf_counter() - t_total
 
+    # Data integrity validation
+    integrity: dict[str, int] = {}
+    if not args.dry_run and (args.validate or not args.solo):
+        log.info("── VALIDACIÓN DE INTEGRIDAD ──")
+        integrity = _validate_data_integrity()
+        for tabla, count in integrity.items():
+            status = "✅" if count > 0 else "⚠️ "
+            log.info("   %s %-30s %d registros", status, tabla, count)
+
     print("\n  ╔══════════════════════════════════════════════════════════════╗")
-    print("  ║  RESUMEN FINAL ETL v9.0                                     ║")
+    print("  ║  RESUMEN FINAL ETL v9.1                                     ║")
     print("  ╠══════════════════════════════════════════════════════════════╣")
     for r in resultados:
         print(f"  ║  {r}")
     ok_count  = sum(1 for r in resultados if r.ok)
     err_count = len(resultados) - ok_count
+    total_ins = sum(r.insertados for r in resultados)
+    total_upd = sum(r.actualizados for r in resultados)
     print("  ╠══════════════════════════════════════════════════════════════╣")
+    if integrity:
+        irc_cov = integrity.get("distritos_con_irc_v9", 0)
+        total_d = integrity.get("distritos", 0)
+        pct_cov = (irc_cov / total_d * 100) if total_d > 0 else 0
+        print(f"  ║  📊 IRC v9 cobertura: {irc_cov}/{total_d} distritos ({pct_cov:.0f}%)")
+        sin_zona = integrity.get("distritos_sin_zona", 0)
+        if sin_zona > 0:
+            print(f"  ║  ⚠️  {sin_zona} distritos sin zona sísmica asignada")
     print(f"  ║  ✅ {ok_count} pasos OK  ❌ {err_count} con errores  ⏱ {elapsed:.0f}s total")
+    print(f"  ║  📦 {total_ins:,} inserts  🔄 {total_upd:,} updates")
     print("  ╚══════════════════════════════════════════════════════════════╝\n")
 
     close_pool()

@@ -18,6 +18,11 @@ export interface SismoProps {
   tipo_profundidad: 'superficial' | 'intermedio' | 'profundo'
   fecha: string; hora_utc: string | null; lugar: string
   region: string | null; tipo_magnitud: string; estado: string
+  // 🆕 v9.1: detalles sísmicos enriquecidos
+  energia_j: number | null
+  radio_sentido_km: number | null
+  mmi_epicentro: number | null
+  intensidad_desc: string | null
 }
 
 export interface DepartamentoProps {
@@ -33,11 +38,16 @@ export interface DistritoProps {
   nivel_riesgo: 1|2|3|4|5; poblacion: number | null; area_km2: number | null
   fuente: string; zona_sismica: 1|2|3|4|null
   indice_riesgo_construccion: number | null
-  clasificacion_suelo: 'S1'|'S2'|'S3'|'S4'|null
+  clasificacion_suelo: 'S0'|'S1'|'S2'|'S3'|'S4'|null
   // 🆕 v9
   indice_riesgo_v9: number | null; irc_v9_p10: number | null
   irc_v9_p90: number | null; factor_cascada: number | null
   peligro_volcan: number | null; peligro_sequia: number | null
+  // 🆕 v9.1: NTE E.031-2020 + intensidad MMI
+  factor_suelo_s: number | null
+  tp_suelo: number | null
+  tl_suelo: number | null
+  mmi_estimada: number | null
 }
 
 export interface FallaProps {
@@ -173,6 +183,13 @@ export interface RiesgoConstruccionRanking {
   irc_v9_p10?: number | null; irc_v9_p90?: number | null
   peligro_volcan?: number | null; peligro_sequia?: number | null
   factor_cascada?: number | null
+  // 🆕 v9.1: suelo NTE E.031-2020 + intensidad MMI
+  clasificacion_suelo?: 'S0'|'S1'|'S2'|'S3'|'S4'|null
+  factor_suelo_s?: number | null
+  tp_suelo?: number | null; tl_suelo?: number | null
+  mmi_estimada?: number | null
+  mag_max_cercana_50km?: number | null
+  dist_epicentro_km?: number | null
 }
 
 export interface CoberturaTipo {

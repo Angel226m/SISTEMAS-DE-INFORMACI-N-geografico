@@ -1,8 +1,8 @@
-# 🌋 GeoRiesgo Perú v9.0 — Plataforma Multi-Amenaza con ML y EWS
+# 🌋 GeoRiesgo Perú v9.1 — Plataforma Multi-Amenaza con ML y EWS
 
-> Plataforma geoespacial multi-amenaza para el análisis integral de riesgos naturales en Perú. Integra sismicidad, vulcanismo, deslizamientos, inundaciones, tsunamis, precipitaciones FEN, sequía SPI-12, modelos de susceptibilidad ML (XGBoost + SHAP + Optuna) y sistema de alerta temprana (EWS) en tiempo real con alineación Sendai 2015–2030.
+> Plataforma geoespacial multi-amenaza para el análisis integral de riesgos naturales en Perú. Integra sismicidad, vulcanismo, deslizamientos, inundaciones, tsunamis, precipitaciones FEN, sequía SPI-12, clasificación de suelos NTE E.031-2020, modelos de susceptibilidad ML (XGBoost + SHAP + Optuna) y sistema de alerta temprana (EWS) en tiempo real con alineación Sendai 2015–2030.
 
-[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://typescriptlang.org)
@@ -100,7 +100,7 @@
 ### Backend
 | Tecnología       | Versión   | Uso |
 |-----------------|-----------|-----|
-| Python           | 3.11      | Runtime |
+| Python           | 3.12      | Runtime |
 | FastAPI          | 0.115     | Framework API REST asíncrono |
 | Uvicorn          | 0.31      | Servidor ASGI |
 | asyncpg          | —         | Driver PostgreSQL asíncrono (prepared statements para 5 queries frecuentes) |
@@ -144,14 +144,14 @@ georiesgo-peru/
 ├── docker-compose.yml              # 4 servicios: db, redis, backend, frontend
 ├── README.md
 ├── backend/
-│   ├── Dockerfile                  # Python 3.11-slim + GDAL + deps
+│   ├── Dockerfile                  # Multi-stage: builder (wheels C++) + runtime 3.12-slim (~100 MB menos)
 │   ├── entrypoint.sh               # ETL + arranque uvicorn
 │   ├── init.sql                    # DDL PostgreSQL (20+ tablas + PostGIS + vistas materializadas)
 │   ├── main.py                     # API FastAPI — 30+ endpoints REST + WS + SSE
 │   ├── ml_engine.py                # Motor ML: XGBoost + VIF + SMOTE-Tomek + Optuna + SHAP
 │   ├── alert_worker.py             # EWS Worker — USGS/IGP tiempo real + CAP v1.2
 │   ├── damage_model.py             # Modelo de daño: Youngs 1997 + fragilidad multi-taxonomía
-│   ├── procesar_datos.py           # ETL v9.0: 20 pasos con dependencias + bootstrap IRC
+│   ├── procesar_datos.py           # ETL v9.1: 20 pasos + bootstrap IRC + validación integridad (--validate)
 │   ├── cache.py                    # Decorador cache Redis con TTL
 │   ├── stac_catalog.py             # Catálogo STAC (opcional, requiere MinIO)
 │   └── requirements.txt
@@ -254,7 +254,7 @@ La API expone 30+ endpoints REST + WebSocket bajo `/api/v1/`. Documentación int
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
-| `GET`  | `/`  | Estado general del sistema v9.0 |
+| `GET`  | `/`  | Estado general del sistema v9.1 |
 | `GET`  | `/health` | Healthcheck Docker/k8s |
 | `GET`  | `/api/v1/resumen` | Resumen completo de datos cargados |
 | `GET`  | `/api/v1/diagnostico/regiones` | Diagnóstico de regiones disponibles |
@@ -335,6 +335,13 @@ La API expone 30+ endpoints REST + WebSocket bajo `/api/v1/`. Documentación int
 | `GET`  | `/api/v1/alertas/stream` | SSE (Server-Sent Events) en tiempo real |
 | `GET`  | `/api/v1/alertas/recap` | Últimas alertas emitidas |
 | `GET`  | `/api/v1/ews/stats` | Estadísticas del worker EWS |
+
+### Caché y Rendimiento
+
+| Método   | Ruta | Descripción |
+|----------|------|-------------|
+| `GET`    | `/api/v1/cache/stats` | Estadísticas Redis: hit rate, memoria, keys por endpoint |
+| `DELETE` | `/api/v1/cache/flush` | Invalida keys por prefijo `gr:` (parámetro: `prefix`) |
 
 ---
 
@@ -504,7 +511,12 @@ python procesar_datos.py --dry-run
 
 # Ajustar workers y bootstrap
 python procesar_datos.py --workers 8 --bootstrap-n 1000 --verbose
+
+# Validar integridad de datos (sin ejecutar ETL)
+python procesar_datos.py --validate
 ```
+
+El flag `--validate` ejecuta consultas de conteo en 10 tablas clave, calcula la cobertura IRC v9 y detecta distritos huérfanos. Útil para diagnosticar la BD antes de arrancar la plataforma.
 
 ---
 
@@ -538,6 +550,21 @@ Calibrado con inventario CENEPRED post-sismo Pisco M8.0 2007. Modela la interacc
 
 - 500 iteraciones bootstrap con perturbación ±10% en los pesos (normalización a suma=1)
 - Percentiles p10 y p90 almacenados en `irc_v9_p10` / `irc_v9_p90`
+
+### Clasificación de Suelos NTE E.031-2020 (v9.1)
+
+La vista `mv_riesgo_construccion` incluye clasificación de perfil de suelo por distrito conforme a NTE E.031-2020 (equivalente a ASCE 7-22 / EN 1998):
+
+| Clase | Descripción | Vs30 (m/s) | Factor Fa |
+|-------|-------------|------------|-----------|
+| S0 | Roca dura | > 1500 | 0.80 |
+| S1 | Roca o suelo muy rígido | 500–1500 | 1.00 |
+| S2 | Suelos intermedios | 180–500 | 1.20 |
+| S3 | Suelos blandos | < 180 | 1.40 |
+| S4 | Condiciones especiales | — | 1.60 |
+
+Nuevos campos en `/api/v1/riesgo/construccion/mapa` y `/api/v1/riesgo/construccion/ranking`:
+`clasificacion_suelo`, `factor_suelo_s`, `tp_suelo`, `tl_suelo`, `mmi_estimada`, `mag_max_cercana_50km`, `dist_epicentro_km`
 
 ---
 
@@ -578,6 +605,16 @@ Calibrado con inventario CENEPRED post-sismo Pisco M8.0 2007. Modela la interacc
 - Eventos FEN históricos con intensidad
 - Escenario de daño sísmico (distribución estados de daño, pérdidas estimadas)
 - Reporte Sendai (7 targets con indicadores)
+
+### Carga Diferida de Capas (v9.1)
+
+Las capas no activas al arrancar se cargan **bajo demanda** cuando el usuario las activa:
+
+| Capas cargadas al inicio | Capas lazy (carga al activar) |
+|--------------------------|-------------------------------|
+| Sismos, Distritos, Fallas, Estadísticas | Departamentos, Inundaciones, Tsunamis, Deslizamientos, Infraestructura, Estaciones |
+
+Esto reduce la carga inicial en ~60% de ancho de banda y mejora el tiempo de primer renderizado.
 
 ### Error Handling
 
@@ -688,6 +725,10 @@ npm run lint    # ESLint
 | SENCICO (2018) Norma Técnica de Edificación E.030 | Zonificación sísmica Z1–Z4 |
 | UNDRR (2022) Early Warnings for All (EW4All) | 4 pilares del EWS |
 | WMO (2012) Standardized Precipitation Index User Guide (WMO-No. 1090) | Clasificación SPI |
+| Wald, D.J. et al. (1999) "Relationships between Peak Ground Acceleration, Peak Ground Velocity, and Modified Mercalli Intensity in California". *Earthquake Spectra* 15(3):557–564 | Conversión PGA → MMI en `InfoPopup` y `mv_riesgo_construccion` |
+| Toppozada, T. (1975) "Earthquake Magnitude as a Function of Intensity Data in California and Western Nevada". *BSSA* 65(5):1223–1238 | Lookup de intensidad percibida por magnitud |
+| Gutenberg, B. & Richter, C.F. (1956) Magnitude and Energy of Earthquakes. *Annali di Geofisica* 9:1–15 | Cálculo energía E = 10^(1.5M + 4.8) J mostrado en popup sísmico |
+| SENCICO (2020) Norma Técnica de Edificación E.031 — Suelos con Condiciones Especiales | Clasificación S0–S4 y factores Fa/Fv en `mv_riesgo_construccion` |
 
 ---
 
@@ -708,6 +749,24 @@ npm run lint    # ESLint
 Proyecto académico — noveno ciclo. Datos de fuentes públicas gubernamentales.
 
 Datos sísmicos © USGS (dominio público). Datos geoespaciales © IGP, INGEMMET, ANA, INEI, SENAMHI (sujetos a términos de uso de cada institución). GEM Global Exposure Model © GEM Foundation 2023.
+
+---
+
+---
+
+## 🆕 Changelog v9.1
+
+| Componente | Mejora |
+|------------|--------|
+| `backend/init.sql` | Vista `mv_riesgo_construccion` reescrita con CTEs NTE E.031-2020: nuevas columnas de suelo S0–S4 + `mmi_estimada` |
+| `backend/Dockerfile` | Build multi-stage: etapa `builder` compila wheels C/C++, etapa `runtime` usa 3.12-slim (~100 MB de ahorro) |
+| `backend/main.py` | Cache warming en `lifespan` (volcanes + IRC mapa). Nuevos endpoints `/api/v1/cache/stats` y `DELETE /api/v1/cache/flush` |
+| `backend/cache.py` | Método `stats()` con métricas Redis (hit rate, memoria, keys por endpoint). Método `mset_pipeline()` para escrituras batch |
+| `backend/procesar_datos.py` | Flag `--validate` para diagnóstico de integridad. Barra de progreso visual. Cobertura IRC en resumen |
+| `frontend/useMapData.ts` | Lazy loading: 6 capas deferred. Nuevos callbacks exportados por capa |
+| `frontend/App.tsx` | 6 `useEffect` que disparan carga lazy al activar cada capa |
+| `frontend/InfoPopup.tsx` | Sismos: MMI coloreado, energía J, radio percepción. IRC/suelo: card S0–S4 + Fs + MMI estimada |
+| `frontend/constants.ts` | Sistema de diseño completo: `SUELO_COLORS`, `mmiColor()`, escala tipográfica `T`, escala espaciado `S` |
 
 ---
 

@@ -206,6 +206,83 @@ class GeoCache:
         except Exception:
             return 0
 
+    async def stats(self) -> dict[str, Any]:
+        """
+        Retorna estadísticas de Redis: memoria, hits, misses, uptime y
+        distribución de keys por prefijo de endpoint.
+
+        Returns:
+            dict con campos: available, keys_total, memory_used_mb,
+            hit_rate_pct, uptime_hours, keys_by_prefix.
+        """
+        if not self.available or self._client is None:
+            return {"available": False}
+        try:
+            info = await self._client.info("all")
+            keys_total = await self._client.dbsize()
+
+            hits   = int(info.get("keyspace_hits",   0))
+            misses = int(info.get("keyspace_misses", 0))
+            total_ops = hits + misses
+            hit_rate = round(hits / total_ops * 100, 1) if total_ops > 0 else 0.0
+
+            mem_bytes = int(info.get("used_memory", 0))
+            mem_mb    = round(mem_bytes / 1_048_576, 2)
+
+            uptime_s = int(info.get("uptime_in_seconds", 0))
+
+            # Conteo por prefijo de endpoint (SCAN sin bloquear)
+            prefixes: dict[str, int] = {}
+            cursor = 0
+            while True:
+                cursor, keys = await self._client.scan(
+                    cursor=cursor, match=f"{_KEY_PREFIX}:GET:*", count=200
+                )
+                for key_bytes in keys:
+                    key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
+                    parts = key.split(":")
+                    endpoint = "/".join(parts[2:5]) if len(parts) >= 5 else "other"
+                    prefixes[endpoint] = prefixes.get(endpoint, 0) + 1
+                if cursor == 0:
+                    break
+                await asyncio.sleep(0)
+
+            return {
+                "available": True,
+                "keys_total": keys_total,
+                "memory_used_mb": mem_mb,
+                "hit_rate_pct": hit_rate,
+                "hits": hits,
+                "misses": misses,
+                "uptime_hours": round(uptime_s / 3600, 1),
+                "redis_version": info.get("redis_version", "?"),
+                "keys_by_endpoint": dict(
+                    sorted(prefixes.items(), key=lambda x: -x[1])[:20]
+                ),
+            }
+        except Exception as exc:
+            logger.warning("GeoCache.stats error: %s", exc)
+            return {"available": True, "error": str(exc)}
+
+    async def mset_pipeline(self, items: list[tuple[str, bytes, int]]) -> None:
+        """
+        Guarda múltiples (key, value, ttl) en un pipeline Redis para
+        reducir round-trips durante el calentamiento de caché.
+
+        Args:
+            items: lista de (key, value_bytes, ttl_segundos)
+        """
+        if not self.available or self._client is None or not items:
+            return
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            for key, value, ttl in items:
+                pipe.setex(key, ttl, value)
+            await pipe.execute()
+            logger.debug("GeoCache.mset_pipeline: %d keys escritas", len(items))
+        except Exception as exc:
+            logger.warning("GeoCache.mset_pipeline error: %s", exc)
+
     def build_key(self, method: str, path: str, params: dict[str, Any]) -> str:
         """
         Construye una cache key determinista desde método HTTP, path y params.
